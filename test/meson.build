@@ -60,6 +60,7 @@ test_sources = [
     'unit/namespace.cpp',
     'unit/not_copyable.cpp',
     'unit/not_moveable.cpp',
+    'unit/pmr_move_with_allocators.cpp',
     'unit/pmr.cpp',
     'unit/rehash.cpp',
     'unit/replace.cpp',
@@ -141,7 +142,7 @@ endif
 #endif
 
 test_exe = executable(
-    'udm',
+    'udm-test',
     test_sources,
     include_directories: incdir,
     cpp_args: cpp_args,
@@ -190,8 +191,9 @@ if compiler.get_id() == 'clang'
         '-fsanitize-undefined-trap-on-error',
         '-fsanitize=undefined,address,fuzzer',
         '-fno-sanitize=thread',
+        '-ftrivial-auto-var-init=pattern',
         '-g',
-        '-isystem', '/usr/lib64/clang/14.0.0/include/',
+        #'-isystem', '/usr/lib64/clang/14.0.0/include/',
     ]
     fuzz_link_args = [
         '-fsanitize=undefined,address,fuzzer',
