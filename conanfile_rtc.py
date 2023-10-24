@@ -2,7 +2,7 @@ from conans import ConanFile
 
 class UnorderedDense(ConanFile):
     name = "unordered_dense"
-    version = "4.0.0"
+    version = "4.1.2"
     url = "https://github.com/Esri/unordered_dense/tree/runtimecore"
     license = "https://github.com/Esri/unordered_dense/blob/runtimecore/LICENSE"
     description = (
