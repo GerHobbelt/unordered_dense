@@ -14,10 +14,7 @@ test_sources = [
     'bench/find_random.cpp',
     'bench/copy.cpp',
 
-    'fuzz/api.cpp',
-    'fuzz/insert_erase.cpp',
-    'fuzz/replace.cpp',
-    'fuzz/string.cpp',
+    'fuzz/run.cpp',
 
     'unit/assign_to_move.cpp',
     'unit/assignment_combinations.cpp',
@@ -40,7 +37,10 @@ test_sources = [
     'unit/erase.cpp',
     'unit/explicit.cpp',
     'unit/extract.cpp',
-    'unit/fuzz_corpus.cpp',
+    'unit/fuzz_api.cpp',
+    'unit/fuzz_insert_erase.cpp',
+    'unit/fuzz_replace_map.cpp',
+    'unit/fuzz_string.cpp',
     'unit/hash_char_types.cpp',
     'unit/hash_smart_ptr.cpp',
     'unit/hash_string_view.cpp',
@@ -73,6 +73,7 @@ test_sources = [
     'unit/swap.cpp',
     'unit/transparent.cpp',
     'unit/try_emplace.cpp',
+    'unit/tuple_hash.cpp',
     'unit/unique_ptr.cpp',
     'unit/unordered_set.cpp',
     'unit/vectorofmaps.cpp',
@@ -88,6 +89,7 @@ foreach arg : [
             '-Wno-stringop-overflow', # g++ error in fmtlib
             '-Warith-conversion',
             '-Wshadow=global',
+            '-Wno-array-bounds', # gcc 13 gives incorrect warning
 
             # gcc / clang
             '-Wconversion',
@@ -96,6 +98,7 @@ foreach arg : [
             '-Wuninitialized',
             '-pedantic-errors',
             '-Wold-style-cast',
+            '-Wno-unused-function',
             # '-Weffc++', doesn't work with fmt
             
             # '-march=native',
@@ -141,6 +144,21 @@ endif
 #    add_global_arguments('-DANKERL_UNORDERED_DENSE_HAS_ABSL=0', language: 'cpp')
 #endif
 
+cpp_args += [
+    #'-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION',
+    #'-fsanitize-undefined-trap-on-error',
+    #'-fsanitize=undefined,address',
+    #'-fno-sanitize=thread',
+    #'-ftrivial-auto-var-init=pattern',
+    #'-g',
+]
+
+link_args += [
+    #'-fsanitize=undefined,address',
+    #'-fno-sanitize=thread'
+    #'-Wl,-shuffle-sections' # for benchmarking with mold linker
+]
+
 test_exe = executable(
     'udm-test',
     test_sources,
@@ -157,6 +175,7 @@ test_exe = executable(
         # disable these two if you don't want them
         #dependency('boost'),
         #dependency('absl_container', default_options: ['warning_level=0', 'werror=false'])
+        # dependency('absl_hash', method: 'builtin', default_options: ['warning_level=0', 'werror=false'])
     ],
 )
 
@@ -171,68 +190,3 @@ test(
     test_exe,
     verbose: true)
 
-test(
-    'fuzz',
-    test_exe,
-    args: ['-ns', '-ts=fuzz'],
-    env: 'FUZZ_CORPUS_BASE_DIR=' + meson.source_root() / 'data' / 'fuzz',
-    verbose: true)
-
-###################
-
-if compiler.get_id() == 'clang'
-    fuzz_deps = [
-            dependency('doctest'),
-            dependency('threads'),
-            dependency('fmt', method: fmt_method),
-        ]
-    fuzz_cpp_args = [
-        '-DFUZZ',
-        '-fsanitize-undefined-trap-on-error',
-        '-fsanitize=undefined,address,fuzzer',
-        '-fno-sanitize=thread',
-        '-ftrivial-auto-var-init=pattern',
-        '-g',
-        #'-isystem', '/usr/lib64/clang/14.0.0/include/',
-    ]
-    fuzz_link_args = [
-        '-fsanitize=undefined,address,fuzzer',
-        '-fno-sanitize=thread',
-    ]
-    fuzz_sources = [
-        'app/counter.cpp',
-    ]
-
-    executable(
-        'fuzz_api',
-        fuzz_sources + ['fuzz/api.cpp'],
-        include_directories: incdir,
-        cpp_args : fuzz_cpp_args,
-        link_args: fuzz_link_args,
-        dependencies: fuzz_deps,
-    )
-    executable(
-        'fuzz_replace',
-        fuzz_sources + ['fuzz/replace.cpp'],
-        include_directories: incdir,
-        cpp_args : fuzz_cpp_args,
-        link_args: fuzz_link_args,
-        dependencies: fuzz_deps,
-    )    
-    executable(
-        'fuzz_insert_erase',
-        fuzz_sources + ['fuzz/insert_erase.cpp'],
-        include_directories: incdir,
-        cpp_args : fuzz_cpp_args,
-        link_args: fuzz_link_args,
-        dependencies: fuzz_deps,
-    )
-    executable(
-        'fuzz_string',
-        fuzz_sources + ['fuzz/string.cpp'],
-        include_directories: incdir,
-        cpp_args : fuzz_cpp_args,
-        link_args: fuzz_link_args,
-        dependencies: fuzz_deps,
-    )
-endif
