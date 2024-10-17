@@ -3,7 +3,7 @@ import ankerl.unordered_dense;
 #include <cassert>
 #include <string>
 
-int main() {
+int main(void) {
     ankerl::unordered_dense::map<std::string, int> m;
     m["24535"] = 4;
     assert(m.size() == 1);
