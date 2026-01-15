@@ -214,7 +214,7 @@ inline void mum(std::uint64_t* a, std::uint64_t* b) {
                                               UINT64_C(0x8ebc6af09c88c6e3),
                                               UINT64_C(0x589965cc75374cc3)};
 
-    auto const* p = static_cast<uint8_t const*>(key);
+    auto const* p = static_cast<std::uint8_t const*>(key);
     std::uint64_t seed = secret[0];
     std::uint64_t a{};
     std::uint64_t b{};
