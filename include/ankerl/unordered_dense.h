@@ -1,7 +1,7 @@
 ///////////////////////// ankerl::unordered_dense::{map, set} /////////////////////////
 
 // A fast & densely stored hashmap and hashset.
-// Version 5.0.0
+// Version 5.0.1
 // https://github.com/martinus/unordered_dense
 //
 // Licensed under the MIT License <http://opensource.org/licenses/MIT>.
@@ -32,7 +32,7 @@
 // see https://semver.org/spec/v2.0.0.html
 #define ANKERL_UNORDERED_DENSE_VERSION_MAJOR 5 // NOLINT(cppcoreguidelines-macro-usage) incompatible API changes
 #define ANKERL_UNORDERED_DENSE_VERSION_MINOR 0 // NOLINT(cppcoreguidelines-macro-usage) backwards compatible functionality
-#define ANKERL_UNORDERED_DENSE_VERSION_PATCH 0 // NOLINT(cppcoreguidelines-macro-usage) backwards compatible bug fixes
+#define ANKERL_UNORDERED_DENSE_VERSION_PATCH 1 // NOLINT(cppcoreguidelines-macro-usage) backwards compatible bug fixes
 
 // API versioning with inline namespace, see https://www.foonathan.net/2018/11/inline-namespaces/
 
@@ -240,11 +240,16 @@ namespace detail {
 
 // hash ///////////////////////////////////////////////////////////////////////
 
-// Descended from wyhash: https://github.com/wangyi-fudan/wyhash -- its reads, its multiply-and-xor
-// mix, its short path and its chained lanes for long keys -- with the middle lengths restructured
-// into independent blocks, which the comment on hash() explains. No big-endian support (because
-// different values on different machines don't matter), hardcodes seed and the secret.
-namespace detail::wyhash {
+// This is no longer wyhash and does not produce wyhash's values, so it is not named after it. It is
+// descended from it: https://github.com/wangyi-fudan/wyhash gives the reads, the multiply-and-xor
+// mix, the short path and the chained lanes for long keys. What changed is the middle lengths,
+// restructured into independent blocks, which the comment on hash_bytes() explains. If it ever
+// leaves this header as something callers can use on its own it will be called `ankerlhash`; until
+// then the entry points are `detail::hash_bytes` and `detail::hash_int` and the name is not needed.
+//
+// No big-endian support, because different values on different machines do not matter here.
+// The seed and the secret are hardcoded, so there is nothing to salt a table with.
+namespace detail::hash_impl {
 
 inline void mum(std::uint64_t* a, std::uint64_t* b) {
 #    if defined(__SIZEOF_INT128__)
@@ -323,7 +328,7 @@ inline void mum(std::uint64_t* a, std::uint64_t* b) {
 // hash. Sixteen pairs cover 144 bytes, and past that the chained lanes take over, where reuse is
 // harmless because the chain carries the position. The secrets have wyhash's property, every
 // byte with four bits set, odd, and were drawn once from a fixed seed.
-[[maybe_unused]] [[nodiscard]] inline auto hash(void const* key, std::size_t len) -> std::uint64_t {
+[[maybe_unused]] [[nodiscard]] inline auto hash_bytes(void const* key, std::size_t len) -> std::uint64_t {
     static constexpr auto secret = std::array{
         UINT64_C(0xa0761d6478bd642f), UINT64_C(0xe7037ed1a0b428db), UINT64_C(0x8ebc6af09c88c6e3), UINT64_C(0x589965cc75374cc3),
         UINT64_C(0x2d358dccaa6c78a5), UINT64_C(0x8bb84b93962eacc9), UINT64_C(0x4b33a62ed433d4a3), UINT64_C(0xa693c93927d87217),
@@ -442,11 +447,20 @@ inline void mum(std::uint64_t* a, std::uint64_t* b) {
     return mix(secret[1] ^ len, seed ^ tail);
 }
 
-[[nodiscard]] inline auto hash(std::uint64_t x) -> std::uint64_t {
-    return detail::wyhash::mix(x, UINT64_C(0x9E3779B97F4A7C15));
+[[nodiscard]] inline auto hash_int(std::uint64_t x) -> std::uint64_t {
+    return mix(x, UINT64_C(0x9E3779B97F4A7C15));
 }
 
-} // namespace detail::wyhash
+} // namespace detail::hash_impl
+
+namespace detail {
+
+// The two entry points, at `detail` scope because that is where callers writing their own hash for
+// their own type reach for them, and doc/usage.md shows exactly that.
+using hash_impl::hash_bytes;
+using hash_impl::hash_int;
+
+} // namespace detail
 
 namespace detail {
 
@@ -520,7 +534,8 @@ template <typename Hash>
 //
 // Deliberately the same name, the same two ways of answering and the same meaning as Boost's
 // boost::hash_is_avalanching, so that a hash annotated for either library is read correctly by the
-// other. See README 3.2.7.
+// other. See "Marking a Hash Avalanching From Outside" in
+// https://github.com/martinus/unordered_dense/blob/main/doc/usage.md
 template <typename Hash>
 struct hash_is_avalanching : std::bool_constant<detail::is_avalanching_member<Hash>()> {};
 
@@ -552,7 +567,7 @@ template <typename CharT>
 struct hash<std::basic_string<CharT>> {
     using is_avalanching = void;
     auto operator()(std::basic_string<CharT> const& str) const noexcept -> std::uint64_t {
-        return detail::wyhash::hash(str.data(), sizeof(CharT) * str.size());
+        return detail::hash_bytes(str.data(), sizeof(CharT) * str.size());
     }
 };
 
@@ -560,7 +575,7 @@ template <typename CharT>
 struct hash<std::basic_string_view<CharT>> {
     using is_avalanching = void;
     auto operator()(std::basic_string_view<CharT> const& sv) const noexcept -> std::uint64_t {
-        return detail::wyhash::hash(sv.data(), sizeof(CharT) * sv.size());
+        return detail::hash_bytes(sv.data(), sizeof(CharT) * sv.size());
     }
 };
 
@@ -569,7 +584,7 @@ struct hash<T*> {
     using is_avalanching = void;
     auto operator()(T* ptr) const noexcept -> std::uint64_t {
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-        return detail::wyhash::hash(reinterpret_cast<std::uintptr_t>(ptr));
+        return detail::hash_int(reinterpret_cast<std::uintptr_t>(ptr));
     }
 };
 
@@ -578,7 +593,7 @@ struct hash<std::unique_ptr<T>> {
     using is_avalanching = void;
     auto operator()(std::unique_ptr<T> const& ptr) const noexcept -> std::uint64_t {
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-        return detail::wyhash::hash(reinterpret_cast<std::uintptr_t>(ptr.get()));
+        return detail::hash_int(reinterpret_cast<std::uintptr_t>(ptr.get()));
     }
 };
 
@@ -587,7 +602,7 @@ struct hash<std::shared_ptr<T>> {
     using is_avalanching = void;
     auto operator()(std::shared_ptr<T> const& ptr) const noexcept -> std::uint64_t {
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-        return detail::wyhash::hash(reinterpret_cast<std::uintptr_t>(ptr.get()));
+        return detail::hash_int(reinterpret_cast<std::uintptr_t>(ptr.get()));
     }
 };
 
@@ -596,7 +611,7 @@ struct hash<Enum, typename std::enable_if_t<std::is_enum_v<Enum>>> {
     using is_avalanching = void;
     auto operator()(Enum e) const noexcept -> std::uint64_t {
         using underlying = std::underlying_type_t<Enum>;
-        return detail::wyhash::hash(static_cast<std::uint64_t>(static_cast<underlying>(e)));
+        return detail::hash_int(static_cast<std::uint64_t>(static_cast<underlying>(e)));
     }
 };
 
@@ -616,12 +631,12 @@ struct tuple_hash_helper {
     [[nodiscard]] ANKERL_UNORDERED_DENSE_DISABLE_UBSAN_UNSIGNED_INTEGER_CHECK static auto mix64(std::uint64_t state,
                                                                                                 std::uint64_t v)
         -> std::uint64_t {
-        return detail::wyhash::mix(state + v, std::uint64_t{0x9ddfea08eb382d69});
+        return detail::hash_impl::mix(state + v, std::uint64_t{0x9ddfea08eb382d69});
     }
 
     // Creates a buffer that holds all the data from each element of the tuple. If possible we memcpy the data directly. If
     // not, we hash the object and use this for the array. Size of the array is known at compile time, and memcpy is optimized
-    // away, so filling the buffer is highly efficient. Finally, call wyhash with this buffer.
+    // away, so filling the buffer is highly efficient. Finally, call hash_bytes with this buffer.
     template <typename T, std::size_t... Idx>
     [[nodiscard]] static auto calc_hash(T const& t, std::index_sequence<Idx...> /*unused*/) noexcept -> std::uint64_t {
         auto h = std::uint64_t{};
@@ -647,13 +662,13 @@ struct hash<std::pair<A, B>> : tuple_hash_helper<A, B> {
 };
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
-#    define ANKERL_UNORDERED_DENSE_HASH_STATICCAST(T)                         \
-        template <>                                                           \
-        struct hash<T> {                                                      \
-            using is_avalanching = void;                                      \
-            auto operator()(T const& obj) const noexcept -> std::uint64_t {   \
-                return detail::wyhash::hash(static_cast<std::uint64_t>(obj)); \
-            }                                                                 \
+#    define ANKERL_UNORDERED_DENSE_HASH_STATICCAST(T)                       \
+        template <>                                                         \
+        struct hash<T> {                                                    \
+            using is_avalanching = void;                                    \
+            auto operator()(T const& obj) const noexcept -> std::uint64_t { \
+                return detail::hash_int(static_cast<std::uint64_t>(obj));   \
+            }                                                               \
         }
 
 #    if defined(__GNUC__) && !defined(__clang__)
@@ -692,8 +707,9 @@ namespace bucket_type {
 // sixteen at a time, and eight overflow counters that record how many entries with those low three
 // fingerprint bits had to probe past it. An erase decrements them, so nothing ever moves after it
 // is placed and no tombstone is left behind. The value indices sit in the same block as the group
-// they belong to: 24 + 64 bytes per sixteen slots, 5.5 bytes per slot. See "5. Design" in the
-// README, and group_storage::block below for why one block rather than two arrays.
+// they belong to: 24 + 64 bytes per sixteen slots, 5.5 bytes per slot. See
+// https://github.com/martinus/unordered_dense/blob/main/doc/design.md and
+// group_storage::block below for why one block rather than two arrays.
 //
 // The width of the value index is the one thing the two bucket types differ in: `group` indexes
 // up to 2^32 values at 24 + 64 bytes per sixteen slots, `group_big` up to 2^63 at 24 + 128.
@@ -870,12 +886,20 @@ struct require_avalanching : Hash {
     using is_avalanching = void;
 };
 
+// How many bytes of elements a segment holds by default, and the *maximum*: a segment is a power of
+// two of elements that fits inside it, rounded down. So 4096 bytes is 256 pairs of eight-byte halves
+// exactly, and 32 of an 80 byte value rather than 51 -- 2560 bytes. `segmented_map` takes this as a
+// trailing parameter, which is worth setting when the rounding is what decides whether a segment
+// reaches an allocator's threshold: a "2 MB" segment is one whole huge page for a 16 byte pair and
+// 1.28 MB for a 40 byte one.
+inline constexpr std::size_t default_segment_size_bytes = 4096;
+
 // Very much like std::deque, but faster for indexing (in most cases). As of now this doesn't implement the full std::vector
 // API, but merely what's necessary to work as an underlying container for ankerl::unordered_dense::{map, set}.
 // It allocates blocks of equal size and puts them into the m_blocks vector. That means it can grow simply by adding a new
 // block to the back of m_blocks, and doesn't double its size like an std::vector. The disadvantage is that memory is not
 // linear and thus there is one more indirection necessary for indexing.
-template <typename T, typename Allocator = std::allocator<T>, std::size_t MaxSegmentSizeBytes = 4096>
+template <typename T, typename Allocator = std::allocator<T>, std::size_t MaxSegmentSizeBytes = default_segment_size_bytes>
 class segmented_vector {
     template <bool IsConst>
     class iter_t;
@@ -1353,7 +1377,11 @@ namespace detail {
 // Alloc is the table's value allocator; the block array rebinds it.
 template <typename Group, typename Alloc>
 class group_storage {
-    static constexpr std::size_t slots = std::tuple_size_v<decltype(Group::m_fingerprints)>;
+    // `slots_per_group`, the name the table below already gives the same constant, and not
+    // `slots`: Qt defines `slots` as an empty macro unless the build sets QT_NO_KEYWORDS, so a
+    // member of that name does not survive a translation unit that has seen a Qt header (#289).
+    // test/unit/qt_keywords.cpp compiles the header with those macros defined.
+    static constexpr std::size_t slots_per_group = std::tuple_size_v<decltype(Group::m_fingerprints)>;
 
 public:
     using value_idx_type = typename Group::value_idx_type;
@@ -1361,7 +1389,7 @@ public:
     // Inherits so that every use of a group's fingerprints and counters reads unchanged, and so a
     // block converts to the Group const& that match_fingerprint takes.
     struct block : Group {
-        std::array<value_idx_type, slots> m_index;
+        std::array<value_idx_type, slots_per_group> m_index;
     };
 
     using allocator_type = typename std::allocator_traits<Alloc>::template rebind_alloc<block>;
@@ -1589,8 +1617,8 @@ private:
                 return m_hash(key);
             }
         } else {
-            // not is_avalanching => apply wyhash
-            return wyhash::hash(m_hash(key));
+            // not is_avalanching => run it through this library's own hash
+            return detail::hash_int(m_hash(key));
         }
     }
 
@@ -1601,9 +1629,27 @@ private:
     // Where a probe for a key stopped. Found: the slot holding it, and the value it points to.
     // Not found: nothing but `found` is meaningful, and an insert walks the probe sequence again
     // from the hash to place the key.
+    // A slot, as the group it is in and the lane inside it. Nothing in the map holds a flat slot
+    // number any more: the probe finds the pair, and both consumers -- erase_group_slot and
+    // move_home -- address the group with it directly.
+    struct group_slot {
+        value_idx_type group_idx;
+        std::uint8_t lane;
+    };
+
+    // Where the probe stopped, as the group and the lane inside it. Not as one flat slot number:
+    // every consumer wants the pair back, and packing `group_idx * slots_per_group + lane` here made
+    // erase_group_slot and move_home divide it apart again -- which gcc never folded (#262). The
+    // lane is a std::uint8_t so that this stays the same twelve bytes it was.
+    //
+    // Do not narrow it: dropping `value_idx` for the caller to re-read, and folding `found` into
+    // `lane` as a sentinel, both cost the string find and buy nothing anywhere, because a compiler
+    // already returns these twelve bytes in two registers and there is no spill to save (measured
+    // 2026-09-12, `notes/index-design.md`, "probe_result's shape").
     struct probe_result {
-        value_idx_type slot;
+        value_idx_type group_idx;
         value_idx_type value_idx;
+        std::uint8_t lane;
         bool found;
     };
 
@@ -1731,56 +1777,62 @@ private:
         return match_fingerprint(group, 0);
     }
 
-    // The value indices of a group are the next thing a hit reads, and their address needs only
-    // the group, so they are asked for before the fingerprints have arrived: the two latencies
-    // overlap instead of adding. Measured 3 cycles off every hit, 0.2 onto every miss.
-    // MERGED VARIANT: the indices sit inside the block, so what has to be pulled in is the rest of
-    // the block rather than a second array. One block is 88 bytes and unaligned, so it covers two or
-    // three lines; the first is the one the fingerprints are already being read from.
+    // Both helpers here ask for **two consecutive cache lines, clamped into the block**, and differ
+    // only in which line they start at. That rule is #250's: the hardware fetches what it can see
+    // coming, so the job is to start it in the right place rather than to name every line a block
+    // touches. A block is 88 bytes, or 152 for `group_big`, at eight byte alignment, and
+    // `88 % 64 == 24` with `gcd(24, 64) == 8`, so `p % 64` cycles through {0, 8, ... 56} whatever
+    // the array's address and a quarter of blocks reach one line further than the rest. Naming that
+    // extra line has now been measured twice and lost twice: 12.85 ns/block against 12.28 on the 88
+    // byte block (#250), and 16.37 against 16.07 under clang and 16.49 against 16.08 under gcc on
+    // the 152 byte one, where a rehash-shaped read of every byte ties at 19.12 against 19.15 (#252).
+    // scripts/ab/prefetch_lines.cpp. They are two functions rather than one template because
+    // folding them together moves gcc's code generation on the default bucket type, and this way
+    // both spellings are byte identical to what shipped before.
     //
-    // The second address is the block's last byte for `group` and a fixed 128 for `group_big`, which
-    // is the same rule read twice: **the two lines after the one being read, clamped into the
-    // block**. 88 bytes never reaches past 128, so for the default type this is the `p + 87` it has
-    // always asked for and the generated code does not move. 152 bytes does: it spans four lines
-    // whenever `p % 64 > 40`, which is 36% of blocks, and asking for the first and the *last* of
-    // them leaves out the middle -- where eight of the sixteen value indices live. Naming all three
-    // instead is not the fix; it measured no better than the pair it replaces (15.65 against 15.64
-    // ns/block) while the two consecutive lines read 15.01, the same shape and the same reason as
-    // #250's fix to prefetch_block. gcc agrees, 15.54 / 15.60 against 15.00.
-    // scripts/ab/prefetch_lines.cpp, issue #252.
+    // The rest of the block, for a probe that is reading the fingerprints out of the first line as
+    // this is issued. The value indices of a group are the next thing a hit reads and their address
+    // needs only the group, so they are asked for before the fingerprints have arrived: the two
+    // latencies overlap instead of adding. Measured 3 cycles off every hit, 0.2 onto every miss.
+    //
+    // Call it where the index a group hands back is an *address*. `probe_from` loads
+    // `m_values[value_idx]` behind it -- a second miss queued on the first -- and that is the chain
+    // the prefetch shortens. The two walks that look a value *up* have no load behind the index, and
+    // measured better without it (#263, and the comment on slot_of_value).
+    //
+    // For `group` the second address is the block's last byte, which is where it has always pointed;
+    // for `group_big` it is 128. 152 bytes spans four lines whenever `p % 64 > 40`, a quarter of
+    // blocks, and asking for the first and the *last* of them left out the middle -- where eight of
+    // the sixteen value indices live. The clamp also keeps a block that does not reach the second
+    // line, such as the 64 byte layout measured in #250's neighbourhood, from asking past itself.
     template <typename Block>
     static void prefetch_index(Block const* blocks, value_idx_type group_idx) {
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- byte arithmetic on the block
         auto const* p = reinterpret_cast<char const*>(blocks + std::size_t{group_idx});
-        ANKERL_UNORDERED_DENSE_PREFETCH(p + 64);
-        ANKERL_UNORDERED_DENSE_PREFETCH(p + (sizeof(Block) - 1 < 128 ? sizeof(Block) - 1 : 128));
+        constexpr auto first = (std::min)(std::size_t{64}, sizeof(Block) - 1);
+        constexpr auto second = (std::min)(std::size_t{128}, sizeof(Block) - 1);
+        ANKERL_UNORDERED_DENSE_PREFETCH(p + first);
+        if constexpr (second != first) {
+            ANKERL_UNORDERED_DENSE_PREFETCH(p + second);
+        }
     }
 
-    // The first and last line of a block, for a caller that has not touched the group at all.
-    // prefetch_index skips the first line because the probe is about to read it anyway; a rehash is
-    // about to write a group it has never read, so it wants that line too.
+    // The same two lines started at the block's first, for a caller that has not touched the group
+    // at all: prefetch_index skips that line because the probe is about to read it anyway, and a
+    // rehash is about to write a group it has never read, so it wants that line too.
     //
-    // Consecutive lines from the block's start -- *not* its first and its last, which is what this
-    // asked for until 2026-09-11 and is a line short. A block is 88 bytes with four byte alignment,
-    // `88 % 64 == 24` and `gcd(24, 64) == 8`, so `p % 64` walks the whole cycle whatever the array's
-    // alignment and a quarter of blocks span three lines. Asking for `p` and `p + 87` then covers
-    // the first and the *last*, leaving out the middle -- which holds all eight counters and half
-    // the fingerprints, the two things a probe reads first. Stepping by 64 instead covers the first
-    // two and leaves out the last, which holds only the top two index entries.
-    //
-    // Same instruction count, **3.3% faster**: 12.28 ns per block against 12.67, seven rounds of
-    // seven with no overlap, on a 176 MiB array walked at random with a sixteen-deep lookahead and a
-    // probe-shaped read. Adding a third prefetch to cover the tail as well is a loss (12.85) -- the
-    // hardware fetches what it can see coming, so the job here is to start it in the right place
-    // rather than to name every line. scripts/ab/prefetch_lines.cpp, issue #250.
-    //
-    // The loop is what makes it right for group_big too: 152 bytes spans up to four lines, and the
-    // old pair covered the first and the last of them.
+    // Asking for `p` and `p + 87` instead -- the first line and the *last*, which is what this did
+    // until 2026-09-11 -- left out the middle, which holds all eight counters and half the
+    // fingerprints, the two things a probe reads first. Stepping by 64 was worth 3.3%, 12.28
+    // ns/block against 12.67, on a 176 MiB array walked at random with a sixteen-deep lookahead and
+    // a probe-shaped read (#250). The `off < 128` is the clamp, and it is the half of the rule this
+    // function was missing: without it a 152 byte block gets a third prefetch, which is the one
+    // #252 measured as a loss.
     template <typename Block>
     static void prefetch_block(Block const* block) {
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- byte arithmetic on the block
         auto const* p = reinterpret_cast<char const*>(block);
-        for (std::size_t off = 0; off < sizeof(Block); off += 64) {
+        for (std::size_t off = 0; off < sizeof(Block) && off < 128; off += 64) {
             ANKERL_UNORDERED_DENSE_PREFETCH(p + off);
         }
     }
@@ -1815,17 +1867,16 @@ private:
             auto lanes = match_fingerprint(group, word);
             while (lanes != 0) {
                 auto const lane = first_lane(lanes);
-                auto const slot = static_cast<value_idx_type>(std::size_t{group_idx} * slots_per_group + lane);
                 auto const value_idx = group.m_index[lane];
                 if (m_equal(key, get_key(m_values[value_idx]))) {
-                    return {slot, value_idx, true};
+                    return {group_idx, value_idx, static_cast<std::uint8_t>(lane), true};
                 }
                 lanes &= lanes - 1;
             }
             // Not here if nothing of this class ever overflowed past this group, and not anywhere
             // once every group has been looked at: see the note on termination above.
             if (group.m_overflows[counter] == 0 || delta == m_group_mask) {
-                return {0, 0, false};
+                return {0, 0, 0, false};
             }
             group_idx = next_group(group_idx, delta);
         }
@@ -1856,7 +1907,7 @@ private:
     probe_after_home(K const& key, std::uint32_t word, unsigned counter, Bucket const& home, value_idx_type home_idx) const
         -> probe_result {
         if (home.m_overflows[counter] == 0 || m_group_mask == 0) {
-            return {0, 0, false};
+            return {0, 0, 0, false};
         }
         value_idx_type delta = 0;
         auto const next = next_group(home_idx, delta);
@@ -1893,10 +1944,9 @@ private:
         auto lanes = match_fingerprint(home, word);
         while (lanes != 0) {
             auto const lane = first_lane(lanes);
-            auto const slot = static_cast<value_idx_type>(std::size_t{home_idx} * slots_per_group + lane);
             auto const value_idx = home.m_index[lane];
             if (m_equal(key, get_key(m_values[value_idx]))) {
-                return {slot, value_idx, true};
+                return {home_idx, value_idx, static_cast<std::uint8_t>(lane), true};
             }
             lanes &= lanes - 1;
         }
@@ -1919,10 +1969,9 @@ private:
             auto lanes = match_fingerprint(home, word);
             while (lanes != 0) {
                 auto const lane = first_lane(lanes);
-                auto const slot = static_cast<value_idx_type>(std::size_t{home_idx} * slots_per_group + lane);
                 auto const value_idx = home.m_index[lane];
                 if (m_equal(key, get_key(m_values[value_idx]))) {
-                    return {slot, value_idx, true};
+                    return {home_idx, value_idx, static_cast<std::uint8_t>(lane), true};
                 }
                 lanes &= lanes - 1;
             }
@@ -1984,14 +2033,14 @@ private:
         }
     }
 
-    // Frees the slot and takes the entry out of the counters.
-    void erase_group_slot(value_idx_type slot, std::uint64_t mh) {
+    // Frees the slot and takes the entry out of the counters. The slot arrives as the group it is
+    // in and the lane inside it, which is how the probe had it.
+    void erase_group_slot(value_idx_type found_in, std::uint8_t lane, std::uint64_t mh) {
         auto* groups = m_buckets.data();
         auto const mask = m_group_mask;
         auto const home_idx = group_idx_from_hash(mh);
         auto const counter = fingerprint_word(mh) & 7U;
-        auto const found_in = static_cast<value_idx_type>(slot / slots_per_group);
-        groups[found_in].m_fingerprints[slot % slots_per_group] = 0;
+        groups[found_in].m_fingerprints[lane] = 0;
         uncount(groups, mask, home_idx, counter, found_in);
     }
 
@@ -2017,8 +2066,7 @@ private:
     //
     // Only from paths that already write. A const find cannot do this, and a non-const find()
     // is treated as read-only by callers who share a map between threads, so it does not either.
-    void move_home(value_idx_type slot, std::uint64_t mh) {
-        auto const found_in = static_cast<value_idx_type>(slot / slots_per_group);
+    void move_home(value_idx_type found_in, std::uint8_t from_lane, std::uint64_t mh) {
         auto const home_idx = group_idx_from_hash(mh);
         if (ANKERL_UNORDERED_DENSE_LIKELY(found_in == home_idx)) {
             return;
@@ -2033,7 +2081,6 @@ private:
         auto const mask = m_group_mask;
         auto const counter = fingerprint_word(mh) & 7U;
         auto& from = groups[found_in];
-        auto const from_lane = slot % slots_per_group;
         home.m_fingerprints[lane] = from.m_fingerprints[from_lane];
         home.m_index[lane] = from.m_index[from_lane];
         from.m_fingerprints[from_lane] = 0;
@@ -2066,20 +2113,28 @@ private:
     // It measured 10% *faster* than the unbounded version under clang, and that is an artifact, not
     // a reason -- see notes/index-design.md. Forcing this function out of line makes the difference
     // vanish and gcc never had it. The reason to bound the loop is that it hangs.
-    [[nodiscard]] auto slot_of_value(std::uint64_t mh, value_idx_type value_idx) const -> value_idx_type {
+    //
+    // No prefetch_index here, unlike the probe, and none in repoint_value either. There the index a
+    // group hands back is an address to load from -- `m_values[value_idx]`, a second miss behind the
+    // first -- so the prefetch takes one level off a two-level chain. Here the index ends the chain:
+    // it feeds a compare, and in the twin a store that ends the function, so what the prefetch can
+    // overlap is worth about what its two instructions cost. Dropping both takes 0.3-0.6% of the
+    // instructions off every erase-heavy workload of the score under both compilers and nothing off
+    // any other one; the time moves less than the noise floor, baseline/candidate 1.0039 under gcc
+    // and 0.9991 under clang, one header per binary with scripts/ab/solo.sh. It ships on the
+    // instruction count. #263.
+    [[nodiscard]] auto slot_of_value(std::uint64_t mh, value_idx_type value_idx) const -> group_slot {
         auto const word = fingerprint_word(mh);
         auto group_idx = group_idx_from_hash(mh);
         auto const* groups = m_buckets.data();
         value_idx_type delta = 0;
         while (true) {
-            prefetch_index(groups, group_idx);
             auto const& group = groups[group_idx];
             auto lanes = match_fingerprint(group, word);
             while (lanes != 0) {
                 auto const lane = first_lane(lanes);
-                auto const slot = static_cast<value_idx_type>(std::size_t{group_idx} * slots_per_group + lane);
                 if (group.m_index[lane] == value_idx) {
-                    return slot;
+                    return {group_idx, static_cast<std::uint8_t>(lane)};
                 }
                 lanes &= lanes - 1;
             }
@@ -2107,7 +2162,6 @@ private:
         auto* groups = m_buckets.data();
         value_idx_type delta = 0;
         while (true) {
-            prefetch_index(groups, group_idx);
             auto& group = groups[group_idx];
             auto lanes = match_fingerprint(group, word);
             while (lanes != 0) {
@@ -2482,15 +2536,15 @@ private:
         m_values.pop_back();
     }
 
-    // slot is the one that points at the value; mh is the value's mixed hash, which the counters
+    // `at` is the slot that points at the value; mh is the value's mixed hash, which the counters
     // on the way to it are undone with.
     template <typename Op>
-    void do_erase(value_idx_type slot, value_idx_type value_idx_to_remove, std::uint64_t mh, Op handle_erased_value) {
+    void do_erase(group_slot at, value_idx_type value_idx_to_remove, std::uint64_t mh, Op handle_erased_value) {
         // both values are needed once the slot is freed; start fetching them now to overlap the latencies
         ANKERL_UNORDERED_DENSE_PREFETCH(&m_values[value_idx_to_remove]);
         ANKERL_UNORDERED_DENSE_PREFETCH(&m_values.back());
 
-        erase_group_slot(slot, mh);
+        erase_group_slot(at.group_idx, at.lane, mh);
         auto&& erased_value = std::move(m_values[value_idx_to_remove]);
 
         // erase() hands the value to a callback that cannot throw, so the branch below is not even instantiated for it.
@@ -2520,7 +2574,7 @@ private:
         if (!r.found) {
             return 0;
         }
-        do_erase(r.slot, r.value_idx, mh, handle_erased_value);
+        do_erase({r.group_idx, r.lane}, r.value_idx, mh, handle_erased_value);
         return 1;
     }
 
@@ -2743,7 +2797,7 @@ private:
         // the current array, so a growth since then is simply a prefetch that did nothing.
         auto r = probe_at_home(get_key(value), word, counter, m_buckets.data()[home_idx], home_idx);
         if (r.found) {
-            move_home(r.slot, mh);
+            move_home(r.group_idx, r.lane, mh);
             return;
         }
         place_element_at(word, counter, home_idx, std::forward<V>(value));
@@ -2909,7 +2963,7 @@ private:
                 if (r.found) {
                     // Stays behind. merge() is a writing operation, so a hit here pays for its own
                     // drift the same way one inside try_emplace does.
-                    move_home(r.slot, mh);
+                    move_home(r.group_idx, r.lane, mh);
                     if (write != read) {
                         *write = std::move(value);
                     }
@@ -2957,7 +3011,7 @@ private:
         auto const home_idx = group_idx_from_hash(mh);
         auto r = probe(key, word, counter, home_idx);
         if (r.found) {
-            move_home(r.slot, mh);
+            move_home(r.group_idx, r.lane, mh);
             return {begin() + static_cast<difference_type>(r.value_idx), false};
         }
         return place_element_at(word,
@@ -3558,7 +3612,7 @@ public:
         auto r = probe(key, mh);
         if (r.found) {
             m_values.pop_back(); // value was already there, so get rid of it
-            move_home(r.slot, mh);
+            move_home(r.group_idx, r.lane, mh);
             return {begin() + static_cast<difference_type>(r.value_idx), false};
         }
 
@@ -3650,7 +3704,8 @@ public:
         target_key = std::forward<K>(new_key);
 
         auto const value_idx = static_cast<value_idx_type>(it - begin());
-        erase_group_slot(slot_of_value(old_key_hash, value_idx), old_key_hash);
+        auto const at = slot_of_value(old_key_hash, value_idx);
+        erase_group_slot(at.group_idx, at.lane, old_key_hash);
         place_group(new_key_hash, value_idx);
         return {it, true};
     }
@@ -3660,7 +3715,7 @@ public:
     struct located {
         value_idx_type value_idx;
         std::uint64_t mh;
-        value_idx_type slot;
+        group_slot at;
     };
 
     [[nodiscard]] auto locate(iterator it) const -> located {
@@ -3673,7 +3728,7 @@ public:
         auto const e = locate(it);
         // The noexcept here and on the other two erase callbacks is what keeps erase() out of do_erase()'s exception
         // guard: a call expression is noexcept only if the callee says so, an empty body is not enough.
-        do_erase(e.slot, e.value_idx, e.mh, [](value_type const& /*unused*/) noexcept -> void {
+        do_erase(e.at, e.value_idx, e.mh, [](value_type const& /*unused*/) noexcept -> void {
         });
         return begin() + static_cast<difference_type>(e.value_idx);
     }
@@ -3681,7 +3736,7 @@ public:
     auto extract(iterator it) -> value_type {
         auto const e = locate(it);
         auto tmp = std::optional<value_type>{};
-        do_erase(e.slot, e.value_idx, e.mh, [&tmp](value_type&& val) -> void {
+        do_erase(e.at, e.value_idx, e.mh, [&tmp](value_type&& val) -> void {
             tmp = std::move(val);
         });
         return std::move(tmp).value();
@@ -4193,6 +4248,27 @@ public:
     }
 };
 
+// What a segmented alias puts in the container slot, so that the segment size can be chosen there.
+//
+// `table` builds `segmented_vector<value_type, Alloc>` itself from its IsSegmented flag, and that
+// spelling has no room for a size. Resolving the container in the alias reaches it without an eighth
+// `table` parameter, which would change `erase_if`'s deduction and every mangled name. The default
+// size passes the allocator through instead of wrapping it, because `table` then builds exactly this
+// type anyway and `segmented_map<K, V>` stays the type it has always been.
+template <class Value, class AllocatorOrContainer, std::size_t MaxSegmentSizeBytes>
+struct segmented_container {
+    static_assert(!is_detected_v<detect_iterator, AllocatorOrContainer> || MaxSegmentSizeBytes == default_segment_size_bytes,
+                  "a container in the allocator slot carries its own segment size; drop the size argument");
+
+    using type = std::conditional_t<is_detected_v<detect_iterator, AllocatorOrContainer> ||
+                                        MaxSegmentSizeBytes == default_segment_size_bytes,
+                                    AllocatorOrContainer,
+                                    segmented_vector<Value, AllocatorOrContainer, MaxSegmentSizeBytes>>;
+};
+
+template <class Value, class AllocatorOrContainer, std::size_t MaxSegmentSizeBytes>
+using segmented_container_for = typename segmented_container<Value, AllocatorOrContainer, MaxSegmentSizeBytes>::type;
+
 } // namespace detail
 
 template <class Key,
@@ -4208,8 +4284,16 @@ template <class Key,
           class Hash = hash<Key>,
           class KeyEqual = std::equal_to<Key>,
           class AllocatorOrContainer = std::allocator<std::pair<Key, T>>,
-          class Bucket = bucket_type::group>
-using segmented_map = detail::table<Key, T, Hash, KeyEqual, AllocatorOrContainer, Bucket, true>;
+          class Bucket = bucket_type::group,
+          std::size_t MaxSegmentSizeBytes = default_segment_size_bytes>
+using segmented_map =
+    detail::table<Key,
+                  T,
+                  Hash,
+                  KeyEqual,
+                  detail::segmented_container_for<std::pair<Key, T>, AllocatorOrContainer, MaxSegmentSizeBytes>,
+                  Bucket,
+                  true>;
 
 template <class Key,
           class Hash = hash<Key>,
@@ -4222,8 +4306,15 @@ template <class Key,
           class Hash = hash<Key>,
           class KeyEqual = std::equal_to<Key>,
           class AllocatorOrContainer = std::allocator<Key>,
-          class Bucket = bucket_type::group>
-using segmented_set = detail::table<Key, void, Hash, KeyEqual, AllocatorOrContainer, Bucket, true>;
+          class Bucket = bucket_type::group,
+          std::size_t MaxSegmentSizeBytes = default_segment_size_bytes>
+using segmented_set = detail::table<Key,
+                                    void,
+                                    Hash,
+                                    KeyEqual,
+                                    detail::segmented_container_for<Key, AllocatorOrContainer, MaxSegmentSizeBytes>,
+                                    Bucket,
+                                    true>;
 
 #    if defined(ANKERL_UNORDERED_DENSE_PMR)
 
@@ -4233,16 +4324,39 @@ template <class Key, class T, class Hash = hash<Key>, class KeyEqual = std::equa
 using map =
     detail::table<Key, T, Hash, KeyEqual, ANKERL_UNORDERED_DENSE_PMR::polymorphic_allocator<std::pair<Key, T>>, Bucket, false>;
 
-template <class Key, class T, class Hash = hash<Key>, class KeyEqual = std::equal_to<Key>, class Bucket = bucket_type::group>
+template <class Key,
+          class T,
+          class Hash = hash<Key>,
+          class KeyEqual = std::equal_to<Key>,
+          class Bucket = bucket_type::group,
+          std::size_t MaxSegmentSizeBytes = default_segment_size_bytes>
 using segmented_map =
-    detail::table<Key, T, Hash, KeyEqual, ANKERL_UNORDERED_DENSE_PMR::polymorphic_allocator<std::pair<Key, T>>, Bucket, true>;
+    detail::table<Key,
+                  T,
+                  Hash,
+                  KeyEqual,
+                  detail::segmented_container_for<std::pair<Key, T>,
+                                                  ANKERL_UNORDERED_DENSE_PMR::polymorphic_allocator<std::pair<Key, T>>,
+                                                  MaxSegmentSizeBytes>,
+                  Bucket,
+                  true>;
 
 template <class Key, class Hash = hash<Key>, class KeyEqual = std::equal_to<Key>, class Bucket = bucket_type::group>
 using set = detail::table<Key, void, Hash, KeyEqual, ANKERL_UNORDERED_DENSE_PMR::polymorphic_allocator<Key>, Bucket, false>;
 
-template <class Key, class Hash = hash<Key>, class KeyEqual = std::equal_to<Key>, class Bucket = bucket_type::group>
-using segmented_set =
-    detail::table<Key, void, Hash, KeyEqual, ANKERL_UNORDERED_DENSE_PMR::polymorphic_allocator<Key>, Bucket, true>;
+template <class Key,
+          class Hash = hash<Key>,
+          class KeyEqual = std::equal_to<Key>,
+          class Bucket = bucket_type::group,
+          std::size_t MaxSegmentSizeBytes = default_segment_size_bytes>
+using segmented_set = detail::table<
+    Key,
+    void,
+    Hash,
+    KeyEqual,
+    detail::segmented_container_for<Key, ANKERL_UNORDERED_DENSE_PMR::polymorphic_allocator<Key>, MaxSegmentSizeBytes>,
+    Bucket,
+    true>;
 
 } // namespace pmr
 

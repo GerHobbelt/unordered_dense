@@ -4,13 +4,15 @@ Every experiment run on this map's index, hash and benchmarks, with the numbers 
 `CLAUDE.md` carries the rules that came out of this; this file is the evidence, and it is here so
 that the rules can be checked and so that a rejected idea is not proposed a second time.
 
-**How to use it.** Do not read it front to back -- it is ~2400 lines. Search it for the thing you
+**How to use it.** Do not read it front to back -- it is ~4600 lines. Search it for the thing you
 are about to try, by the phrase in the index below (`grep -n "double hashing" notes/index-design.md`)
 or by a symbol (`grep -n move_home notes/index-design.md`). Each entry opens with a bold sentence
-saying what was tried and what happened, and the paragraph under it is the evidence.
+saying what was tried and what happened, and the paragraph under it is the evidence; bold sentences
+inside an entry are its sub-results and are not indexed. The index is kept by hand: one line per
+entry, the entry's opening sentence, added in the same commit as the entry.
 
-**Read it before proposing an optimization.** 149 ideas are recorded here and most of them lost.
-Several were proposed twice because the first rejection was not looked up.
+**Read it before proposing an optimization.** About 170 entries are recorded here and most of them
+lost. Several were proposed twice because the first rejection was not looked up.
 
 **Dates are load-bearing.** An entry is true of the header on the day it was measured. Anything
 older than the change it is about has to be re-measured, and entries that were retracted say so in
@@ -29,9 +31,23 @@ place rather than being deleted, because the retraction is usually the more usef
 - `build` measured the kernel's page fault handler as much as the map, until `tame_allocator()`
 - Nothing measured a table that only churns
 - Lookup benchmarks must not replay
+- Seventeen maps in their own default configurations, at a million entries: the dense layout wins iteration by 5.5x to 110x and the string build by 1.6x to 2.2x, and loses the integer find and churn to boost by 37% and 64%
+- Comparing today's runs against a stored CSV invented a 2-3% regression that does not exist
+- The lookup harnesses measure throughput, and a million entries is not past the cache here
+- `max_rss::of` was charging every map 128 KB of its own, and the counter beside it could not see `aligned_alloc`
+- Peak memory across every harness is now the process's resident high-water mark, and one build of the map is enough to measure it
 
 **Dead ends of the group index (paired A/B, 2026-09-05)**
 
+- `probe_result`'s shape swept two ways, a third argued down from the return sequence, and the one that ships is the best of them
+- A slot back-pointer, re-tested across the cache boundary: the win is real, and it is cancelled by the inserts that put the elements there
+- Fifty points draw the load-factor sawtooth that five average out, and five points are worth 26% of a cross-family ratio
+- The #260/#262 sweep run over find and churn, and it comes back empty
+- The opt-in huge page allocator, measured across the size axis
+- The score runs on 4 KB pages and pays 1.6 billion L1 dTLB misses for it
+- Nothing holds a flat slot number any more, and gcc was the one paying for it
+- The two value walks do not want the index prefetch the probe wants
+- `prefetch_index` was a line short for `group_big`, and covering that line is not the fix
 - `finish_erase` packed a slot that the store took straight back apart
 - An unbounded probe that hangs -- and the 10% speedup that came with it is an inlining artifact
 - `replace()`'s gate was re-measured on a fixed harness and kept, and the harness is the finding
@@ -184,9 +200,12 @@ place rather than being deleted, because the retraction is usually the more usef
 - Windows had never been measured at all
 - The one outlier chased down, and it is the CPU rather than the code
 - NEON closed the ARM lookup gap, and it was the whole gap
+- `replace()` + `extract()` as the way to unique a vector, and the duplicate rate that turns it over
+- `visit()` re-measured across the cache boundary: the cache-resident loss is a hit-rate effect
 - Before NEON: on ARM the branch was 1.11x main, the same overall as on x86, split the opposite way
 - lookups are behind main
 - `ie64` ties boost while executing 58% more instructions, and the counts say why
+- The rehash pipeline below 200000 entries, where it had never been measured: it costs a gcc integer build up to 3.6% in a band, and it stays
 
 **The robin hood index this replaced, and its dead ends**
 
@@ -301,7 +320,1081 @@ where a random sequence costs the scalar probe 1.35. That under-reported the cos
 probing and rewarded the opposite, and it hid most of the SSE2 probe's gain. The workload now
 decides every lookup with an rng of its own. `find_random.cpp` still replays.
 
+**Seventeen maps in their own default configurations, at a million entries: the dense layout wins
+iteration by 5.5x to 110x and the string build-and-destroy by 2.1x to 2.6x, and loses the integer find and churn
+to boost by 37% and 64%** (2026-09-12, issue #277, Ryzen 9 7950X, Fedora 44, clang 22.1.8, THP
+`madvise`, `scripts/ab/bench_readme.{cpp,sh}` and `scripts/ab/mapsplot.py readme`, one binary per
+map, five octave sizes from 1000000, ten million operations per timed cell, three rounds interleaved
+rounds-outermost with an untimed warm-up before each cell, median). This is the harness behind the
+README's four graphs: two per key type, one holding this map and 4.11.0 against the other libraries
+and one holding the shapes this map can be asked to take, because a reader choosing between
+libraries should not have to read past three rows that are one library configured three ways.
+
+Ratios to `ankerl::unordered_dense::map`, `uint64_t` keys (`build+destroy` 23.80 ns/entry, `find` 29.29
+ns/lookup at 50% hits, `churn` 84.63 ns/pair, `iterate` 0.19 ns/element, `peak RSS` 48.84 B/entry
+peak):
+
+| map | build+destroy | find | churn | iterate | peak RSS |
+|---|---|---|---|---|---|
+| huge pages | 0.60 | 0.91 | 0.79 | 0.84 | 0.78 |
+| segmented + huge | 0.57 | 0.94 | 0.95 | 1.38 | 0.66 |
+| segmented | 0.64 | 1.05 | 1.13 | 1.54 | 0.58 |
+| 4.11.0 | 1.59 | 1.29 | 1.49 | 1.02 | 1.14 |
+| boost flat | 0.97 | 0.73 | 0.61 | 9.51 | 1.21 |
+| absl flat | 0.81 | 0.81 | 0.81 | 13.33 | 1.11 |
+| indivi flat_umap | 1.21 | 0.81 | 0.66 | 5.69 | 1.18 |
+| indivi flat_wmap | 1.50 | 0.71 | 0.70 | 7.52 | 1.28 |
+| emilib | 0.90 | 0.82 | 0.73 | 5.47 | 1.04 |
+| F14Value | 1.22 | 1.15 | 1.08 | 6.75 | 1.20 |
+| F14Vector | 1.53 | 1.09 | 1.13 | 1.11 | 1.23 |
+| emhash8 | 1.38 | 0.97 | 1.08 | 0.89 | 0.97 |
+| absl node | 3.64 | 1.15 | 1.70 | 24.49 | 0.99 |
+| boost node | 3.82 | 1.08 | 1.35 | 45.12 | 1.04 |
+| F14Node | 3.77 | 1.17 | 2.05 | 35.07 | 0.99 |
+| `std::unordered_map` | 4.84 | 1.98 | 2.84 | 110.30 | 0.94 |
+
+`std::string` keys (`build+destroy` 92.84 ns, `find` 124.38 ns, `churn` 416.86 ns, `iterate` 0.65 ns,
+`peak RSS` 123.19 B/entry). The picture is a different one: the build-and-destroy lead is 2.1x to 2.6x over every
+flat map, and the two the integer key loses are much closer: boost finds at 1.15 and churns at 0.91
+where the integer key reads 0.73 and 0.61.
+
+| map | build+destroy | find | churn | iterate | peak RSS |
+|---|---|---|---|---|---|
+| huge pages | 0.71 | 0.97 | 0.95 | 1.00 | 0.98 |
+| segmented + huge | 0.63 | 0.97 | 0.96 | 1.05 | 0.91 |
+| segmented | 0.99 | 1.00 | 1.03 | 3.48 | 0.90 |
+| 4.11.0 | 1.26 | 1.13 | 1.09 | 1.01 | 1.05 |
+| boost flat | 2.35 | 1.15 | 0.91 | 3.04 | 1.22 |
+| absl flat | 2.07 | 0.96 | 0.92 | 4.03 | 1.14 |
+| indivi flat_umap | 2.12 | 0.97 | 0.91 | 2.96 | 1.16 |
+| indivi flat_wmap | 2.45 | 0.91 | 0.89 | 3.19 | 1.27 |
+| emilib | 2.56 | 1.34 | 0.95 | 2.75 | 1.13 |
+| F14Value | 2.46 | 1.03 | 0.97 | 3.36 | 1.14 |
+| F14Vector | 1.67 | 1.02 | 1.00 | 0.97 | 1.06 |
+| emhash8 | 2.34 | 1.38 | 1.43 | 0.95 | 1.00 |
+| absl node | 2.51 | 0.96 | 1.08 | 8.38 | 1.00 |
+| boost node | 3.08 | 1.18 | 1.11 | 15.32 | 1.02 |
+| F14Node | 2.26 | 0.97 | 1.05 | 11.57 | 1.00 |
+| `std::unordered_map` | 3.64 | 1.79 | 1.57 | 99.88 | 1.11 |
+
+**The `uint64_t` build corroborates #231 independently.** The huge page allocator reads 1/0.63 = 1.59x
+on the build at a million, against #231's 1.5-1.7x from 200000 upwards, through a harness that
+shares no code with it. The same row says `absl::flat_hash_map` builds at 0.82 with its own hash,
+so this map is not the fastest builder for integers either.
+
+**Five defects in this harness, each of which would have published a wrong number, and each found
+only by looking at a figure that made no sense.** The first three were found before publishing; the
+last two after, and they had already been published in the PR when they were caught. All five are
+the general shape of the rules already in `CLAUDE.md`, met again in a new tool.
+
+- *No warm-up.* The first of the five octave sizes read up to 2.3x the third: it is the size that
+  pays for the process's first touch of every page. One untimed round first.
+- *Cells of about a millisecond, and a loop with the maps outside the rounds.* Repeated runs of the
+  same configuration disagreed by 6-13%, which is larger than most of the ratios being drawn. Ten
+  million operations per cell and rounds outermost took that to 0.1-3.5%.
+- *A memory counter that could not see two of the three allocation paths.* Counting only global
+  `operator new` reported `emilib` at 0.00 B/entry (it calls `malloc` directly) and the huge-page
+  segmented map at 0.35x (its blocks come from `mmap`). Interposing `malloc`, `calloc`, `realloc`,
+  `free`, `mmap` and `munmap` fixed both.
+- *And then the fixed counter charged the request rather than the chunk.* glibc serves a 24 byte
+  node out of a 32 byte chunk, so counting `n` reported every node map as *cheaper* per `uint64_t`
+  entry than this map: `std::unordered_map` at 0.88 where `malloc_usable_size` plus the header says
+  1.06. `scripts/ab/alloc_timeline.cpp` had had the right policy since it was written.
+- ***Retraction, and the largest of the five: the whole chart was drawn from binaries that taxed
+  every allocation.*** The counter above was swapped in and only the `memory` panel re-measured, so
+  `build`, `find`, `churn` and `iterate` were still coming from binaries whose `malloc` kept a
+  sixteen byte header of its own. Reconstructing that binary reproduces the published figures
+  exactly -- `std::unordered_map` build 157.0 against the 155.69 that shipped, this map 23.6 against
+  23.97 -- and the same binary without the header reads 121. A 29% tax on a map that allocates per
+  element and 0% on a dense one. Worse, the *replacement* interposer is not free either: measured
+  three rounds, it costs `std::unordered_map` 4.4% of the integer build and this map 0.0%. The four
+  timed workloads now run from a binary with no counting layer compiled in (`-DUDM_COUNT_ALLOC`
+  gates it, and only the `memory` binary gets it). Alongside it, `maps.h`'s `build()` destroys the
+  map before returning, so the destructor was inside the clock: 33% of the timed region for
+  `std::unordered_map` and about 5% for this map. Together the two put `absl node`'s integer build
+  at 4.68 where it is 1.46, and `std::unordered_map`'s at 6.49 where it is 3.50. Every number in
+  this entry is from the re-run; the superseded ones are named here rather than deleted.
+
+**What this says and does not say.** It is one size band, one machine, one compiler and one workload
+shape, and the octave starts at a million, which is past every cache on this machine; the `doc/`
+size-axis charts are what orders these maps below cache. `iterate` is a full pass over every element
+and a program that never does one should read the chart without that column. The memory column is
+peak rather than steady, which is where a caller's ceiling is but not where its resident set sits.
+Nothing here is a paired A/B and none of it transfers to a header-against-header question: for that,
+`run.sh` and `solo.sh`, and five octave points rather than fifty are only enough when both sides are
+this header (#274).
+
+**Two of the five panels were the wrong measurement, and both were changed after the first
+publication.**
+
+*Peak memory is now the process's resident high-water mark, not the bytes the map asked for.* The
+two disagree systematically: every flat map reads 1.04-1.28x per `uint64_t` entry under RSS where
+counted bytes put `absl` and `emilib` *below* this map at 0.96, and the node maps read 0.94-1.04
+against 1.06-1.18 counted. The mechanism is visible in which families move. A flat map that doubles
+leaves every superseded array freed but resident in glibc's arena, and the next allocation is twice
+its size so it cannot be reused; a node map allocates a million uniform blocks that are all
+reusable, and its two numbers agree to 1%. The huge page variants go the other way, 0.85, because
+the counter charges the whole `mmap` length and RSS only the pages touched. Both numbers are in the
+CSV (`rss` and `memory`); the ~30% is glibc's retention policy rather than a property of the map and
+another allocator will not reproduce it. Measuring RSS needs a fork per fill: the first version read
+the second fill in the same process, and since glibc does not hand a grown arena back, that reused
+resident pages and read below the bytes the map demonstrably allocated.
+
+*The first panel is build **and destroy**.* Timing only the inserts hid the largest difference
+between the designs on this chart. Teardown is 62% of a node map's `uint64_t` lifetime and 6% of
+this one's, so `absl node` reads 1.46 on inserts alone and 3.64 on the whole thing. With string
+keys the split is sharper still and it is not about node versus flat: freeing a million
+`std::string` buffers costs this map 14 ns per entry and every flat map 64-68 ns. The
+strings are identical; a dense map holds them in insertion order and frees them in the order the
+heap was filled, a flat map holds them in hash order and frees them in an order unrelated to how
+they were allocated. `build` on its own stays in the CSV, and the difference between the columns is
+the teardown.
+
+**Comparing today's runs against a stored CSV invented a 2-3% regression that does not exist**
+(2026-09-14, while re-taking the index-structures post, `scripts/ab/maps.sh -r REV`).
+
+Re-measuring the post meant asking whether the map had moved since its numbers were taken at
+`fab7984`. The obvious way -- run the sweep now, diff against `scripts/ab/data/maps_*.csv` -- said
+`map<uint64_t, big_value>` lookups had got 2-3% slower: `hit` +2.4%, `half` +3.1%, `ie` +2.9%,
+`miss` +2.8% at the 32000 octave, all one direction, and stable across five runs whose own spread
+was 0.5-1.6%. Five runs made each side precise and did nothing about the axis between them.
+
+**Both headers in one process says the opposite.** `maps.sh -r fab7984` renames any revision into
+its own namespace and puts it in the second-map slot, so the two are interleaved epoch by epoch by
+`compare()`. Current over post-era, three rounds, below 1.00 meaning the current header is faster:
+`big` hit 1.005, miss 1.011, half 1.001, **ie 0.977**, churn 0.993, build 0.989 at 32000. The cell
+the CSV method was most confident about is 2.3% *faster*, not 2.8% slower. The same run also found a
+real gain the CSV method had hidden: integer `ie` **0.957-0.976** across the three octaves, which is
+the #260/#262/#268 erase work, and string `miss` **0.916-0.951**, which is the probe split.
+
+**So the rule already in `CLAUDE.md` -- never compare runs from different times -- is not about
+drift within an afternoon.** A week-old CSV and a fresh run differ by a systematic few percent from
+machine state that no number of repetitions on either side can see. When the question is "did this
+header move", the instrument is both headers in one process, and `maps.sh -r` has been able to do it
+all along.
+
+**What could not do it is `solo.sh -r fab7984`.** It copies the tree and swaps only
+`unordered_dense.h`, so the old header is compiled against today's tests, and
+`huge_page_allocator.h` needs `default_segment_size_bytes` and `detail::segmented_container_for`,
+neither of which existed on 2026-09-07. That harness reaches back exactly as far as the test suite
+does, which is worth knowing before planning a long-range A/B with it.
+
+**The lookup harnesses measure throughput, and a million entries is not past the cache here**
+(2026-09-14, both raised by a reader of the index-structures post, `scripts/ab/latency.cpp`).
+
+One claim that was wrong and one that was never made, neither of them about a number in a table.
+The distinction matters: nothing published said these were latency figures, so the second half is a
+missing label rather than a correction.
+
+**A million entries is L3-resident on this machine.** 64 MB of L3 in two 32 MB slices, and `AB_CORE`
+pins to one core, so 32 MB is what a measured process gets. `map<uint64_t, uint64_t>` at a million
+entries: this map is 11.0 MB of index plus 15.3 MB of values = **26.3 MB**, and
+`boost::unordered_flat_map` is 2.0 MB of metadata plus 30.0 MB of slots = **32.0 MB**, sitting
+exactly on the line. Two million is the first size clearly past it (52.5 and 64.0). `doc/benchmarks.md`
+said the README charts were "past every cache level" and that was wrong at the bottom of their range.
+
+**Every lookup workload here is reciprocal throughput, and nothing said so either way.** `lookups()`
+in `maps.h` draws its key from `st.rng()`, so nothing stops several lookups being in flight. A
+program looking up in a loop gets the same overlap, so it is worth measuring. It is not the latency
+of one lookup. Checked before writing this: every use of the word "latency" in the post is about the
+hash, the rehash loop or tail latency, and none is about a map lookup, so this is an omission and
+not an error.
+ns per hit, same map and keys, chain = each key is the value the last lookup returned:
+
+| | 1M chain | 1M indep | 4M chain | 4M indep | 16M chain | 16M indep |
+|---|---|---|---|---|---|---|
+| this map | 16.63 | 12.24 | 56.62 | 38.73 | 93.33 | 45.25 |
+| boost | 22.02 | 7.26 | 81.27 | 20.45 | 101.21 | 27.79 |
+
+**The two do not rank the maps the same way, and the published one is the unflattering one.** Boost
+takes an independent hit **1.69x** faster at a million and loses the chain, 22.02 against 16.63. A
+flat map has one region and one dependent load and so has more to overlap; a dense map's second load
+is already on the chain. So the throughput framing understates this map, which is not a reason to
+keep it unlabelled.
+
+**And the trap in measuring it.** The independent loop has to do the same work per lookup as the
+chain apart from the dependency. The first version picked its key by reading a shuffled index array,
+which at a million entries is 8 MB: it measured that array's cache misses and came out **slower**
+than the chain (udm 30.45 indep against 18.32 chain). Keys are `mix(1..n)` now, so an in-register
+rng reaches a present key with no memory access of its own.
+
+**What this does not change.** Every ratio in the post and in `doc/` is between two maps measured the
+same way, so none of them moves. What moves is what a single number means when it is quoted out of
+one.
+
+**`max_rss::of` was charging every map 128 KB of its own, and the counter beside it could not see
+`aligned_alloc`** (2026-09-14, while re-taking the index-structures post, Ryzen 9 7950X, Fedora 44,
+clang 22.1.8, `scripts/ab/max_rss.h`, `scripts/ab/count_alloc.h`, `scripts/ab/maps.cpp`).
+
+Three defects in the memory panels, found by asking why cells at a thousand entries read 200-500
+bytes per entry for a map holding 16 KB of data and disagreed by up to 1.64x between runs.
+
+**The instrument has a floor and was not subtracting it.** `of()` returned `VmHWM - VmRSS` measured
+in a forked child, and a child that does nothing at all does not read zero: forking, writing
+`/proc/self/clear_refs` and reading `/proc/self/status` fault in ~128 KB of their own. Measured on
+an empty closure, five repetitions: 128.0 KB every time, and still 128.0 KB after the parent grew by
+256 MB. So it is a constant, not drift -- the entry above's claim that the measurement is
+deterministic to the page is right, and it was deterministically 128 KB too high. Against known
+work: 1 MB read 1172 KB, 16 MB read 16532, 64 MB read 65684, a constant +148. Subtracting a
+same-shaped empty child leaves a ~20 KB residual, which is 0.1% at 16 MB and the whole answer at
+16 KB. **Two hypotheses were wrong before this one**, and both were disproven by measurement rather
+than argument: copy-on-write faults from the parent (an empty closure would then drift, and it does
+not) and the child inheriting a warm arena (a 1 MB cell read 1424 KB cold and 1408 KB after the
+parent had freed 64 MB).
+
+**So there is no thousand-entry memory column any more.** After the floor comes off, the n=1000
+cells get *relatively* worse -- worst spread between two runs 1.217 before and 1.307 after -- because
+the absolute error is unchanged and the subject is 16 KB. n=32000 improved 1.042 to 1.032 and
+n=500000 1.003 to 1.002. The method needs the subject large against the residual; the header says so
+now.
+
+**Adding a counted column re-broke the resident one, which is the same fork lesson from the other
+side.** The counted pass filled a map in the *caller's* process, and glibc does not hand the arena
+back, so every later `max_rss::of` child served its whole allocation out of already-resident freed
+space: every map after the first read 2 to 20 resident bytes per entry against a true 50 to 70, and
+emilib read 2.0. `count_alloc::of` forks too, for that reason alone -- it counts requests, so a warm
+arena cannot flatter it directly.
+
+**`aligned_alloc` and `posix_memalign` were not interposed.** ihtab asks for its whole group array
+with `std::aligned_alloc`, so it reported **8.3 bytes per entry against a true 35.3**, with its
+element array counted and its index invisible. `free` had always charged those blocks correctly
+through `malloc_usable_size`, so the counter leaked in one direction only, which produces a
+plausible wrong number rather than an obvious one. This is the same failure as counting only
+`operator new` and missing emilib's direct `malloc`, already recorded above.
+
+**And `measure_memory` charged the benchmark's own key vectors to the map.** The churn closure
+copied `present` and `spare` *inside* the measured region -- two vectors of n keys, 16 bytes an entry
+for an integer key -- so every map's churned column, in both metrics, was that much too high at once.
+The comment above it claimed they were copied before the fork. With them hoisted out, the asked
+column goes flat across a turnover for every tombstone-free map (udm 31.8 to 31.8, boost 28.5 to
+28.5) and ihtab doubles 35.3 to 70.6, which is the property the panel exists to show and which the
+inflated numbers had buried.
+
+**The check that the fixed counter is right**: it reproduces the `mallinfo2` figures this file
+replaced, to the decimal, on all eighteen maps at the 32000 octave -- absl 26.4/30.3, boost 28.5,
+udm 31.8, emhash8 37.1, std 44.4, boost-node 47.4. Two independent accountings agreeing to 0.1 is
+what makes either believable.
+
+**What the two metrics say that neither says alone.** Resident over asked sorts the field by family
+more cleanly than anything else measured for the post: node maps 0.85-1.04x, dense 1.05-1.55x, flat
+1.50-1.97x at an eight byte value, and 0.90-1.00 / 1.41-1.63 / 1.86-1.97 at a 64 byte one. A
+doubling flat map supersedes its whole slot array at `sizeof(value_type)` a slot and glibc keeps all
+of it resident; a dense map supersedes a 5.5 byte index. So abseil asks for 26.4 bytes an entry and
+occupies 48.8, where this map asks for 31.8 and occupies 42.0 -- the verdict inverts, and quoting
+either column alone answers a different question than a reader thinks it does.
+
+**And clang elides the obvious benchmark.** Both diagnostics above first read "no effect at all",
+because `auto v = std::vector<char>(n); memset(v.data(), 1, n); if (v[0] == 0) ...` folds to a
+constant and the allocation disappears: a touched 16 MB measured the same as an empty closure, and a
+1 MB `malloc`/`free` counted zero bytes. Anything that measures allocation needs a `volatile` sink
+or an accumulation the compiler cannot see through. This cost two false starts in one session.
+
+**Peak memory across every harness is now the process's resident high-water mark, and one build of
+the map is enough to measure it** (2026-09-13, issue #277 follow-up, Ryzen 9 7950X, Fedora 44, clang
+22.1.8, THP `madvise`, `scripts/ab/max_rss.h` used by `bench_readme.cpp` and `maps.cpp`).
+
+`maps.cpp` had counted with `mallinfo2()`, which cannot see `mmap` at all and therefore read the
+huge page allocator's blocks as nothing; `bench_readme.cpp` had its own copy of an RSS reader. Both
+now call one header. What it does and why each part is load-*carrying*:
+
+- *Fork per measurement.* glibc does not hand a grown arena back, so a second fill in the same
+  process reuses resident pages. The first version of this read `boost` with string keys at 187.5
+  B/entry where a forked one reads 145.1, and several maps came out *below* the bytes they
+  demonstrably allocated.
+- *Reset `VmHWM` through `/proc/self/clear_refs`* (CLEAR_REFS_MM_HIWATER_RSS), or the mark is for
+  the life of the process and the pools dominate it.
+- *Subtract the resident set from just before.* The key pools are built in the parent, are only
+  read, and are therefore in the baseline and never copied.
+
+**Huge pages are counted correctly, checked rather than assumed.** A 1M-entry
+`huge_page::map<uint64_t,uint64_t>` reports 28 MB of `AnonHugePages` in `/proc/self/smaps_rollup`
+against 0 for the same map on 4 KB pages, and a `VmHWM` 2 MB higher -- the rounding up to a whole
+huge page, resident, which is what a caller pays. It also explains why the huge-page variants read
+*below* the plain map on this metric where counted bytes put them above: the allocator `munmap`s a
+superseded mapping and the kernel takes the pages back at once, where glibc keeps a freed arena
+block resident. The same mechanism, seen from the other side, is the ~⅓ that every doubling flat map
+carries.
+
+**One build is enough.** The result is deterministic to the page: three runs of the same cell come
+back byte-identical, so `bench_readme.sh` measures `rss` and `memory` in the first round only and
+the median has nothing to do. That is 5-6 minutes of a full run rather than 15.
+
+What this does not say: the ~30% a flat map carries is glibc's retention policy and another
+allocator will not reproduce it, which is why bytes-requested stays measured beside it in the CSV
+under `memory`. `alloc_timeline.cpp` still counts bytes, and should: its output is a timeline of
+individual allocations, which resident-set sampling cannot reproduce at that resolution.
+
+
 ## Dead ends of the group index (paired A/B, 2026-09-05)
+**`probe_result`'s shape swept two ways, a third argued down from the return sequence, and the one that ships is the best of them** (2026-09-12,
+issue #267, Ryzen 9 7950X, clang 22 and gcc 16, `scripts/ab/solo.sh` and `scripts/ab/perwl.sh`, one
+header per binary, five alternating rounds for the score and instruction counts that need none).
+
+#262 repacked `probe_result` and the `std::string` 50%-find row moved 0.9749 in instructions under
+gcc; this file also records the opposite, a `probe_result` returned from an inner function costing
+gcc 26% of an integer hit. Two accidents, opposite signs, no sweep. #267 asked for the sweep: does
+the caller need `value_idx` back, is `found` better as a sentinel, is an out-parameter or a single
+word better, and does the out-of-line `probe_past_home` want a different shape from the inlined
+`probe_from`.
+
+**Instructions per operation, candidate over baseline, so below 1.00 is fewer.** The two variants
+are the whole struct narrowed (`value_idx` dropped, the caller re-reading `m_index[lane]` from the
+slot the probe stopped at -- twelve bytes to eight, two return registers to one) and `found` folded
+into `lane` as a `0xFF` sentinel (still twelve bytes; the bool sat in padding, so what this tests is
+the store and the caller's test of it):
+
+| | no `value_idx`, clang | gcc | `found` as sentinel, clang | gcc |
+|---|---|---|---|---|
+| `std::string` 50% find | **1.0407** | 1.0041 | **1.0109** | 1.0038 |
+| `std::string` churn | 1.0130 | 1.0087 | 0.9978 | 1.0014 |
+| `std::string` insert erase | 0.9976 | 1.0185 | 1.0032 | 0.9985 |
+| `uint64_t` build | 1.0136 | 1.0154 | 1.0000 | 1.0000 |
+| `uint64_t` churn | 1.0064 | 1.0142 | 1.0000 | 0.9971 |
+| **`uint64_t` 50% find** | **1.0000** | **1.0001** | **0.9998** | **1.0001** |
+| score, one header per binary | 0.9956 | 1.0001 | 0.9954 | 0.9970 |
+
+**Both cost the string find and neither buys anything anywhere.** Dropping `value_idx` is the worse
+of the two and by the larger margin under clang: 4.1% more instructions on the workload the issue is
+about, because `find()` is the shape's biggest consumer and re-reading the slot costs more than the
+return register it saves -- and the insert paths, which also take `value_idx` out of a probe, pay
+1.4-1.5% on an integer build for the same reason. The sentinel is a smaller version of the same
+answer, 1.1% under clang.
+
+**Why there was nothing to win, read off the baseline.** The return sequence of `probe_past_home`
+for a string key:
+
+    shl $0x20,%r12 ; or %rsi,%r12      group_idx and value_idx into one register
+    or  $0x100,%r13d                   lane and found into the other
+    mov %r12,%rax ; mov %r13d,%edx ; ret
+
+Clang already packs the twelve bytes into the two registers the ABI allows, with two ALU ops and no
+memory at all. So there is no hidden pointer to remove, no spill to save, and the only thing a
+narrower struct can do is make the caller re-derive what it stopped carrying.
+
+**The third variant the issue lists, an out-parameter, was not built, and what follows is an argument
+and not a measurement.** Against that return sequence it replaces two register moves with a store
+and a load, which is the narrowing's trade in a more expensive currency. It is the one cell of the
+sweep that is reasoning, and if the shape is ever revisited it is the one to measure.
+
+**The two probes do want different things, and it is not a shape.** Every effect in the table landed
+where a return value is formed. A key whose compare needs no call never goes through
+`probe_past_home` at all -- `probe_from` is force-inlined into the caller -- so the struct's shape is
+free on the integer *find* by construction, which is what that row of the table says. Its insert
+paths are a different matter and do move, because they take `value_idx` out of a probe and the
+narrowing makes them re-read it. The delicacy this file records is the *call boundary*, not the
+fields: it is worth something only where a boundary exists, and what it is worth there is negative
+for both ways of making the struct smaller.
+
+**What this says and does not say.** It says the shipped `probe_result` is a local optimum on the
+two axes anyone has proposed, that the 26% and the 0.9749 in this file were both about crossing the
+call boundary rather than about the struct's fields, and that `uint64_t` lookups cannot be moved
+from here at all. It does not say the boundary itself is optimal -- `probe_past_home` exists because
+a string compare is a call, and whether *that* split is still right is a different question from how
+its result is packed. And it is instructions: the score moved 0.9954 to 1.0001 across the four cells,
+which is inside this harness's layout band and is not evidence of anything on its own.
+
+**A slot back-pointer, re-tested across the cache boundary: the win is real, and it is cancelled by
+the inserts that put the elements there** (2026-09-12, issue #266, Ryzen 9 7950X, clang 22 and
+gcc 16, `scripts/ab/back_pointer.sh`, `scripts/ab/solo.sh`, `scripts/ab/run.sh`, `scripts/ab/perwl.sh`).
+
+`finish_erase` moves the last value into the hole an erase leaves and hashes that element's key a
+second time to find the slot pointing at it. For an integer key that is free; for a string key it is
+about 50 ns, and the entry that measured it said so while noting that the back-pointer which removes
+it had been rejected on a suite whose string tables are cache-resident -- the regime where the second
+hash costs least. #266 asked for the re-test on the size axis. The decision rule was fixed before
+looking, from the issue: a win only in the large-string regime, paid for by memory everywhere and by
+`build64`, is a knob and not a default; #248's principle rules out guessing at the caller's data.
+
+**The win is exactly where it was predicted, and it is the only one.** One packed slot per value in
+a vector parallel to `m_values`; ns per operation, one variant per binary, rounds alternating the two
+variants, three of them, medians, and `find` as the control because the change cannot reach it.
+`std::string` keys:
+
+| n | erase by key | churn (erase+insert) | erase by iterator | build | find (control) |
+|---|---|---|---|---|---|
+| 50000 | **0.915** | 0.949 | 0.938 | 1.031 | 1.001 |
+| 200000 | **0.908** | 0.936 | 1.001 | 1.034 | 1.034 |
+| 800000 | **0.893** | 1.033 | 0.971 | 1.060 | 1.006 |
+| 2000000 | **0.900** | 1.006 | 0.975 | 1.049 | 1.000 |
+| 4000000 | **0.901** | 0.993 | 0.956 | 1.011 | 0.999 |
+
+Erasing a string key by key is 9-11% cheaper at every size, and the *absolute* saving grows with the
+table exactly as the 50 ns figure implied: 5.4 ns at fifty thousand entries and **40.8 ns at four
+million**, where nothing the second hash touches is in cache. That is the largest single cost the
+notes had named in the churn workloads, and the back-pointer does remove it.
+
+**A 64 byte mapped value is the shape where the memory objection is weakest, and it loses worse.**
+Four bytes per entry is 5% of a `map<uint64_t, big_value>` and 19% of a `map<uint64_t, size_t>`, so
+if the tax were only the memory this is where the trade would come good. It does not: erase by key
+wins the same way (0.994, 0.975, 0.930, 0.909, **0.898** over the five sizes) and **churn loses at
+every one of them** -- 1.058, 1.122, 1.069, 1.066, 1.070 -- against a control at 1.010-1.060. The
+bigger the value, the more the extra store per insert competes for the same cache the value wants.
+
+**It does not survive the insert.** Every element erased had to be inserted, and the back-pointer
+charges every insert a store and the value vector a parallel growth: `build` is 1.1-6.0% slower for
+strings and 6.9-23.3% for integer keys, and the instruction counts -- which no code layout can move
+-- put the cost at **+12.8% per operation on `build64`**, +10.4% on `buildbig` and +2.6% on
+`buildstr`, against -3.8% on `churn64`, -4.5% on `churnstr` and -4.9% on `iestr`. So the mechanism
+is confirmed from both sides, and a workload that holds a table at a fixed size by erasing one and
+inserting one -- `churn`, the shape a real cache has -- comes out **0.936 to 1.033 for strings**, a
+wash inside a control band of 1.000-1.034, and a loss for both other value shapes. The erase win and
+the insert tax are the same size.
+
+**`erase(iterator)` gains nothing, which is the half the issue expected most from.** 0.970 to 1.008
+for strings against a control at 1.003-1.016. The reason is structural and worth recording: the
+back-pointer hands `finish_erase` its slot, but `erase(iterator)` still has to hash the key for
+`erase_group_slot`, which needs the counter class and the *home group* to walk the counters back
+from. The fingerprint byte in the slot would give the counter class; only a stored distance gives
+the home. So the back-pointer alone removes one hash from the backfill and none from the locate,
+and the no-hash erase needs the nibbles the same entry already measured at 0.959 on the score.
+
+**The score, three ways, and they agree.** One header per binary, five alternating rounds:
+**0.9870 under clang** (rounds 0.9862, 0.9832, 0.9904, 0.9904, 0.9846 -- no round disagrees) and
+**0.9729 under gcc**. Paired in one process: 0.988 over the fifteen, builds 0.961, churn 0.983,
+insert-and-erase 1.020. Per workload, paired: `build64` 0.930, `buildstr` 0.977, `buildbig` 0.976,
+`churnbig` 0.930 against `churnstr` 1.031 and `iestr` 1.041 -- the same shape the 2025 rejection
+recorded (`churnstr` 1.045, `iestr` 1.024, `build64` 0.953), at the same sizes, from a different
+harness.
+
+**Memory, quoted next to the speed as the issue required.** Live bytes per entry -- allocations
+minus frees, counted through a replaced global `operator new`, because the experiment's vector is on
+the default allocator and an allocator-side counter cannot see it:
+
+| | base | back-pointer | |
+|---|---|---|---|
+| `map<uint64_t, size_t>` | 28.2 | 33.4 | **+18.6%** |
+| `map<std::string, size_t>` | 107.9 | 113.1 | +4.9% |
+| `map<uint64_t, big_value>` | 101.6 | 106.8 | +5.2% |
+
+The 2025 note's "19% more memory for an 8 byte value" reproduces exactly; the other two are diluted
+by what the key or the value already costs.
+
+**So it is rejected, and this time the size axis is covered.** Not a default: it loses the score on
+both compilers and costs a fifth of the memory of an integer map. Not a knob either, and the reason
+is sharper than "it loses on balance": the regime where it wins is *erasing without inserting*, and
+no workload in the score's set separates the two -- a caller who drains a table paid the build tax
+to fill it, and one who holds a table at a fixed size pays the insert tax on every erase they save.
+A caller might exist for whom the fill is off the measured path and the erases are on it; #248's
+rule is what answers them, because the map cannot see which caller it has and this file does not
+ship knobs that guess. The issue's own terms
+said that if the re-test came back negative the nibble variant could not rescue it. It cannot: the
+nibbles pay for `erase(iterator)`, which is the half measured here at nothing.
+
+**Two things found on the way.**
+
+*The first version of the harness diluted the very ratio the verdict rests on.* Its `churn` drew
+both the key to erase and the key to insert by indexing a prepared array of 3n keys -- two random
+reads into 384 MB at four million string entries, inside the timed loop, doing work neither variant
+does and compressing every ratio toward 1.00. "A wash on churn" is exactly the conclusion that
+dilution manufactures, so it was rebuilt in `workloads::churn`'s shape -- a live set of key *values*
+with the key made from one -- and re-measured. The wash held (0.957-1.022 before, 0.936-1.033 after,
+against a control at 1.000-1.034), which is the only reason the conclusion stands rather than the
+harness's.
+
+*The harness measured its own inlining until it was split.* With both variants in one translation
+unit the integer erase-by-iterator cell reads 1.77 at 200000 entries; with one variant per binary
+the same cell reads 1.27, and the `find` control -- code the change cannot reach -- moves from 1.02
+to 0.95, which is the two-binary layout band showing up where the one-binary run hid it. Two headers in one unit share an inlining budget --
+`scripts/ab/window.cpp` says so at the top and `CLAUDE.md` makes it a rule -- and this change alters
+`finish_erase`'s size, so it is exactly the case the rule is about. The numbers above are all one
+variant per binary. The two harnesses agree on everything large (`erasekey` at 2M: 0.896 and 0.894)
+and disagree on everything small, which is the useful summary of what each is good for.
+
+*The back-pointer trades a loud failure for a silent one, which is a third reason against it.*
+`mutated_key_found_by_the_backfill_terminates` requires that a key changed through an iterator be
+caught when the backfill walks to the moved element's slot; there is no walk any more, so nothing
+throws and four test cases fail -- the only four of 835, under clang, gcc and ASan+UBSan. That is
+not the check being made unnecessary. The mutated element still sits in a slot whose fingerprint and
+home group belong to its old key, so the table is exactly as corrupt as before and now says nothing
+about it: `find(new_key)` will not reach it and `find(old_key)` will not match it. The walk was
+never the problem, it was where the corruption surfaced. A shipped back-pointer would owe a
+replacement check -- verify the fingerprint at the back-pointed slot before writing through it --
+and that check would eat part of the win being measured here.
+
+The experiment is `scripts/ab/back_pointer.patch` -- ten maintenance sites, listed at the top of it
+-- with `scripts/ab/back_pointer.cpp` and `.sh` to re-take any of these numbers.
+
+**Fifty points draw the load-factor sawtooth that five average out, and five points are worth 26% of
+a cross-family ratio** (2026-09-12, issue #274, Ryzen 9 7950X, clang 22, `scripts/ab/run.sh -p`,
+`scripts/ab/ab.cpp`, `test/bench/workloads.h`).
+
+The paired harness has swept five sizes across an octave since 2026-09-07 (the boost entry below)
+because a comparison at one size reports wherever that size lands on each map's sawtooth. #274 asked
+the next question: five points cannot land on the *peak* -- the size just before a doubling, which
+is where a table is fullest and every probe is longest -- so is a much denser sweep affordable, is
+the octave really one whole turn of the cycle, and can the payload be cut so the run does not
+explode?
+
+**The switch did not mean what it said.** The five sizes were a table of five scale factors and
+`-p N` ran its first N, so `-p 3` swept from n to 1.32n -- three fifths of an octave -- and printed
+"octave geomean" over it. Nothing recorded in this file was taken that way (every `run.sh` entry
+says five), but the switch was there and it was wrong. The count is now a compile-time constant --
+`run.sh -p` rebuilds the binary, because the sizes are template arguments -- and the i-th of P
+points is `n * 2^(i/P)` for any P, which spans exactly one doubling however many are asked for.
+
+**What fifty points see that five do not.** The dearest point of an octave over the cheapest, per
+element, same header on both sides, twelve epochs:
+
+| | 5 points | 50 points | dearest at |
+|---|---|---|---|
+| `rmiss64` | 1.286x | **1.458x** | load 0.795 |
+| `churn64` | 1.142x | **1.284x** | load 0.795 |
+| `churnbig` | 1.148x | 1.247x | load 0.795 |
+| `rhit64` | 1.115x | 1.168x | load 0.742 |
+| `churnstr` | 1.055x | 1.120x | load 0.752 |
+| `rmissstr` | 1.061x | 1.099x | load 0.795 |
+
+A fifth of an octave gets no closer to the peak than load 0.763 of a maximum of 0.800; a fiftieth
+reaches 0.795. Half of `rmiss64`'s amplitude is in that last 4% of the load, which is exactly where
+the issue expected it to be: the cost of a miss is superlinear in the load factor, so the top of the
+cycle is a spike and not a plateau, and a sweep that steps past it never sees it.
+
+**The spike belongs to the miss and not to the hit**, which fifty points make plain and five could
+not. `rmiss64` steps 32.2% and `rmissstr` 10.3% across the single size where the array doubles;
+`rhit64`'s largest step anywhere in the octave is 2.0% and `rhitstr`'s 2.9%, and neither is at the
+doubling -- their 1.168x and 1.097x climb with the size of the table and not with its load. A key
+that is there is found in its home group whatever the load; a key that is not there is what walks.
+
+**And what five points are worth, measured rather than argued.** A fifty-point run contains ten
+five-point sweeps -- every tenth point, each spanning the whole octave, each one a sweep this
+harness would have reported without complaint. Each one's geomean against the fifty-point one:
+
+| | `base/cand`, the same header twice | `boost/cand` |
+|---|---|---|
+| `churn64` | 0.999 .. 1.005 | **0.742 .. 1.023** |
+| `churnbig` | 0.995 .. 1.002 | 0.787 .. 1.069 |
+| `churnstr` | 0.998 .. 1.001 | 0.855 .. 1.038 |
+| `rmiss64` | 0.989 .. 0.996 | 0.833 .. 1.010 |
+| `build64` | 0.992 .. 1.003 | 1.459 .. 1.571 |
+| `rhit64` | 0.974 .. 0.980 | 0.753 .. 0.776 |
+| `rhitstr` | 0.993 .. 1.017 | 0.858 .. 0.881 |
+
+**Against another revision of this header, five points are worth 0.6%** -- the two sawtooths are in
+phase, so they cancel out of the ratio whatever is sampled, which is the reason every same-family
+paired number in this file is sound however it was taken. **Against boost they are worth 26%**:
+`churn64` reads 0.742 or 1.023 for one quantity depending only on which five of the fifty sizes the
+sweep starts from. Two fifty-point runs made the same day give that spread to within 0.4%, so it is
+the phase and not the noise. The five-point and fifty-point geomeans themselves differ by under 4%
+on nine of the ten workloads and by **16% on `buildbig`** (1.986 against 1.716), for a reason worth
+seeing on its own.
+
+The fifty-point column is the one to quote from now on. `boost::unordered_flat_map` given this
+library's hash, **boost's time over this map's, so above 1.00 means this map is faster**, the same
+header on the other two sides, same order of columns as the table above:
+
+| | 5 points | 50 points |
+|---|---|---|
+| `build64` | 1.591 | 1.526 |
+| `buildstr` | 2.026 | 2.054 |
+| `buildbig` | 1.986 | **1.716** |
+| `churn64` | 0.805 | 0.810 |
+| `churnstr` | 0.890 | 0.898 |
+| `churnbig` | 0.843 | 0.858 |
+| `rhit64` | 0.761 | 0.762 |
+| `rmiss64` | 0.868 | 0.888 |
+| `rhitstr` | 0.875 | 0.869 |
+| `rmissstr` | 0.832 | 0.837 |
+
+The two columns agree because one five-point sweep out of ten was run, not because five points are
+enough: the table above this one is what the other nine would have said.
+
+**`buildbig`'s octave has a 5.9x step in it that has nothing to do with the load factor.** Building
+a `map<uint64_t, big_value>` costs 3.90 ms at 249666 entries and 23.09 ms at 263902, one 5.7% step
+in size later, and stays there for the rest of the octave: 64 bytes times a quarter million is 17 MB
+of values, and doubling that vector wants the old and the new at once, which is where a 32 MB L3
+stops holding the copy. The sawtooth column reads 6.45x for that workload and it is a cache cliff,
+not a cycle. A five-point sweep puts two points below it and three above, a fifty-point sweep five
+and forty-five, and the geomean moves by the difference. It is the "sweep across the cache boundary"
+rule arriving in a workload that was never thought of as a size sweep.
+
+**The sizes are template arguments, and that is worth at most 1.4%, which is the layout band.**
+Asked on 2026-09-12: does making every swept size a compile-time constant buy anything? The premise
+`workloads.h` states -- "turning a literal loop bound into a runtime value is a change even when the
+value is the same" -- had never been measured. Two builds of the harness from one source, the second
+with every size passed through `asm volatile("" : "+r"(v))` before use, which is exactly what a
+function argument would do to the compiler's knowledge of it and changes nothing else. Candidate
+time, opaque over constant, five sizes each:
+
+| `build64` | `churn64` | `ie64` | `find64` | `buildstr` | `churnstr` | `rhit64` | `rmissstr` |
+|---|---|---|---|---|---|---|---|
+| 0.959 | 1.014 | 1.006 | 1.006 | 1.010 | 0.995 | **0.998** | **0.986** |
+
+The last two are the control: `rhit*`/`rmiss*` take their trip count from a body constant, not from
+the template parameter, so their code is identical in both binaries -- and they read 0.998 and 0.986,
+which is the two-binary layout band. Every workload that did change is inside it, in both directions.
+`build64`'s 0.959 is the largest number in the table and it says the *opaque* build was faster, which
+is what layout luck looks like.
+
+So the rule holds where it was written -- the scored instantiation must keep compiling the literal it
+always did, because silently editing the benchmark is the thing to avoid -- and buys nothing
+measurable for the swept points. What it costs there is compile time that scales with the point
+count: 17.4 s at fifty sizes against 3.6 s at five, where runtime sizes would compile in the
+five-size time whatever P is. Within one run the per-point control ratios scatter by 0.25-0.92%
+standard deviation, mostly under nanobench's own interval, so fifty separate instantiations are not
+adding noise either; the geomean's standard error from that scatter is 0.04-0.33%. **If a grid finer
+than fifty is ever wanted, passing the swept sizes at runtime is the change to make, and this is the
+measurement that says it is safe.**
+
+**The growth is measured now, not assumed.** An octave is one whole turn of the cycle only because
+the bucket array doubles, which is this map's policy and not a law -- a growth factor under two is a
+knob this file already records. So before anything is timed the harness inserts into each map in the
+comparison and records every size at which `bucket_count()` changes:
+
+    # cand  grows at 1639 3277 6554 13108 26215 52429 104858 209716   x2.000 -- one octave is exactly one sawtooth
+    # boost grows at 1680 3360 6720 13440 26880 53760 107520 215040   x2.000 -- one octave is exactly one sawtooth
+
+Both double, so both are one octave per cycle and the geomean over an octave is unbiased for both;
+they double 2.5% apart, which is the whole reason the boost column needs the points. A map whose
+ratios were not 2.000 would print a warning saying the geomean weighs part of the cycle twice. The
+same table gives every point line its load factor, so where on the cycle a number sits is readable
+instead of inferred.
+
+**The run does not get ten times longer, and the reason is where a point's cost was cut.** All
+twenty workloads, twelve epochs, clang: **2m21 at five points and 5m34 at fifty**, against 3m19 for
+the five-point run before this change; with boost as a third alternative, 3m32 and 8m37 against
+4m51. Compiling costs 3.6s at five points and 17.4s at fifty, since every size is a template argument.
+Three things pay for the other forty-five points:
+
+- **The two lookup workloads search a table built outside the timed region**, a million times rather
+  than ten million. Before, every timed iteration filled a fifty thousand entry map and then searched
+  it; the fill is not what `rhit64` is for, and with a tenth of the lookups it would have been a tenth
+  of the measurement. `rhit*`/`rmiss*` cost 8.2 s and 2.9 s at fifty points where they cost 7.7 s and
+  3.0 s at five before -- the payload cut buys exactly the ten times the point count spends.
+- **The two workloads that grow a map from empty keep five points.** Their cost is the integral over
+  every doubling they passed through, so there is no cycle left in it. Measured at fifty points
+  anyway, by building the harness with that cap removed: `ie64`'s per-element cost moves 1.021x from
+  its cheapest size to its dearest against the 1.026x five points read, `find64` 1.137x against
+  1.110x and monotonically with size, and **neither has a single step over 1.3%** anywhere in fifty
+  -- where `rmiss64` steps 32.2%, `churn64` 22.1% and `build64` 18.1% in one 1.4% increment of size,
+  at exactly the 52429 and 209716 the growth probe prints. The two of them at fifty points cost 4m43
+  to reproduce what five points said.
+- **Nothing else needed anything.** `build*` and `churn*` run the full payload at every point, which
+  is what takes the run from 2m21 to 5m34; they are the cheap ones.
+
+**Two traps inside that restructuring, both of them this file's own rules.** Passing the table to
+the lookup loop by pointer made it 6.28 ns per hit against the 6.05 the old loop cost, because the
+rng's state update is a store the compiler must assume can alias the map's members -- reached through
+the same pointer -- so it reloaded them on every lookup. Drawing the rng and the key pointer into
+locals and writing the rng back at the end restores 6.05: the same aliasing the notes record for the
+value walks, in a new place. And the control for those four workloads reads 0.976 in one build of the
+harness and 1.000 in another, with `-falign-functions=32` moving 0.976 to 0.997 -- the +-3% code
+layout band, now plainly visible because the timed region is one tight loop and nothing else.
+
+**What this says and does not say.** It says a cross-family ratio -- this map against boost, or an
+index against one with a different number of slots per group -- wants fifty points, and that the ten
+boost ratios in this file taken at five carry up to 26% of sampling error on churn and 16% on
+`buildbig`. It says a header-against-header A/B does not want them: 0.6% is below everything else
+this harness is subject to, and `-p 5` stays the default for that reason. It does not say the
+absolute times of `rhit*`/`rmiss*` are comparable with any run before 2026-09-12 -- the payload is a
+tenth and the table is no longer rebuilt inside the measurement -- **and their boost ratios are not
+either**: taking the fill out moved `rhit64` from 0.798 to 0.760, `rmiss64` 0.917 to 0.868,
+`rmissstr` 0.931 to 0.832 and `rhitstr` 0.886 to 0.874. This map's own per-lookup cost is where it
+was (6.05 ns per hit before, 6.00-6.10 after), so the move is on boost's side of the ratio, and how
+much of it is the fill leaving the measurement and how much is the +-2% the control shows across
+builds was not separated. Against another revision of this header the ratios did not move, because
+there the fill is the same code on both sides and cancels. And it does not touch `bench_quick_overall_udm`: every scored workload compiles the
+same code it did, because the knobs added are template parameters whose defaults are what they were.
+
+**The #260/#262 sweep run over find and churn, and it comes back empty** (2026-09-12, issue #268,
+Ryzen 9 7950X, gcc 16 and clang 22, `scripts/ab/solo.sh`, `perf record` and `perf stat`).
+
+#260 and #262 were both found by reading a hot path's disassembly and asking which instructions
+correspond to nothing the caller wanted, and both were paid by gcc alone. #268 asked for the same
+sweep over the paths those two did not touch: `find` at 50% hits for both key types, the churn
+insert path, and the two placement walks. Three candidates came out of it and none of them is worth
+anything.
+
+**Two were already closed by this file**, which is the cheapest possible outcome and the reason the
+index at the top exists. The SSE probe itself was audited on 2026-09-07 -- `movdqu`, `pcmpeqb`
+against a broadcast both compilers hoist, `pmovmskb`, `test`, with `blsr` and `tzcnt` for the lane
+loop -- and has nothing left in it. The one redundancy that audit did find, `prefetch_index` naming
+`p + 64` and `p + 87`, which land on the same cache line for six of the eight offsets an 88 byte
+stride can have, was measured then and deliberately kept: removing it is a clang win and a 12% gcc
+loss at four million entries.
+
+**The third is real and measures nothing.** `move_home(found_in, from_lane, mh)` took the whole
+hash and re-derived `group_idx_from_hash(mh)` -- a load of `m_shifts` and a shift -- on its
+early-exit path, plus `fingerprint_words[mh & 0xFF] & 7` on the walking one, while all three of its
+writing callers (`do_try_emplace`, `do_insert_hashed`, `do_merge`'s walk) had just taken the hash
+apart to probe with and were holding both pieces. That is the #260 shape exactly, and the mechanism
+is visible: gcc emits 26 full out-of-line copies of `move_home` in the benchmark binary, so the
+early exit costs a call and nine instructions; passing `home_idx` and `counter` instead turns the
+condition into a compare of two arguments, `-fpartial-inlining` splits it, and all 32 copies become
+`.part.0` clones reached only when the element is *not* at home. clang inlines it everywhere either
+way and has nothing to gain.
+
+Per-workload instructions from the score binaries, one header per binary, candidate over baseline
+under gcc, and the two runs were bit-identical, so these are not noise:
+
+| workload | gcc |
+|---|---|
+| `uint64_t` churn at a fixed size | 1.0075 |
+| `std::string` random insert erase | 1.0048 |
+| `uint64_t` `big_value` build from empty | 1.0048 |
+| `uint64_t` `big_value` churn | 0.9846 |
+| `std::string` 50% probability to find | 0.9962 |
+| the other ten | 1.0000 +- 0.0002 |
+
+**The workloads that moved are the ones that cannot call it.** Churn's `map[next]` takes a counter
+key it has never held, build is all misses and find is read-only, so `move_home` never runs in any
+of the three largest movements. What moved is gcc's inliner: one `churn` instantiation in the
+benchmark object went from 7065 to 10384 bytes. The score agrees with the instruction counts --
+0.9957 over five rounds under gcc, inside the layout band. Reverted.
+
+**Why the ceiling was 0.2% and could have been read off in one command.** `perf record` on the
+baseline score binary does not show `move_home` at all above 0.2%: the hot workload functions have
+`do_try_emplace` inlined into them and `move_home` with it, and the out-of-line copies serve the
+cold instantiations. An out-of-line symbol in the binary is not evidence that the hot call site pays
+for it, and counting symbols is not counting calls. Profile first, then read the disassembly of what
+the profile named.
+
+**And the one candidate that looked best came from a scratch translation unit and was an artifact.**
+`place_group`'s loop stores `group.m_overflows[counter]`, a `std::uint8_t` store that may alias
+anything, and then calls `next_group`, which reads `m_group_mask` through `this` -- the exact hazard
+`uncount` was refactored for and `fill_buckets_from_values` is written out by hand to avoid. In a
+one-map translation unit gcc emits `and 0x38(%r10),%r9d`, a reload on every step of the walk. In the
+benchmark binary, where the walk is inlined into `workloads::build`, the same loop reads
+`and %r13d,%r10d` with the mask and the group pointer both hoisted across the store. gcc
+disambiguates it where it matters. **A scratch TU can invent a redundancy as well as hide one**,
+which is the other half of #254's rule.
+
+**The opt-in huge page allocator, measured across the size axis** (2026-09-12, issue #231,
+Ryzen 9 7950X, clang 22 and gcc 16, `scripts/ab/huge_pages.{cpp,sh}`, `include/ankerl/huge_page_allocator.h`).
+
+`huge_page_allocator<T, Threshold = 2 MB>`: a block of at least `Threshold` bytes is `mmap`ed on
+its own, 2 MB aligned, rounded up to a multiple of 2 MB and `madvise(MADV_HUGEPAGE)`d; smaller
+blocks go to `std::allocator`. Handed to the map as the allocator it covers both regions, since the
+index rebinds the value allocator. The harness instantiates the score's own workloads
+(`test/bench/workloads.h`) on the map with each allocator, one cell per process so the variant is
+a template instantiation, five interleaved rounds, medians. ns per operation, `std::allocator` then
+`huge_page_allocator`, ratio above 1 meaning huge pages are faster:
+
+| clang | 50000 | 200000 | 800000 | 4000000 |
+|---|---|---|---|---|
+| `build` u64 | 18.27 / 18.55 (0.98) | 20.40 / 13.30 (**1.53**) | 22.07 / 12.78 (**1.73**) | 38.35 / 24.58 (**1.56**) |
+| `build` str | 68.49 / 58.45 (**1.17**) | 71.91 / 63.59 (**1.13**) | 85.46 / 68.64 (**1.25**) | 121.82 / 94.45 (**1.29**) |
+| `churn` u64 | 10.61 / 10.65 (1.00) | 12.66 / 12.26 (1.03) | 16.13 / 12.12 (**1.33**) | 53.74 / 49.40 (1.09) |
+| `churn` str | 33.95 / 34.15 (0.99) | 44.59 / 40.74 (1.09) | 100.67 / 93.91 (1.07) | 156.20 / 146.53 (1.07) |
+| `churn` big | -- | 15.08 / 12.40 (**1.22**) | 32.93 / 28.13 (**1.17**) | 58.31 / 53.13 (1.10) |
+| `find` u64 | 4.47 / 4.48 (1.00) | 5.49 / 5.45 (1.01) | 6.50 / 6.21 (1.05) | 16.27 / 14.25 (**1.14**) |
+| `find` str | 16.65 / 16.66 (1.00) | 19.27 / 18.91 (1.02) | 28.13 / 25.63 (1.10) | 65.97 / 60.81 (1.08) |
+
+gcc at the two headline sizes says the same: `build` u64 24.18 / 13.92 (**1.74**) at 800k and
+43.12 / 27.00 (**1.60**) at 4M, `build` str 90.14 / 74.78 (1.21) and 126.88 / 99.81 (1.27),
+`churn` u64 18.35 / 13.84 (**1.33**) and 60.23 / 55.89 (1.08), `find` u64 6.10 / 5.80 (1.05) and
+15.13 / 13.17 (**1.15**), `find` str 28.34 / 25.91 (1.09) and 66.14 / 61.38 (1.08), `churn` str
+106.66 / 99.60 (1.07) and 162.69 / 152.21 (1.07).
+
+**Three things the table says.** First, the size axis is the whole result, and it is the header
+comment's: at 50000 entries nothing but the string build moves, because nothing but the string
+values vector (2 MB at 50000 x 40 bytes) reaches a block of 2 MB. The score's 50000-entry churn
+gained 7% from the glibc route in the entry below and 0% here, and both are right -- a per-block
+allocator has no neighbour to share a huge page with. Second, `build` gains far more than the TLB:
+a doubling vector faults in every new block, and on 2 MB pages that is 512 times fewer faults --
+the cost `tame_allocator()` removed from the score, halved again, and it starts at 200000 for
+integers. Third, the allocator's reach ends at what the map allocates. `perf stat` per operation,
+L1 misses served by the L2 TLB / page walks, 4 KB then huge: `find` u64 4M 1.07 / 0.94 to 0.55 /
+0.016; `churn` u64 800k 1.32 / 0.79 to 0.48 / 0.0006; but `churn` str 4M 0.37 / 2.68 to only 0.29 /
+1.11 and `find` str 4M 0.95 / 1.53 to 0.57 / 0.45, because a string's *body* is `malloc`ed outside
+the allocator and still lives on 4 KB pages. The environment route covers those; this one cannot.
+
+**The segmented container, with its segment sized for the page** (asked as "would it make sense to
+size one chunk exactly as one huge page"). Yes, and it is the cleanest fit in the story for a
+power-of-two element size: a 2 MB segment of 16 byte pairs is 131072 elements, exactly one huge
+page, verified 2 MB aligned at elements 0, 131072 and 262144 of a 300000 entry map, with no
+rounding to amortize and no copy on growth. The catch is `num_bits_closest`, which rounds the
+element count *down* to a power of two so the index stays a shift and a mask: a "2 MB" segment of
+40 byte pairs is 32768 elements, 1.28 MB, below the threshold, and gets nothing; 16 MB segments
+bound the rounding at 2 MB per segment for any element size. The `segmented_map` alias hardcodes
+4096 bytes, so the recipe goes through the map's container slot. ns per operation, clang, `std::vector`
+on `std::allocator` / on the allocator / segmented on `std::allocator` / segmented 2 MB on the
+allocator / segmented 16 MB on the allocator:
+
+| | 200000 | 800000 | 4000000 |
+|---|---|---|---|
+| `churn` u64 | 11.80 / 11.38 / 13.98 / 13.39 / 13.47 | 16.05 / 12.00 / 18.61 / 14.19 / 14.52 | 53.94 / 49.55 / 65.95 / 61.23 / 61.17 |
+| `churn` str | 44.60 / 40.71 / 45.69 / 45.79 / 41.72 | 100.99 / 93.88 / 102.59 / 100.44 / 95.59 | 155.93 / 145.94 / 158.30 / 154.39 / 148.84 |
+| `find` u64 | 5.55 / 5.42 / 5.86 / 5.85 / 5.94 | 6.55 / 6.25 / 7.02 / 6.85 / 6.82 | 16.34 / 14.27 / 17.32 / 15.40 / 15.26 |
+| `find` str | 19.43 / 19.04 / 19.79 / 19.92 / 19.51 | 28.13 / 25.74 / 28.99 / 28.40 / 26.25 | 66.18 / 60.92 / 67.64 / 65.55 / 62.40 |
+| `build` u64 | 20.34 / 13.56 / 19.17 / 15.10 / 15.02 | 22.04 / 13.19 / 21.21 / 15.04 / 14.65 | 39.33 / 24.69 / 39.02 / 26.36 / 26.19 |
+| `build` str | 72.57 / 64.14 / 72.44 / 71.67 / 62.32 | 85.64 / 69.17 / 76.44 / 74.02 / **63.28** | 121.14 / 94.78 / 105.77 / 98.23 / **91.31** |
+| `churn` big | | 32.98 / 28.10 / 37.65 / 35.74 / 31.74 | |
+| `build` big | | 77.09 / 25.50 / 40.51 / 36.26 / **20.49** | |
+
+Three readings. The 2 MB segment gets the vector's whole gain for 16 byte pairs (`churn` u64 800k
+18.61 to 14.19, the same 1.31 the vector reads) and nothing for 40 and 72 byte ones, exactly as the
+rounding says, and 16 MB segments get it for all three. The segmented container itself is 10-20%
+slower than the vector on churn and lookups -- this file had never recorded that number -- and it
+is the second dependent load of every value access, which huge pages do not remove: segmented on
+huge pages lands about where the vector on 4 KB pages was. And on builds the order inverts: a
+segmented map neither copies on growth nor faults a new block in, so 16 MB segments on the allocator
+are the fastest build measured, 63.3 against the vector's 69.2 for strings and 20.5 against 25.5
+for 64 byte values, 3.8x the plain vector. Whether `segmented_map` should expose the segment size
+is an API question, not a measurement one; the recipe needs the container slot today.
+
+**boost::unordered_flat_map on the same allocator**, with the hash `scripts/ab/ab.cpp` gives it,
+because the 2026-09-06 entry found huge pages worth the same 22% to both maps at one size and one
+workload and the question was whether that holds. Point measurements, one per cell, five rounds,
+ns per operation: this map / this map on the allocator / boost / boost on the allocator. **Not
+octave geomeans**, so the boost-against-this-map ratios are the kind CLAUDE.md says must be re-taken
+before being quoted as a ranking; the allocator-against-itself ratios are what this table is for.
+
+| | 200000 | 800000 | 4000000 |
+|---|---|---|---|
+| `churn` u64 | 11.96 / 11.41 / 13.33 / 12.68 | 16.32 / 12.22 / 17.89 / 15.96 | 54.30 / 49.58 / 30.55 / 28.54 |
+| `churn` str | 44.79 / 40.61 / 54.07 / 49.81 | 101.17 / 94.14 / 109.01 / 104.04 | 156.17 / 146.11 / 111.76 / 105.80 |
+| `churn` big | | 33.08 / 28.19 / 49.35 / 30.41 | |
+| `find` u64 | 5.56 / 5.40 / 4.76 / 4.79 | 6.56 / 6.24 / 5.61 / 5.36 | 16.34 / 14.19 / 11.54 / 10.45 |
+| `find` str | 19.41 / 19.10 / 18.66 / 18.20 | 28.53 / 26.23 / 25.93 / 24.77 | 66.17 / 60.85 / 57.10 / 55.27 |
+| `build` u64 | 20.32 / 13.46 / 23.19 / 15.44 | 21.78 / 12.98 / 26.54 / 14.71 | 38.67 / 24.84 / 47.05 / 24.86 |
+| `build` str | 72.56 / 63.86 / 86.76 / 80.54 | 86.06 / 68.78 / 153.40 / 139.82 | 124.73 / 95.31 / 275.52 / 229.78 |
+| `build` big | | 77.61 / 25.36 / 93.54 / 36.20 | |
+
+Huge pages help both, and by amounts that follow each layout. boost gains most where its one
+region holds everything: the 64 byte value churn at 800k goes 49.35 to 30.41 (1.62x) because the
+values are inline in its bucket array and one huge-paged region gets all of it, where this map's
+values are a second region and its churn goes 33.08 to 28.19 (1.17x); its integer builds gain
+1.5-1.9x to this map's 1.5-1.7x. This map gains more on the integer churn at 800k (1.34x against
+1.12x), where its two regions are two translations per access and boost's one is one. The
+counters on the integer find at 4M say the same for both: L1 misses served by the L2 TLB per
+operation 1.07 to 0.55 here and 1.34 to 0.46 for boost, page walks 0.94 to 0.016 and 0.53 to 0.016.
+Nothing changes who is ahead where: boost stays ahead on lookups and on the large integer and
+string churn, this map stays ahead on every build and on churn up to 800k, and at 4M the two
+integer builds land on the same number (24.84 and 24.86) with or without -- which is the "level at
+4M" the insert-path entry above recorded, unmoved by the page size.
+
+**The threshold is 2 MB, not #231's 4 MB.** `huge4` -- the same allocator at a 4 MB threshold --
+tracks the 2 MB one wherever every block is past both and loses wherever blocks fall between:
+`build` u64 at 200000 reads 13.30 against 17.08, because the 3.2 MB values vector qualifies at one
+threshold and not the other. There is no size at which 4 MB wins, since a block below 2 MB is
+never rounded either way.
+
+**The score runs on 4 KB pages and pays 1.6 billion L1 dTLB misses for it** (2026-09-12, found
+while closing #268; Ryzen 9 7950X, gcc 16 and clang 22, glibc 2.43, THP mode `madvise`).
+
+The 2026-09-06 huge page entry measured hits against a warm 200000 entry map, read 7.18 to 7.10 ns,
+and concluded huge pages live "in the one regime the score cannot see". That measurement was the
+one shape of workload that cannot see them. A hit loop is throughput-bound: its lookups are
+independent, so an L1 dTLB miss served by the L2 TLB overlaps the next lookup's work. `churn` and
+`insert_erase` are chains -- probe, then value, then the erase's second walk -- and a translation
+on a chain is latency.
+
+The geometry is the whole argument. Zen 4's L1 dTLB holds 72 entries, which is 288 KB of 4 KB
+pages. `iterate` works on about 125 KB and fits. Everything else in the score does not: `insert_erase`
+peaks near 0.3-0.6 MB, `find_50` and `churn` sit on about 1.2 MB, `build` reaches 4.6 MB. So every
+random access to the index or the values in those twelve workloads is an L1 dTLB miss served by the
+L2 TLB, about seven cycles, and a lookup does two of them.
+
+**Zero-code A/B.** glibc 2.43's `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` keeps the heap top 2 MB
+aligned and `madvise(MADV_HUGEPAGE)`s every extension of at least 2 MB (observed:
+`madvise(0x11a00000, 8388608, MADV_HUGEPAGE)` on an 8 MB block); `tame_allocator()` already routes
+every block the score allocates through that heap. So the *same binary* runs twice, alternating,
+and only the environment differs -- no second build, no code layout, no ±3% band. The score process
+held 24 MB of `AnonHugePages` mid-run.
+
+Score, `bench_quick_overall_udm`, 4 KB over 2 MB, above 1.00 meaning huge pages are faster:
+
+| round | gcc | clang |
+|---|---|---|
+| 1 | 1.0218 | 1.0285 |
+| 2 | 1.0262 | 1.0454 |
+| 3 | 1.0221 | 1.0407 |
+| 4 | 1.0379 | 1.0246 |
+| 5 | 1.0203 | 1.0429 |
+| geomean | **1.0256** | **1.0364** |
+
+Per workload under gcc, ns/op, same ratio:
+
+| | `uint64_t` | `std::string` | `big_value` |
+|---|---|---|---|
+| iterate while adding then removing | 0.9996 | 1.0002 | 0.9990 |
+| random insert erase | 1.0010 | 1.0226 | 1.0011 |
+| build from empty | 1.0430 | 1.0050 | 1.0161 |
+| churn at a fixed size | **1.0713** | **1.0700** | **1.0822** |
+| 50% probability to find | **1.0559** | **1.0553** | **1.0708** |
+
+The three `iterate` rows are the control and read 1.000 to the third decimal: the only workloads
+whose working set fits the L1 dTLB are the only ones that do not move. `perf stat` over a whole
+score pass, gcc: `ls_l1_d_tlb_miss.tlb_reload_4k_l2_hit` **1,595,516,981 to 14,881,142**, page walks
+(`all_l2_miss`) 6,121,399 to 294,657, and 230.5 G instructions retired against 222.2 G in the same
+~104 G cycles, which is nanobench's time budget doing 3.7% more work.
+
+**What this says and does not say.** It is the largest measured, unclaimed lever left on the score
+and it is not in the map's code: the header cannot ask for a page size, an allocator can (#231), and
+so can a user's environment. It also says two more things about the benchmark itself. A machine
+whose THP mode is `always` scores 2.6-3.6% higher than one on `madvise`, and none of the nine bench
+runners records its mode, so cross-runner absolutes were already meaningless and this is one more
+reason. And the paired harness cannot measure it: both sides share one process, so an environment
+variable cancels out of the ratio -- this needs two whole runs of one binary, which is the method
+above.
+
+**Nothing holds a flat slot number any more, and gcc was the one paying for it** (2026-09-12,
+issue #262, Ryzen 9 7950X, clang 22 and gcc 16, `scripts/ab/solo.sh` and `perf stat`).
+
+#260 took the pack-and-unpack out of `finish_erase`. The same round trip was still there on the
+*lookup* half of every erase. `probe_result` carried `slot = group_idx * slots_per_group + lane`, and
+both of its consumers divided it straight back apart: `erase_group_slot` into `slot / slots_per_group`
+and `slot % slots_per_group`, `move_home` into the same pair. Four producers fed them -- `probe_from`,
+the two home-group loops, and `slot_of_value`.
+
+Clang folded most of it, which is why it was invisible from one compiler: what survived there was an
+`and` and a zero-extending `mov` per site. **gcc folded none of it.** Counting the `shr $0x4` /
+`and $0xf` pair inside each function of a three-entry-point translation unit:
+
+| | gcc before | gcc after | clang before | clang after |
+|---|---|---|---|---|
+| `erase(iterator)` | 2 | 0 | 0 | 0 |
+| `erase(key)` | 2 | 0 | 0 | 0 |
+| writing hit, through `move_home` | 2 | 0 | 0 | 0 |
+
+`probe_result` now carries `group_idx` and a `std::uint8_t lane`, `slot_of_value` returns the same
+pair as a `group_slot`, and `erase_group_slot`, `move_home`, `do_erase` and `located` take it.
+**The struct does not grow**: 12 bytes for `group` and 24 for `group_big`, exactly what it was, so the
+return-register question that makes `probe_past_home` delicate never comes up.
+
+Per-workload instructions from the score binaries themselves, one header per binary, candidate over
+baseline:
+
+| workload | gcc | clang |
+|---|---|---|
+| `uint64_t` random insert erase | **0.9549** | 0.9859 |
+| `uint64_t` churn at a fixed size | 0.9778 | 1.0025 |
+| `std::string` random insert erase | **0.9451** | 0.9905 |
+| `std::string` churn | 0.9808 | 0.9991 |
+| `std::string` 50% probability to find | **0.9749** | 0.9893 |
+| `big_value` random insert erase | 0.9610 | 0.9866 |
+| `big_value` churn | 0.9805 | 1.0000 |
+| every build and iterate workload | 1.0000 | 1.0000 |
+
+The string *find* row is the surprise and it is not the erase path: a string key takes the out-of-line
+`probe_past_home`, so `probe_result` is what that function returns, and repacking it made the return
+cheaper. The file's own warning points the other way -- returning a `probe_result` from an inner
+function once cost gcc 26% of an integer hit -- so that axis has teeth in both directions and nobody
+has swept it.
+
+**And the time is a lesson in why this is settled on instructions.** The score, one header per
+binary against `main`:
+
+| | ratio | rounds |
+|---|---|---|
+| gcc | 1.0017 | 5 of 5 candidate-faster |
+| clang, default alignment | 0.9975, then 0.9956 on a rerun | candidate-slower |
+| clang, `-falign-functions=32` | **1.0052** | 5 of 5 candidate-faster |
+
+Same source, same compiler, opposite sign, from nothing but where the functions landed. Two runs of
+the *same two binaries* are one layout sample, not two, and it took a third build to see it. The
+instruction counts above never moved.
+
+**The two value walks do not want the index prefetch the probe wants** (2026-09-12, issue #263,
+Ryzen 9 7950X, clang 22 and gcc 16, `scripts/ab/solo.sh`).
+
+`slot_of_value` and `repoint_value` each opened a group with `prefetch_index`, inherited from
+`probe_from` and never measured in place. The shapes are not the same. In the probe the index a group
+hands back is an *address*: `m_values[value_idx]` is a second miss queued behind the first, so pulling
+the rest of the block in early takes one level off a two-level chain. In these two walks the index
+**ends** the chain -- it feeds a compare, and in `repoint_value` a store that ends the function. It is
+still a dependent load, and for a block that spans three lines it is still often on a line the
+prefetch would have started; what is gone is the second level, and with it about as much as the two
+instructions cost. Which is what a 0.3-0.6% instruction win and a time inside the noise floor look
+like.
+
+Deleting both, one header per binary, per-workload instructions from the score itself
+(candidate / baseline, below 1.00 means less work):
+
+| workload | gcc | clang |
+|---|---|---|
+| `uint64_t` random insert erase | 0.9966 | 0.9970 |
+| `uint64_t` churn at a fixed size | 0.9967 | 0.9942 |
+| `std::string` random insert erase | 0.9988 | 0.9989 |
+| `std::string` churn | 0.9979 | 0.9988 |
+| `big_value` random insert erase | 1.0000 | 0.9946 |
+| `big_value` churn | 0.9971 | 0.9946 |
+| every build, find and iterate workload | 1.0000 | 1.0000 |
+
+Exactly the erase-heavy workloads, nothing else, on both compilers. The score reads **1.0039** under
+gcc (5 of 5 rounds) and **0.9991** under clang, whose rounds scatter either side of 1.00 -- `solo.sh`
+prints baseline/candidate, so above 1.00 is the candidate being faster, the opposite of `run.sh`'s
+convention. A small gcc win, no measurable clang change, and an instruction count that moves in one
+direction on both: **this ships on the instruction count.**
+
+One cost that the score cannot see. In a translation unit that calls `erase` itself rather than
+building the whole test binary, clang stops inlining `do_erase` into its four entry points: a six
+function TU over `map<uint64_t, uint64_t>` goes from one out-of-line `do_erase` to three and from
+7880 to 8211 bytes of text, +4.2%. A caller in that position pays the call boundary's documented 15
+instructions on the erase entry points, against the 0.3-0.6% the walk itself saves. gcc does not move
+(28162 to 28065 bytes).
+
+**The scratch benchmark said the opposite and was wrong.** A one-map translation unit that erases
+every key read 114.36 instructions per erase with the prefetches and **126.82** without under clang --
+removing two instructions appeared to add twelve, because in that small TU it moved an inlining
+decision. That is #254's lesson arriving from the other side: the same change, measured in the real
+build, takes instructions *off* every erase workload. Two binaries of the actual score, not a
+scratch TU, is what the rule in `CLAUDE.md` means.
+
+The probe's own prefetches stay. Removing either of those was measured in 2026-09 as a clang win and
+a bigger gcc loss, and that is a different function with a dependent load behind it.
+
+**`prefetch_index` was a line short for `group_big`, and covering that line is not the fix**
+(2026-09-12, issue #252, same machine, `scripts/ab/prefetch_lines.cpp`).
+
+`prefetch_index` asked for `p + 64` and `p + sizeof(Block) - 1`, skipping the first line because the
+probe is reading the fingerprints out of it. For the 88 byte `group` those two addresses cover every
+line a block can have past the first -- enumerating every alignment, nothing is missed -- which is why
+#250 left this function alone when it fixed `prefetch_block`. `group_big` is 152 bytes and reaches a
+*fourth* line whenever `p % 64 > 40`. `152 % 64 == 24` and `gcd(24, 64) == 8`, so `p % 64` only takes
+the eight multiples of eight and that is 2 of them, **a quarter of blocks** -- the same fraction, by
+the same argument, that `prefetch_block`'s comment gives for the 88 byte block. First-and-last then
+skips the middle line: at `p % 64 == 48` it holds `m_index[7..14]`, eight of the sixteen value
+indices.
+
+The obvious repair -- name the third line too -- does nothing. 152 byte blocks, 304 MiB, probe-shaped
+reads, sixteen-deep lookahead, medians of seven interleaved rounds from one binary:
+
+| what is asked for | ns/block |
+|---|---|
+| `p + 64`, `p + 151` (first and last, as shipped) | 15.664 |
+| `p + 64`, `p + 128`, `p + 151` (every line) | 15.664 |
+| **`p + 64`, `p + 128`** (two consecutive lines) | **15.006** |
+
+Same answer as #250 gave `prefetch_block`, for the same reason: the hardware fetches what it can see
+coming, so the job is to start it in the right place rather than to name every line. The third
+prefetch buys back nothing and occupies a slot. It holds across the cache boundary -- the same two
+modes read 2.881 against 2.980 at 50k blocks, 5.173 against 5.265 at 200k and 13.226 against 13.854 at
+800k -- and gcc agrees at 2M, 15.00 against 15.60 in its own build.
+
+**`prefetch_block` had the same bug and this entry created it.** Its loop runs from the block's start,
+which is two prefetches at 88 bytes and *three* at 152, so for one release the two helpers asked for
+opposite things about the same block and `prefetch_block`'s comment claimed "the loop is what makes it
+right for group_big too". Capping the loop at two lines reads **15.814 against 16.169**. The one place
+it goes the other way is a rehash-shaped read of every byte, 18.887 against 18.707, and that is the
+minority of its call sites: five of the six are lookups, and the rehash issues one prefetch per
+*element* rather than per block.
+
+So both helpers ask for **two consecutive lines from where they start, clamped into the block**. For
+`group` that is what they already asked for: a six function `map<uint64_t, uint64_t>` translation
+unit compiles byte identical before and after under clang *and* gcc, which is the evidence that this
+costs the default type nothing -- stronger than any timing. For `group_big` it is `p + 64, p + 128`
+and `p, p + 64`. Dropping the second prefetch entirely rather than clamping it would cost the 88 byte
+block 5%: 13.231 against 12.582.
+
+The 88 byte block is also where the harness checks itself. `pair` and `steptail` name the *same two
+addresses* there, and they read 12.582 and 12.578 -- so on this build the floor is a few hundredths of
+a nanosecond. It is not always that good: the modes are separate instantiations, and between two
+builds of the file the same mode moves by a percent or two, which is why every comparison here is
+interleaved inside one binary.
+
+End to end, one header per binary against `main` under clang: the `group_big` score
+(`bench_quick_overall_udm_bigbucket`, the fifteen workloads nothing else in the tree runs) reads
+**1.0042** over five rounds, and the default score **1.0033** over five, both candidate-faster.
+
+**The harness was charging its own dispatch to the prefetch shape.** `prefetch_lines.cpp` chose what
+to prefetch with `how == "pair"` inside the measured loop -- a `std::string` compare per iteration,
+and a different number of them per mode. Two modes that name the *identical* pair of addresses on the
+88 byte block read 14.11 and 13.43 ns/block. The mode and the read shape are template parameters now.
+#250's numbers all carried that overhead, so they were re-taken on the fixed harness: `p, p + 64`
+12.336, `p, p + 87` 12.719, all three lines 12.736, `p` alone 13.153 -- the same ordering and the same
+3% #250 reported (12.28 against 12.67), so its conclusion survives its harness being wrong.
+
 **`finish_erase` packed a slot that the store took straight back apart** (2026-09-11, issue #260,
 Ryzen 9 7950X, clang 22 and gcc 16, `perf stat`, single-header binaries).
 
@@ -823,6 +1916,12 @@ mechanism could not reach a lookup at all. Running `scripts/ab/run.sh -r HEAD` o
 and `hashstr` 0.872. So the candidate side of a paired run is systematically faster on those, and a
 single-digit-percent reading on them means nothing. The null run is the check, it costs one run, and
 it should be taken before believing any sub-benchmark delta under about 5%.
+
+Re-taken 2026-09-12 after the lookup workloads stopped rebuilding their table (see "Fifty points
+draw the load-factor sawtooth"): `rmissstr` now reads 0.993 to 1.008 and `rhit64` 0.976 to 1.000
+across builds of the harness, with `-falign-functions=32` moving that 0.976 to 0.997. **The null run
+has to be re-taken per build, not per harness** -- each build is one sample of the code layout band,
+and the workload that carries the bias is not always the same one.
 
 **A block's prefetches should step from its start, not jump to its end** (2026-09-11, issue #250,
 `scripts/ab/prefetch_lines.cpp`, Ryzen 9 7950X, clang 22). Raised by a cleanup review as "a quarter
@@ -2302,6 +3401,12 @@ to 7.58**, both about 22%; at 200000, 7.18 to 7.10 and 5.47 to 5.29, which is no
 speed in exactly the regime the score cannot see -- 200000 entries is the largest thing the score
 builds -- and it does not change the ranking, since it helps both equally. Worth doing as an opt-in
 allocator and worth documenting; not worth pretending it closes the gap to boost.
+
+**Retracted in part, 2026-09-12:** "the regime the score cannot see" was wrong. The 200000 figure
+above is hits against a warm map, which is the one shape that is throughput-bound and overlaps its
+translations. The score itself moves 2.6% under gcc and 3.6% under clang on 2 MB pages, and churn
+and the 50% find move 5-8%: see "The score runs on 4 KB pages and pays 1.6 billion L1 dTLB misses
+for it" below.
 
 **Merging the group metadata with its own value indices: measured, and kept.** The claim above that
 it had never been tried was wrong -- the split's own comment in the header recorded trying it and
@@ -3829,6 +4934,292 @@ The same numbers say where the tie ends: on a table that does not fit in cache, 
 no coin flip, the memory chain dominates and boost's shorter one shows -- that is the 11% on
 lookups. And nothing here is spare on the instruction side: a change that lengthens the dependent
 chain costs at once, a change that only saves instructions on this workload is invisible.
+
+**`visit()` re-measured across the cache boundary: the cache-resident loss is a hit-rate effect**
+(2026-09-13, `scripts/ab/bulk_visit.cpp`, Ryzen 9 7950X, clang 22, `map<uint64_t, size_t>`, 4000000
+lookups per cell, `taskset -c 2`).
+
+The README documented `visit()` at 1.18x to 1.29x from two sizes, 4 million and 16 million entries,
+both past every cache on this machine, and said in prose that below the cache it is "a small loss".
+Two sizes on one side of a cache are one size, which is this file's own rule, so the claim was
+re-taken over six sizes and both hit rates. ns per lookup, `plain` (the batch looked up one key at a
+time) against `bulk` (`visit()` on the same batch):
+
+| entries | plain, all hits | bulk | | plain, half hits | bulk | |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1000 | 3.95 | 4.43 | 0.89x | 8.16 | 6.83 | 1.19x |
+| 10000 | 4.44 | 4.63 | 0.96x | 8.82 | 7.16 | 1.23x |
+| 100000 | 7.13 | 6.55 | 1.09x | 11.44 | 9.40 | 1.22x |
+| 1000000 | 18.41 | 15.35 | 1.20x | 23.03 | 20.10 | 1.15x |
+| 4000000 | 38.10 | 25.46 | 1.50x | 34.80 | 28.01 | 1.24x |
+| 16000000 | 36.49 | 29.03 | 1.26x | 37.35 | 30.68 | 1.22x |
+
+**The prose was half wrong.** The loss below the cache is real with every key present, 0.89x at a
+thousand entries and 0.96x at ten thousand, and it is gone the moment half the lookups miss: 1.19x
+and 1.23x at those same two sizes, and 1.15x to 1.24x at every size above them. So the gate on
+`visit()` is not the table's size alone, it is the size and the hit rate together, which is what
+`bulk_visit.cpp`'s own header comment says and what the documented two-size table could not show.
+The reading is that a miss the chunk absorbs is a branch the one-at-a-time loop mispredicts; that
+part is not measured separately.
+
+The batching underneath it, `inline` (fetch and look up in one loop body) against `plain`, is 1.30x
+at a million all hits, 1.32x at four million, 1.55x at sixteen million and 1.57x at four million with
+half missing. So the whole thing, the naive loop against a batch handed to `visit()`, is 50.26 to
+25.46 ns at four million entries: **1.97x**, of which the batch is the larger half. That is the
+number a caller sees and the reason `visit()`'s own column is the smaller one.
+
+**`replace()` + `extract()` as the way to unique a vector, and the duplicate rate that turns it
+over** (2026-09-13, `scripts/ab/unique.cpp`, also built `-DUDM_UNIQUE_U64`, Ryzen 9 7950X, clang 22,
+string keys 8 to 135 bytes skewed short, median of 31 rounds or more, `taskset -c 2`).
+
+Taking the duplicates out of a `std::vector<std::string>` is the job a dense set's storage is
+already shaped for: `set.replace(std::move(v))` makes the caller's vector the set's own, and
+`std::move(set).extract()` hands it back, so no string is copied and none is allocated. Five
+variants, all checked against the same order-independent checksum and the same unique count:
+`replace()` + `extract()`, the same set built from the range and then extracted,
+`boost::unordered_flat_set<std::string>` copied out into a fresh vector, a
+`boost::unordered_flat_set<std::string_view>` over the caller's vector with the compaction done
+afterwards (it has to be afterwards -- moving an element invalidates the view the set is holding),
+and `std::sort` + `std::unique`.
+
+**Every variant has to release the input inside the clock, and the first version of this harness let
+two of them off.** `replace()` consumes the caller's vector and destroys the duplicates in it; a
+variant that builds a separate set leaves the caller holding all n elements, and destroying those is
+work the caller still has to do to reach the same state. Left outside the clock it is a free per
+element charged to one variant and to none of the others. Correcting it moved the million-element
+insertion column from 40.07 to 70.46 ns at no duplicates and reversed which variant wins at half
+duplicates. It is the same trap as the README's build panel, one level down: a benchmark has to say
+what state each contestant ends in.
+
+**And eleven rounds was not enough to exclude an outlier.** The first sweep read 86.78 ns for
+`replace()` at a million elements and half duplicates; five later runs of the same binary read 61.4
+to 64.1, and a rebuild of the *old* binary read 61.0 to 62.3, so it was neither the build nor a real
+effect. The harness now prints the min and max beside the median, which is what would have caught it.
+
+**The range constructor wants a `std::make_move_iterator` pair, and that is worth 1.4x to 2.4x.**
+The range insert probes before it constructs anything, so a key already present is skipped with the
+element never touched: only the kept elements are moved out of the caller's range and the duplicates
+are left intact. With `extract()` on the way out that is a unique with no string copy anywhere.
+Range constructor, no duplicates, ns per element: 40.20 to 23.57 at a hundred thousand and 70.64 to
+49.83 at a million for keys of 8 to 135 bytes, 48.07 to 25.39 and 141.32 to 59.44 for keys of 200
+bytes and up. It grows with the key because below the small string buffer a move is a copy. Not
+symmetric: a set's elements are `const`, so the way *out* of one that is not dense stays a copy
+whatever the caller writes, which is the thing `extract()` is for.
+
+Nanoseconds per element of the input vector, no duplicates, one run:
+
+| | 1000 | 10000 | 100000 | 1000000 |
+|---|---:|---:|---:|---:|
+| `replace()` + `extract()` | 4.97 | 6.48 | 8.62 | 9.73 |
+| range constructor (moved) + `extract()` | 14.82 | 23.68 | 23.57 | 49.83 |
+| boost, copied out | 58.23 | 89.16 | 88.15 | 264.32 |
+| boost set of views, compacted after | 10.72 | 15.91 | 18.10 | 28.83 |
+| `std::sort` + `std::unique` | 44.90 | 115.12 | 146.80 | 222.62 |
+
+So 10x to 27x over the version a caller writes with a set that is not dense, 2.1x to 3.0x over the
+hand-written one that copies no string either, and 2.7x to 5.1x over the range constructor. Neither
+of the top two rows copies a string, so what is left between them is the container: `replace()` is
+handed a vector already the right size, the range constructor doubles its own and moves everything
+it holds at each step.
+
+The duplicate rate narrows it. At a million elements, ns per input element:
+
+| | 0% | 50% | 90% |
+|---|---:|---:|---:|
+| `replace()` + `extract()` | 9.73 | 61.57 | 43.84 |
+| range constructor (moved) + `extract()` | 49.83 | 54.36 | 28.60 |
+| boost, copied out | 264.32 | 133.59 | 38.26 |
+| boost set of views, compacted after | 28.83 | 59.44 | 42.77 |
+| `std::sort` + `std::unique` | 222.62 | 256.39 | 267.38 |
+
+Across sizes at half duplicates `replace()` reads 10.41 / 16.36 / 24.07 / 61.57 against the moved
+range constructor's 14.83 / 26.71 / 27.16 / 54.36, so it is ahead to a hundred thousand and behind at
+a million; at nine tenths, 15.86 / 20.00 / 27.50 / 43.84 against 14.10 / 21.32 / 23.79 / 28.60.
+
+**Retracted, 2026-09-13, same day it was written: "insertion pays no `free` for a duplicate, because
+it never copied it anywhere."** That was the explanation given here for the turn-over and it does not
+survive the harness's own accounting. Both versions release every duplicate -- `replace()` as it
+walks, the range constructor when the caller's vector goes -- and the corrected harness charges both
+for it. What is left is *when*: `replace()` releases them inside a walk whose probes go to random
+addresses, the range constructor afterwards in one sequential sweep with nothing to interleave with.
+That is a reading of the numbers and not something measured directly, and it is written here as one.
+
+**The erosion is the dedup walk, and the element type shows it on its own.** With `std::uint64_t`
+elements at a million, `replace()` reads 3.81 / 6.97 / 4.93 against insertion's 8.72 / 8.45 / 4.91 at
+0 / 50 / 90%: the lead erodes from 2.3x to level and never reverses. Removing a duplicate pulls
+`back()` into the hole and hashes it one iteration before the probe that uses it, so alone among the
+elements in the walk its block arrives with no lookahead over it, and a duplicate-heavy input is
+mostly made of those.
+
+**A forward compaction removes the re-hash entirely, and is not a free win** (`scripts/ab/replace_forward.patch`,
+measured 2026-09-13, one header per binary). Stepping over a duplicate and moving the survivors down
+on top of it means every element is hashed exactly once with the full lookahead, and it also makes
+the result order-stable. It moves one element per element *kept* where the pull moves one per
+duplicate, so it trades:
+
+| duplicates | 5% | 10% | 20% | 30% | 40% | 50% | 60% | 75% | 90% |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 100000 elements | 0.83 | 0.84 | 0.89 | 1.02 | 1.02 | 1.10 | 1.15 | 1.24 | 1.27 |
+| 1000000 elements | 0.92 | 0.93 | 0.98 | 1.07 | 1.18 | 1.33 | 1.41 | 1.51 | 1.47 |
+
+Crossover at about 25-30% on both sizes, nothing either way at 0%, and at the top it takes a million
+strings at nine tenths duplicates from 44.2 to 29.2 and `uint64_t` from 4.93 to 3.68, which puts the
+integer case ahead of insertion at every rate measured.
+
+**Destroying the leftover tail front to back is worth 1.04x at 90% and 1.05x at 50%** -- 29.2 to
+28.3 and 47.5 to 45.6 -- because that tail holds live duplicate strings and the order their buffers
+are released in is worth that much to glibc. It needs `erase(first, last)`, which `std::vector`,
+`std::deque` and `boost::interprocess::vector` have and `segmented_vector` does not, so calling it
+unconditionally would add a requirement the header deliberately does not make ("the container is
+only required to have pop_back", `drop_tail_and_reindex`).
+
+**And the other call site that has that same comment on it gains nothing from the change** (measured
+2026-09-13, `scripts/ab/merge.cpp -DUDM_MERGE_STR`, medians of nine, one header per binary).
+`merge()`'s `drop_tail_and_reindex` with `erase(keep, end)` instead of the `pop_back` loop: 23.414 to
+23.270 ns at 200000 and 0% overlap, 24.033 to 24.266 at 25%, 53.461 to 54.388 at a million and 0%,
+52.469 to 52.547 at 25%. Inside 2% everywhere with the sign flipping, so: a null. The reason is
+mechanical and worth keeping -- merge's tail is *moved-from* elements, and an empty `std::string`
+husk destructs without a `free`, so there is no release order to get right. Only a tail of live
+elements, which is what the dedup leaves, has anything to reorder.
+
+So a `segmented_vector::erase(first, last)` would today be built for one unapplied patch and nothing
+else. If the forward compaction ever lands, the cheap shape is an `if constexpr` on whether the value
+container has `erase(first, last)`: that covers `std::vector`, which is the default, without asking
+anything new of a custom container and without `segmented_vector` needing the cross-segment move that
+a general range erase implies. Both call sites only ever truncate a suffix, and `segmented_vector`
+already does exactly that, front to back, in its private `resize_shrink`.
+
+Not applied. It regresses the 5-25% band, which is the band a bulk load is most likely to be in, and
+it changes what `values()` returns afterwards from "partly reordered" to the input's own order,
+which four tests in `test/unit/replace.cpp` and `fuzz_replace_map` pin. Worth revisiting if a caller
+turns up whose input really is mostly duplicates.
+
+What this says and does not say: one machine, one compiler, one key distribution, and a vector of
+200 byte keys would move every row, since the share that is hashing goes up and the share that is
+`free` goes down. It says nothing about `map`, only about `set`. `std::sort` is in the tables for
+reference and not as a rival -- it also sorts the result.
+
+**The rehash pipeline below 200000 entries, where it had never been measured: it costs a gcc
+integer build up to 4.2% in a band, and it stays** (2026-09-15, no issue, asked for directly after
+5.0.1; Ryzen 9 7950X, clang 22 and gcc 16, `scripts/ab/rehash_size.sh` with
+`scripts/ab/rehash_plain.patch`). The entry above measured the pipelined loop from 200000 entries
+upwards. Below that it had no measurement at all, and `fill_buckets_from_values` has no gate where
+`replace()` has one at 256 KB of index -- so the question was whether the rehash is the shape
+`replace()` turned out to be, a pipeline shipped above its crossover and never looked at below it.
+
+The control is the same loop with the ring and the prefetch removed and everything else left alone:
+the iterator walk, the hoisted group pointer, mask and shift, and the placement itself. One variant
+per binary, because a ring changes the function's size and two headers in one translation unit share
+an inlining budget. The subject is `rehash(0)` on a map already at the bucket count `rehash(0)` asks
+for, where the header skips the allocation and runs `clear_buckets()` plus the loop; the memset is in
+both variants and dilutes the ratio rather than steering it. Nineteen sizes, four per octave, because
+a rehash places every element and its cost per element follows the load factor, which sweeps half to
+maximum between doublings. Rounds alternate the two binaries; each cell is the median of 49 rounds
+for the loop and 25 for the build. Every ratio is plain/pipelined, so above 1 the pipeline is
+winning.
+
+### `rehash(0)`, the loop on its own
+
+| entries | index | u64 clang | u64 gcc | str clang | str gcc |
+|---|---|---|---|---|---|
+| 1000 | 5 KB | 1.087 | 1.064 | 1.037 | 0.946 |
+| 1414 | 8 KB | 1.098 | 1.020 | 1.040 | 0.945 |
+| 2000 | 11 KB | 1.027 | 1.052 | 1.071 | 0.982 |
+| 2828 | 15 KB | 1.073 | 1.037 | 1.081 | 0.990 |
+| 4000 | 21 KB | 1.036 | 1.041 | 1.105 | 1.011 |
+| 5657 | 30 KB | 1.016 | 1.006 | 1.118 | 1.019 |
+| 8000 | 43 KB | 1.007 | 0.975 | 1.137 | 1.031 |
+| 11314 | 61 KB | 1.000 | 0.995 | 1.131 | 1.030 |
+| 16000 | 86 KB | 0.966 | 0.966 | 1.148 | 1.044 |
+| 22627 | 122 KB | **0.956** | **0.961** | 1.154 | 1.052 |
+| 32000 | 172 KB | **0.953** | **0.956** | 1.279 | 1.181 |
+| 45255 | 243 KB | 0.953 | 0.971 | 1.285 | 1.186 |
+| 64000 | 344 KB | 1.079 | 1.082 | 1.439 | 1.334 |
+| 90510 | 486 KB | 1.072 | 1.073 | 1.432 | 1.331 |
+| 128000 | 688 KB | 1.207 | 1.222 | 1.534 | 1.414 |
+| 181019 | 972 KB | 1.197 | 1.206 | 1.518 | 1.394 |
+| 256000 | 1.3 MB | 1.271 | 1.273 | 1.527 | 1.413 |
+| 362039 | 1.9 MB | 1.253 | 1.264 | 1.463 | 1.362 |
+| 512000 | 2.7 MB | 1.274 | 1.284 | 1.497 | 1.414 |
+
+A string key wants the pipeline at nearly every size, up to 1.53x, and the two gcc cells at 1000 and
+1414 that read 0.945 are the only ones below 0.98. An integer key wants it up to 61 KB of index and
+from 344 KB on, and **does not want it between**, where it costs 3 to 4.7% on both compilers. Two
+runs of the same sweep agreed on every cell of that dip to within 1.5%.
+
+### Build from empty, which is where the loop actually runs
+
+| entries | index | u64 clang | u64 gcc | str clang | str gcc |
+|---|---|---|---|---|---|
+| 1000 | 5 KB | 1.063 | 1.048 | 0.999 | 0.998 |
+| 1414 | 8 KB | 1.055 | 1.028 | 0.985 | 0.985 |
+| 2000 | 11 KB | 1.049 | 1.031 | 1.003 | 0.996 |
+| 2828 | 15 KB | 1.056 | 1.015 | 1.002 | 0.996 |
+| 4000 | 21 KB | 1.043 | 0.992 | 1.014 | 1.002 |
+| 5657 | 30 KB | 1.087 | 0.994 | 1.012 | 1.003 |
+| 8000 | 43 KB | 1.025 | 0.979 | 1.024 | 1.009 |
+| 11314 | 61 KB | 1.023 | 0.983 | 1.016 | 1.008 |
+| 16000 | 86 KB | 1.023 | **0.965** | 1.027 | 1.006 |
+| 22627 | 122 KB | 1.023 | 0.974 | 1.016 | 1.006 |
+| 32000 | 172 KB | 0.979 | **0.958** | 1.032 | 1.017 |
+| 45255 | 243 KB | 1.004 | 0.963 | 1.021 | 1.013 |
+| 64000 | 344 KB | 1.013 | 0.977 | 1.054 | 1.044 |
+| 90510 | 486 KB | 1.019 | 0.980 | 1.037 | 1.030 |
+| 128000 | 688 KB | 1.030 | 1.004 | 1.070 | 1.061 |
+| 181019 | 972 KB | 1.035 | 1.002 | 1.050 | 1.044 |
+| 256000 | 1.3 MB | 1.056 | 1.024 | 1.083 | 1.075 |
+| 362039 | 1.9 MB | 1.051 | 1.018 | 1.077 | 1.072 |
+| 512000 | 2.7 MB | 1.070 | 1.038 | 1.144 | 1.133 |
+
+Under clang the pipeline costs a build nothing anywhere: the worst cell of the two key types is
+0.979, and the best is 1.144. Under gcc it costs an integer build 1.7 to 4.2% from 43 KB to 486 KB of
+index, which is the same band the loop loses in, and pays it back from 688 KB on. A string build is
+a wash under both compilers below 344 KB and a win above.
+
+### Eleven instructions per element, and where they buy nothing
+
+`perf stat` with the repetition count fixed at compile time so both variants do the same work, u64
+keys, clang, the build phase included in both and identical in both:
+
+| entries | index | pipelined instr/el | plain instr/el | pipelined cycles/el | plain cycles/el |
+|---|---|---|---|---|---|
+| 4000 | 21 KB | 35.9 | 24.8 | 9.87 | 10.75 |
+| 22627 | 122 KB | 37.7 | 26.4 | 10.73 | 9.91 |
+| 512000 | 2.7 MB | 81.0 | 61.8 | 36.64 | 39.10 |
+
+The ring costs 11 instructions per element and that does not move with the table -- the same order as
+the 13 it costs everywhere else in this header. What moves is what they buy. At 21 KB they take 8% of
+the cycles out, at 122 KB they add 8%, and at 2.7 MB they take out 6%. So the loop is not paying for
+its bookkeeping in exactly one place: a cheap hash over an index too big for L1 and too small to
+miss.
+
+**Kept, no gate.** A gate here would have to be on index bytes, the way `replace()`'s is, and the
+band that loses is bounded on both sides -- one threshold cannot say it. Fitting the obvious one,
+"no pipeline below 688 KB of index", hands a gcc integer build back its 2 to 4.2% and takes 4.3 to
+8.7% off a clang integer build below 30 KB, 1 to 3% off a clang string build in the middle, and every
+string cell above 43 KB on both compilers. The loss is one compiler, one key type and one band; the
+win is the other compiler at the same sizes, both compilers above the band, and strings nearly
+everywhere. Separating them needs to know whether the key's hash is expensive, which is a fact about
+the caller's data and not about the table, and this map does not gate on those (the range insert's
+`distance()` sizing, declined for the same reason).
+
+**The harness had to be pinned before any of this was worth reading.** The first version put both
+timed functions in one translation unit, and the second one changed the first: adding `measure_build`
+and a nanobench include moved the pipelined side of the `rehash` mode from 1.45 to 1.62 ns per
+element at 22627 entries while the plain side did not move at all, turning a 4% dip into 13%. The
+build is deterministic -- the same source and flags give a byte-identical binary, checked with
+`md5sum` -- so that was the inliner and not code layout, and it is the "inlining artifact" rule met
+from a new direction: not a count that moved, but a *time* that moved, in a file where nothing the
+clock covers had changed. `REHASH_MODE_BUILD` now gives each mode its own translation unit, the
+`perf` build takes its repetition count from an `#if` so that the default translation unit stays
+byte-identical to the one the tables came from, and the same sweep run twice agrees to 1.5%.
+
+What this says and does not say: one machine, two compilers, one value type (`std::uint64_t`), and an
+integer key through the workloads' bijection. The build column is a build and nothing else -- it does
+not say what a table that churns pays, where the rehash runs over values that are already resident.
+The `rehash(0)` column includes `clear_buckets()`'s memset in both variants, which makes the loop's
+own ratio slightly better than the column shows, not worse. Nothing here was measured above 512000
+entries; the entry above covers 2M and 4M and says the pipeline wins there by more.
 
 ## The robin hood index this replaced, and its dead ends
 

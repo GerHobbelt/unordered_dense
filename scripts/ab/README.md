@@ -33,6 +33,76 @@ which spans 0.79 to 1.33 point to point. The same thing happens to the boost col
 header untouched: a single same-code run reads `boost/cand` at 1.205, 0.641, 0.649, 0.685 and 0.831
 across one octave of `churn64`, a 1.9x swing, geomean 0.779.
 
+### Fifty points draw it, five average it out
+
+`-p 50` measures fifty sizes across the octave instead of five, and what it draws is not what five
+points suggest. The top of the cycle is a *point*: a sweep spaced a fifth of an octave apart gets
+no nearer the peak than load 0.763, one spaced a fiftieth reaches 0.795 of a maximum of 0.800, and
+the amplitude it then reports is far bigger.
+
+| dearest over cheapest, per element across the octave | 5 points | 50 points |
+|---|---|---|
+| `rmiss64` | 1.286x | **1.458x** |
+| `churn64` | 1.142x | **1.284x** |
+| `churnbig` | 1.148x | 1.247x |
+| `rhit64` | 1.115x | 1.168x |
+| `churnstr` | 1.055x | 1.120x |
+| `rmissstr` | 1.061x | 1.099x |
+
+Each point line carries the load factor of a table of that size, so where on the cycle a number
+sits is readable rather than inferred, and each workload prints its cheapest and dearest point;
+where the workload's live size is about half of n (`ie*`, `find*`) the load is left off rather than
+guessed.
+
+**What that is worth depends on whether the two maps double at the same sizes.** Taking the fifty
+points of a run apart into the ten five-point sweeps inside it -- every tenth point, each one
+spanning the whole octave, each one a sweep this harness would have been happy to report -- and
+comparing each to the fifty-point geomean:
+
+| | `base/cand`, the same header both sides | `boost/cand` |
+|---|---|---|
+| `churn64` | 0.999 .. 1.005 | **0.742 .. 1.023** |
+| `churnbig` | 0.995 .. 1.002 | 0.787 .. 1.069 |
+| `churnstr` | 0.998 .. 1.001 | 0.855 .. 1.038 |
+| `rmiss64` | 0.989 .. 0.996 | 0.833 .. 1.010 |
+| `build64` | 0.992 .. 1.003 | 1.459 .. 1.571 |
+| `rhit64` | 0.974 .. 0.980 | 0.753 .. 0.776 |
+
+Against another revision of this header the five-point sweep is worth 0.6% -- the two sawtooths are
+in phase, so they cancel out of the ratio whatever is sampled, which is why every same-family
+paired number in this project is sound however it was taken. Against boost, whose bucket counts are
+a different sequence, the same five points land anywhere within **26%** of the answer: `churn64`
+reads 0.742 or 1.023 for one quantity depending only on where the five sizes start. Both fifty-point
+runs made on the day agree to 0.4% on that spread, so it is phase and not noise. **A cross-family
+ratio wants fifty points; a header-against-header one does not.**
+
+The cycle is one octave long only because the array doubles, which is the map's policy and not a
+law. So the harness measures it: before anything is timed it inserts into each map under comparison,
+records every size at which `bucket_count()` changes, prints those sizes and the ratio between them,
+and says whether an octave is one whole turn. A growth factor under two -- which this project's
+notes list as a knob -- would make the geomean over an octave weigh part of the cycle twice, and the
+run now says so where it cannot be missed instead of being quietly wrong.
+
+Fifty points do not make the run ten times longer, because what a point costs was cut where the
+sawtooth needs the points and left alone where it does not. All twenty workloads, twelve epochs,
+clang on a 7950X: **2m21 at five points and 5m34 at fifty**, where the five-point run cost 3m19
+before this change. With `-b`, three alternatives instead of two: 4m51 before, 3m32 and 8m37 now.
+
+| workload | sizes at `-p 50` | why |
+|---|---|---|
+| `it*`, `hashstr` | 1 | no bucket array whose load factor cycles, and iteration is quadratic in the element count |
+| `ie*`, `find*` | 5 | the map grows from empty through every doubling while the workload runs, so the cost is already an integral over the cycle: measured over one octave, `ie64`'s per-element cost moves 1.03x and `find64`'s a monotone 1.10x, neither with a cycle in it |
+| `build*`, `churn*` | 50 | n is the live size and the payload is n operations; both carry the whole sawtooth |
+| `rhit*`, `rmiss*` | 50 | the sharpest sawtooth there is here (1.32x on a miss), and a point costs the same at every size |
+
+The two lookup workloads pay for the other fifty: they search a table built **outside** the timed
+region, a million times rather than ten, which is what makes a point of the sweep cheap without the
+fill being part of the ratio. Their absolute times before and after 2026-09-12 are not comparable,
+**and neither are their ratios against a map that is not this header**: `rhit64` against boost read
+0.798 with the fill inside the timed region and 0.760 without it, `rmissstr` 0.931 and 0.832. Their
+ratios against another revision of this header are unchanged to within 1%, because there both sides
+pay the same fill and it cancels. Nothing scored changed.
+
 `it64`, `itstr`, `itbig` and `hashstr` are measured at one size on purpose. Iteration walks the
 dense value vector, which has no buckets and so no sawtooth to average out, and its cost is
 quadratic in the element count, so sweeping it would triple the run for an answer that does not
@@ -40,12 +110,15 @@ move; `hashstr` never touches a table. The sizes are template parameters rather 
 arguments, so the default instantiation is the same code `bench_quick_overall_udm` has always
 compiled -- turning a literal loop bound into a runtime value would be a change to the scored
 benchmark even at the same value, and its absolute numbers are only comparable across time if its
-workloads do not move.
+workloads do not move. That is also why the point count is a compile-time constant: `-p` rebuilds
+the binary rather than re-running it, which costs 17 seconds of clang at fifty points against four
+at five.
 
 ## Every other map, on the same workloads
 
     scripts/ab/maps.sh [-c COMPILER] [-s] [-r REV] <check|speed|memory|names> [u64|str|big] [base]
     scripts/ab/maps_one.sh [-c COMPILER] [-k u64|str|big] <workload> <entries> <reps> [map...]
+    scripts/ab/bench_readme.sh [-c COMPILER] [-b BASE] [-r ROUNDS] [-o OUTDIR] [-w WORKLOAD,...] [map...]
 
 `run.sh` compares this header against another revision of itself. `maps.sh` compares it against
 everything else: `boost::unordered_flat_map` and `unordered_node_map`, `absl::flat_hash_map` and
@@ -56,6 +129,23 @@ process with `compare()` interleaving them. `boost` and `absl` appear twice, onc
 library's hash and once with their own, because the same-hash convention is the right way to
 compare *indexes* and is not what a caller gets by typing the type name; for a string key that
 control moves boost by 31% on a hit.
+
+`bench_readme.sh` asks the other question outright: every map in the configuration a caller gets by
+typing its type name, own hash included, which is what the README's two graphs are about. It builds
+one binary per map rather than one process holding them all, sweeps five sizes across an octave from
+a million entries at ten million operations a cell, and writes `doc/bench_readme.csv` plus four
+SVGs: per key type, one chart of this map and 4.11.0 against the other libraries, and one of the
+shapes this map can be asked to take. Seven workloads, five of them drawn: `buildfree` (construct,
+fill and destroy) and `rss` (peak resident set) are the drawn ones, with `build` (inserts only) and
+`memory` (bytes requested, from interposed allocators) measured beside them as the controls the
+choice of each was made against. The two counted workloads run in the first round only: one build
+settles them to the page and repeats come back byte-identical.
+
+`maps.sh memory` reports peak resident set as well, through the same `scripts/ab/max_rss.h`. A full run is 1h45m; `-w memory` re-takes a single panel in about five minutes. It compiles
+with `-DUDM_DEFAULT_HASH -DUDM_VARIANTS`, which is what switches `maps.h` from one shared hash to
+each library's own and what adds `segmented_map` and the two huge-page shapes to the list -- so its
+binaries are *not* interchangeable with `maps.sh`'s, and it writes them under their own names inside
+`AB_BUILD` for that reason.
 
 Every map that is found on the machine is compiled in and one that is not is left out with a note.
 The include paths come from the environment (`ABSL_ROOT`, `FOLLY_ROOT`, `FOLLY_CONFIG`,
@@ -103,6 +193,15 @@ which a real lookup does not have, and a harness that did read a 1.40x for a cha
 A row that hashes nothing (`size ^ first byte`) measures what the chain itself costs, ~1.5 ns, which
 is in every number and is not part of anybody's hash.
 
+`scripts/ab/back_pointer.sh` is the shape to copy for a change too large to live in a harness file:
+the experiment is a unified diff in this directory (`back_pointer.patch`, ten maintenance sites in
+the map), the shipped header keeps one configuration, and the script applies the patch to a copy and
+renames it into its own namespace so the two variants can be built as two binaries. It measured the
+slot back-pointer of #266 -- `build`, `churn`, `erasekey`, `eraseiter` and `find` at five sizes for
+three value shapes, plus live bytes per entry -- and `find` is the control, because no variant of
+that change can reach it. The answer is in `notes/index-design.md` under "A slot back-pointer,
+re-tested across the cache boundary".
+
 Two smaller tools answer questions the harnesses cannot. `scripts/ab/probe_length.sh` patches a
 counter into a copy of the probe and reports **groups visited per lookup**, fresh and after churn,
 with an argument for how many writing lookups each churn round does -- which is the only path
@@ -120,7 +219,31 @@ than a total, because building a twelve-million-entry table is most of what `per
 size: measured as totals, a miss came out at 300 instructions and the fill order appeared to change
 the cost of a workload that never reads a value.
 
-`scripts/ab/mapsplot.py` draws the CSVs (`bars`, `memory`, `octave`) and prints them
+`scripts/ab/latency.cpp` answers a question a reader of the index-structures post asked, and the
+answer was that they were right. Every lookup harness in this directory draws its next key from an
+rng, so several lookups are in flight and what it reports is reciprocal **throughput**. This one runs
+the same map both ways: independently, and as a chain where each key is the value the last lookup
+returned. At a million entries the chain is 1.3x slower for this map and **3.0x** for
+`boost::unordered_flat_map`, because a flat map has one region and one dependent load and so has
+more to overlap. The two orderings are not the same: boost takes the independent hit 1.69x faster
+and loses the chain, 22.0 ns against 16.6. Throughput is the right thing to measure for a program
+that looks up in a loop, and it has to be labelled.
+
+It also fixes a trap worth knowing: the independent loop must do the same work per lookup as the
+chain, minus the dependency. Picking the key by reading a shuffled index array adds that array's own
+cache misses -- 8 MB at a million entries -- and then the "independent" loop measures those and comes
+out *slower* than the chain.
+
+```sh
+clang++ -O3 -DNDEBUG -std=c++20 -Iinclude scripts/ab/latency.cpp -o lat
+taskset -c 2 ./lat 1000000 10000000        # both modes, both maps
+```
+
+And the sizes this directory sweeps are not all past the cache. This machine has 64 MB of L3 in two
+32 MB slices and `AB_CORE` pins to one core, so a million entries of `map<uint64_t, uint64_t>` is
+26 MB here and 32 MB in boost, both inside it. Two million is the first size that is clearly out.
+
+`scripts/ab/mapsplot.py` draws the CSVs (`bars`, `readme`, `memory`, `octave`) and prints them
 (`table`, `swing`); `scripts/ab/diagrams.py` draws the byte-level layout figures of every index in
 one house style. Both are stdlib only.
 
@@ -424,6 +547,47 @@ octave where this map swings 1.07-1.28x. At 3251 entries and load 0.79 it costs 
 map's 3.78. The eleven points where it does come out ahead are all above 440000 entries, where every
 map is waiting on memory and the probe hardly matters.
 
+## What the rehash pipeline is worth, against table size
+
+`scripts/ab/rehash_size.sh` puts `fill_buckets_from_values` against the same loop with its ring and
+prefetch removed (`scripts/ab/rehash_plain.patch`), one variant per binary, alternated round by
+round. It was written to answer whether the pipeline is a loss at the small sizes it had never been
+measured at; the answer and the tables are in `notes/index-design.md`, "The rehash pipeline below
+200000 entries".
+
+```sh
+AB_BUILD=/home/martinus/gra/x AB_CORE=2 scripts/ab/rehash_size.sh -r 49 -k u64   # the loop alone
+AB_BUILD=/home/martinus/gra/x AB_CORE=2 scripts/ab/rehash_size.sh -r 25 -k str -m build
+AB_BUILD=/home/martinus/gra/x AB_CORE=2 scripts/ab/rehash_size.sh -c g++ -r 49 -k u64 22627
+```
+
+Two modes, and they do not agree, which is the point of having both. `-m rehash` times `rehash(0)`
+on a map that is already at the bucket count `rehash(0)` asks for, so the header skips the
+allocation and runs `clear_buckets()` plus the loop: that isolates the loop and reads a 4.4% loss
+for an integer key at 122 KB of index. `-m build` builds from empty, which is where the loop runs
+for a caller, and there the same cell is 0.974 under gcc and 1.023 under clang. Quote which one a
+number is. Both print `plain/pipelined`, so above 1 the pipeline is winning, and both print the
+spread of each cell's rounds beside it -- a cell whose spread is the size of the difference has not
+measured the difference.
+
+**Each mode gets its own binary, and that is load-bearing for the numbers rather than for tidiness.**
+With both timed functions in one translation unit the second one changed the first: the pipelined
+side of `-m rehash` read 1.45 ns per element before `measure_build` was added to the file and 1.62
+after, with the plain side unmoved, which turned a 4% dip into 13%. The binaries are deterministic,
+so that was the inliner. `-DREHASH_MODE_BUILD` splits them, and `-DREHASH_REPS=N` -- which the perf
+recipe below uses -- is an `#if` and not a runtime switch so that the default translation unit stays
+byte-identical to the one the tables were taken with.
+
+A whole sweep is 12 seconds, so rounds are cheap here: the same 49-round sweep run twice agrees on
+every cell to 1.5%, which is what said the dip in the middle of the integer column is a shape rather
+than a noisy cell.
+
+```sh
+# instructions and cycles per element, equal work on both sides
+clang++ -O3 -DNDEBUG -std=c++17 -DREHASH_REPS=110 -Iinclude -Itest scripts/ab/rehash_size.cpp -o pf
+taskset -c 2 perf stat -e cycles,instructions ./pf u64 rehash 22627   # "elements N" on stderr
+```
+
 ## Lookup cost against table size
 
 `scripts/ab/sweep.cpp` walks the size axis instead of the workload axis: it grows
@@ -558,9 +722,11 @@ because that is the only one of the three with branches to mispredict -- 0.575 p
 0.02 for main and 0.024 for this map, counted with `perf` on one-map binaries.
 
 It is the mistake this project's own notes record having fixed once already in the scored find
-workload, reintroduced in this tool. What makes the scored workloads safe and the sweep not is the
-batch size: `find_all` does 10M lookups per epoch, far past what a predictor can hold, while the
-sweep does 20000. The rngs now live in a `state` beside each map and carry on across epochs and
+workload, reintroduced in this tool. What made the scored workloads safe and the sweep not was the
+batch size: `find_all` did 10M lookups per epoch from one seed, far past what a predictor can hold,
+while the sweep does 20000. `find_all` is a million lookups per epoch since 2026-09-12, so it is no
+longer out of reach by size alone, and its rng moved into the table beside its map -- carrying on
+across epochs, exactly as the sweep's does. The rngs now live in a `state` beside each map and carry on across epochs and
 across sample points. Cross-checked afterwards against one-map-per-binary runs of the same
 workload, the fixed sweep agrees to 3-8% and orders the four maps identically at every point; the
 replayed one did not.
@@ -760,3 +926,43 @@ repetition.
 
 `perf stat -e cycles,instructions,branch-misses` on a single-workload runner is what separates
 "more instructions" from "more mispredictions"; `perf record -e cycles:pp` for annotate.
+
+## Uniquing a vector: `replace()` + `extract()` against what a caller writes otherwise
+
+`scripts/ab/unique.cpp` times five ways of taking the duplicates out of a
+`std::vector<std::string>`: the dense set's `replace()` + `extract()`, which takes the caller's
+vector as its own storage and hands it back, the same set built from the range and then extracted,
+`boost::unordered_flat_set<std::string>` copied out into a fresh vector,
+`boost::unordered_flat_set<std::string_view>` over the caller's vector with the compaction done
+afterwards, and `std::sort` + `std::unique`. All five are checked against the same
+order-independent checksum and the same unique count, so a variant that gets the answer wrong says
+so instead of looking fast.
+
+```sh
+clang++ -O3 -DNDEBUG -std=c++17 -DUDM_AB_HAVE_BOOST -Iinclude -Itest -Itest/third-party \
+    scripts/ab/unique.cpp "$build/nanobench.o" -o uq          # nanobench.o from test/app/nanobench.cpp
+taskset -c 2 ./uq udm_replace 1000000 11 0                    # variant, n, rounds, duplicate percent
+```
+
+Variants: `udm_replace`, `udm_insert`, `boost`, `boost_view`, `sort`. Add `-DUDM_UNIQUE_U64` for a
+second binary with `std::uint64_t` elements, which is how the duplicate-rate reversal was split into
+the part that is the dedup walk and the part that is one `free` per duplicate removed: an integer has
+no buffer to release, and there `replace()`'s lead erodes but never reverses. `boost_view` has no
+meaning for integers and is not built.
+
+The input vector is consumed by every variant, so it is rebuilt from a pool of the same strings
+before each round, outside the clock, and the median round is reported with round zero dropped as
+the warmup: a rebuild that faults carries a mean. **Every variant releases the input inside the
+clock**, which the first version of this file got wrong: a variant that builds a separate set leaves
+the caller holding all n elements, and destroying them is work the caller still has to do. Left
+outside the clock it charges one variant a free per element and the others none, and it reversed a
+column.
+
+Use 31 rounds or more and read the `[min max]` the line prints beside the median. Eleven rounds read
+86.78 ns for one cell that five later runs of the same binary put at 61.4 to 64.1, and a median with
+no spread beside it let that through.
+
+Sweep both axes. The size axis and the duplicate rate disagree about which variant wins, and a
+single cell is not an answer -- the numbers and what they decided are in `notes/index-design.md`
+under "the duplicate rate that turns it over". `scripts/ab/replace_forward.patch` is the dedup walk
+rewritten as a forward compaction, measured there and not applied.
