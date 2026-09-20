@@ -52,10 +52,9 @@
 # key is stored in a slot that every later probe reads as free: the key cannot be found, and the
 # next insert overwrites its slot.
 <<<
-        auto f = static_cast<std::uint32_t>(hash & 0xFFU);
-        f |= static_cast<std::uint32_t>(f == 0) << 3U;
+        t[i] = (i == 0 ? 8U : i) * 0x01010101U;
 ===
-        auto f = static_cast<std::uint32_t>(hash & 0xFFU);
+        t[i] = i * 0x01010101U;
 >>>
 
 # an insert that leaves a full group behind does not record that it did
@@ -74,12 +73,13 @@
 
 # an erase undoes the counters from the group the entry landed in rather than from its home
 # The walk has to retrace exactly the groups the insert passed. Starting it at the end retraces
-# nothing, so the counters only ever grow -- and that is worse than slow: a probe for an absent key
-# stops at the first group whose counter is zero, so once every group has been left with a stale
-# count for one fingerprint class, the miss has nothing to stop at. Measured on the sibling bug in
-# bugs/erase-path.txt, the suite hangs rather than fails.
+# nothing, so the counters only ever grow. Before the probe was bounded this hung -- every group
+# left with a stale count for a class, and a miss with nothing to stop at -- so the sibling bug in
+# bugs/erase-path.txt was caught as a hang. The bound stops the miss at the end of the array
+# instead, so this now SURVIVES: the counters being too high only lengthens probes, which no answer
+# shows. It is the shape of bug the suite is least able to see, kept as a named reminder of that.
 <<<
-        auto group_idx = bucket_idx_from_hash(mh);
+        auto group_idx = group_idx_from_hash(mh);
         if (group_idx != found_in) {
 ===
         auto group_idx = found_in;
@@ -91,7 +91,7 @@
 # is slot / 16. Swapping them clears some other slot's fingerprint, which loses that key and leaves
 # the erased one findable.
 <<<
-        groups[found_in].m_fingerprints[slot % 16] = 0;
+        groups[found_in].m_fingerprints[slot % slots_per_group] = 0;
 ===
         groups[found_in].m_fingerprints[slot / 16] = 0;
 >>>
@@ -117,11 +117,11 @@
 <<<
                 lanes &= lanes - 1;
             }
-            if (group.m_overflows[counter] == 0) {
+            // Not here if nothing of this class ever overflowed past this group, and not anywhere
 ===
                 lanes >>= 1;
             }
-            if (group.m_overflows[counter] == 0) {
+            // Not here if nothing of this class ever overflowed past this group, and not anywhere
 >>>
 
 # the search for the slot that points at a value accepts any fingerprint match
@@ -169,7 +169,7 @@
 # growth allocates the bigger array but never refills it from the values
 # Every bucket is then zero, so the table reports the right size and finds nothing at all.
 <<<
-        clear_and_fill_buckets_from_values();
+        fill_buckets_from_values();
     }
 
     // Closes the hole that the erased value left in m_values
@@ -220,14 +220,14 @@
         auto shifts = calc_shifts_for_size((std::max)(capa, size()));
         if (0 == bucket_count() || shifts < m_shifts) {
             allocate_buckets_from_shift(shifts);
-            clear_and_fill_buckets_from_values();
+            fill_buckets_from_values();
         }
     }
 ===
         auto shifts = calc_shifts_for_size((std::max)(capa, size()));
         if (0 == bucket_count()) {
             allocate_buckets_from_shift(shifts);
-            clear_and_fill_buckets_from_values();
+            fill_buckets_from_values();
         }
     }
 >>>
@@ -235,25 +235,21 @@
 # rehash resizes the bucket array and leaves it empty
 # Same shape as the growth bug above, reached through the public API instead.
 <<<
-        if (shifts != m_shifts) {
-            allocate_buckets_from_shift(shifts);
-            m_values.shrink_to_fit();
-            clear_and_fill_buckets_from_values();
-        }
+        m_values.shrink_to_fit();
+        fill_buckets_from_values();
+    }
 ===
-        if (shifts != m_shifts) {
-            allocate_buckets_from_shift(shifts);
-            m_values.shrink_to_fit();
-        }
+        m_values.shrink_to_fit();
+    }
 >>>
 
 # the group mask is the number of groups rather than one less than it
 # Masking with the count instead of count-1 lets a probe address one group past the end, and stops
 # masking off the top bit that a hash puts there: the wrap is wrong and the read is out of bounds.
 <<<
-        m_group_mask = static_cast<value_idx_type>(num_buckets / slots_per_group - 1);
+        m_group_mask = static_cast<value_idx_type>(num_groups - 1);
 ===
-        m_group_mask = static_cast<value_idx_type>(num_buckets / slots_per_group);
+        m_group_mask = static_cast<value_idx_type>(num_groups);
 >>>
 
 # ---------------------------------------------------------------- the dense value array
@@ -290,15 +286,6 @@
 ===
         m_values.clear();
         return values;
->>>
-
-# the erased hole is closed by moving the last value in, without repointing its slot
-# The moved element keeps its old index in the slot that points at it, which is now the hole. Every
-# later lookup of that key reads whatever ends up there.
-<<<
-            m_buckets.index()[slot_of_value(mh, values_idx_back)] = value_idx_to_remove;
-===
-            m_buckets.index()[slot_of_value(mh, values_idx_back)] = values_idx_back;
 >>>
 
 # the last value is popped before the moved element's slot is repointed
@@ -430,7 +417,7 @@
 # The returned iterator is meant to be the position the erased element occupied, which after the
 # swap-with-last holds a different element -- that is what makes an erase-while-iterating loop work.
 <<<
-        return begin() + static_cast<difference_type>(value_idx_to_remove);
+        return begin() + static_cast<difference_type>(e.value_idx);
     }
 
     auto extract(iterator it) -> value_type {
@@ -493,7 +480,7 @@
 
 # a hash that never said it avalanches is used as-is
 # wyhash is what turns std::hash<int>'s identity function into something with entropy in the high
-# bits -- which is where bucket_idx_from_hash takes the index from. Without it every small integer
+# bits -- which is where group_idx_from_hash takes the index from. Without it every small integer
 # key lands in the same handful of buckets.
 <<<
             // not is_avalanching => apply wyhash
@@ -595,4 +582,13 @@
         while (m_blocks.size() > num_blocks_required) {
 ===
         while (m_blocks.size() >= num_blocks_required) {
+>>>
+
+# a miss walks on past the last group instead of stopping there
+# Every counter on a sequence can be positive at once -- eight chosen keys do it -- and then this
+# lookup never returns. The bound is the only thing that makes a miss terminate for every input.
+<<<
+            if (group.m_overflows[counter] == 0 || delta == m_group_mask) {
+===
+            if (group.m_overflows[counter] == 0) {
 >>>

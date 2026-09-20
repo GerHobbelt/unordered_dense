@@ -5,19 +5,25 @@
 #
 #   -r REV       baseline revision (default HEAD)
 #   -b           also measure boost::unordered_flat_map (needs boost headers)
-#   -g           the candidate uses bucket_type::group, the baseline stays as its revision is
 #   -c COMPILER  default clang++
 #
 # Uses the vendored nanobench (test/third-party, >= 4.6 for Bench::compare()); NANOBENCH_INCLUDE
 # overrides it. The workloads come from test/bench/workloads.h, the benchmark's own. Everything is built in $AB_BUILD (default: a temporary directory), the tree is not
 # touched.
+#
+# AB_EXTRA_FLAGS is appended to the compile line of both sides, which is how a run turns a
+# compile-time switch off for baseline and candidate together, e.g.
+#
+#   AB_EXTRA_FLAGS='-DANKERL_UNORDERED_DENSE_HAS_SSE2=0 -DUDMBASE_UNORDERED_DENSE_HAS_SSE2=0'
+#
+# Both prefixes are needed: the baseline header is rewritten into its own macro namespace, so
+# defining only one of them would compare a scalar candidate against a vector baseline.
 set -euo pipefail
-rev=HEAD boost=0 group=0 cxx=clang++
-while getopts "r:bgc:" opt; do
+rev=HEAD boost=0 cxx=clang++
+while getopts "r:bc:" opt; do
     case $opt in
         r) rev=$OPTARG ;;
         b) boost=1 ;;
-        g) group=1 ;;
         c) cxx=$OPTARG ;;
         *) exit 1 ;;
     esac
@@ -27,14 +33,21 @@ shift $((OPTIND - 1))
 root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 build=${AB_BUILD:-$(mktemp -d)}
 mkdir -p "$build"
+# Windows will not run a PE without the extension, and bash under Git for Windows is where this
+# gets invoked there. Everywhere else the suffix is empty and nothing changes.
+exe=ab
+case "$(uname -s)" in
+    MINGW* | MSYS* | CYGWIN*) exe=ab.exe ;;
+esac
 # the baseline header, in its own namespace and macro prefix, beside the candidate one
 git -C "$root" show "$rev:include/ankerl/unordered_dense.h" \
     | sed 's/ankerl::unordered_dense/udmbase::unordered_dense/g; s/ANKERL_UNORDERED_DENSE/UDMBASE_UNORDERED_DENSE/g; s/namespace ankerl/namespace udmbase/g; s|#        include "stl.h"|#        include <ankerl/stl.h>|' \
     > "$build/base.h"
 flags=(-O3 -DNDEBUG -std=c++17 -I"$build" -I"$root/include" -I"$root/test")
+# shellcheck disable=SC2206 -- word splitting is what makes AB_EXTRA_FLAGS able to carry several
+flags+=(${AB_EXTRA_FLAGS:-})
 [ $boost = 1 ] && flags+=(-DUDM_AB_HAVE_BOOST)
-[ $group = 1 ] && flags+=(-DUDM_AB_GROUP)
 [ -f "$build/nanobench_$cxx.o" ] || (cd "$build" && printf '#define ANKERL_NANOBENCH_IMPLEMENT\n#include <third-party/nanobench.h>\n' > nb.cpp && "$cxx" "${flags[@]}" -c nb.cpp -o "nanobench_$cxx.o")
-"$cxx" "${flags[@]}" "$root/scripts/ab/ab.cpp" "$build/nanobench_$cxx.o" -o "$build/ab"
+"$cxx" "${flags[@]}" "$root/scripts/ab/ab.cpp" "$build/nanobench_$cxx.o" -o "$build/$exe"
 echo "baseline $rev vs working tree, $cxx, in $build" >&2
-"$build/ab" "$1" "${2:-12}" "$boost"
+"$build/$exe" "$1" "${2:-12}" "$boost"

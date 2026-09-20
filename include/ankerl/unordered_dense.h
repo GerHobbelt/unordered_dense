@@ -1,7 +1,7 @@
 ///////////////////////// ankerl::unordered_dense::{map, set} /////////////////////////
 
 // A fast & densely stored hashmap and hashset.
-// Version 4.11.0
+// Version 5.0.0
 // https://github.com/martinus/unordered_dense
 //
 // Licensed under the MIT License <http://opensource.org/licenses/MIT>.
@@ -30,9 +30,9 @@
 #define ANKERL_UNORDERED_DENSE_H
 
 // see https://semver.org/spec/v2.0.0.html
-#define ANKERL_UNORDERED_DENSE_VERSION_MAJOR 4  // NOLINT(cppcoreguidelines-macro-usage) incompatible API changes
-#define ANKERL_UNORDERED_DENSE_VERSION_MINOR 11 // NOLINT(cppcoreguidelines-macro-usage) backwards compatible functionality
-#define ANKERL_UNORDERED_DENSE_VERSION_PATCH 0  // NOLINT(cppcoreguidelines-macro-usage) backwards compatible bug fixes
+#define ANKERL_UNORDERED_DENSE_VERSION_MAJOR 5 // NOLINT(cppcoreguidelines-macro-usage) incompatible API changes
+#define ANKERL_UNORDERED_DENSE_VERSION_MINOR 0 // NOLINT(cppcoreguidelines-macro-usage) backwards compatible functionality
+#define ANKERL_UNORDERED_DENSE_VERSION_PATCH 0 // NOLINT(cppcoreguidelines-macro-usage) backwards compatible bug fixes
 
 // API versioning with inline namespace, see https://www.foonathan.net/2018/11/inline-namespaces/
 
@@ -66,26 +66,58 @@
 #endif
 #ifdef _MSC_VER
 #    define ANKERL_UNORDERED_DENSE_NOINLINE __declspec(noinline)
+#    define ANKERL_UNORDERED_DENSE_FORCEINLINE __forceinline
 #else
 #    define ANKERL_UNORDERED_DENSE_NOINLINE __attribute__((noinline))
+#    define ANKERL_UNORDERED_DENSE_FORCEINLINE inline __attribute__((always_inline))
 #endif
 
-// data prefetch hint, a no-op when not supported
+// Data prefetch hint, a no-op where there is nothing to spell it with. MSVC has no
+// __builtin_prefetch and used to get the no-op, which quietly cost it the one the probe issues for
+// a group's value indices -- measured at 3 cycles off every hit, so a whole compiler was paying for
+// a missing spelling. Both MSVC intrinsics come from <intrin.h>, which is included further down;
+// that is in time, because a macro needs its declarations where it is expanded and every expansion
+// is inside the table. Taken from boost, which covers the same three cases.
 #if defined(__GNUC__) || defined(__clang__)
 #    define ANKERL_UNORDERED_DENSE_PREFETCH(addr) __builtin_prefetch(addr) // NOLINT(cppcoreguidelines-macro-usage)
+#elif defined(_MSC_VER) && (defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+#    define ANKERL_UNORDERED_DENSE_PREFETCH(addr) _mm_prefetch(reinterpret_cast<char const*>(addr), _MM_HINT_T0)
+#elif defined(_MSC_VER) && defined(_M_ARM64)
+#    define ANKERL_UNORDERED_DENSE_PREFETCH(addr) __prefetch(addr) // NOLINT(cppcoreguidelines-macro-usage)
 #else
 #    define ANKERL_UNORDERED_DENSE_PREFETCH(addr) static_cast<void>(addr) // NOLINT(cppcoreguidelines-macro-usage)
 #endif
 
-// SSE2 is part of the x86-64 baseline, so the four-buckets-at-a-time probe is available on every
-// x86-64 build without asking for it. Elsewhere, and in a build that defines this to 0, the scalar
-// probe is used.
+// SSE2 is part of the x86-64 baseline, so comparing a group's sixteen fingerprints in one
+// instruction is available on every x86-64 build without asking for it. Elsewhere, and in a build
+// that defines this to 0, they are compared eight per machine word with ordinary arithmetic.
+//
+// This picks the code, never the layout: a group is sixteen slots either way, so two translation
+// units that disagree about this macro -- which they may, it is documented as a per-target switch
+// -- still agree about every byte of the index they share.
 #if !defined(ANKERL_UNORDERED_DENSE_HAS_SSE2)
 #    if defined(__SSE2__) || (defined(_MSC_VER) && (defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)))
 #        define ANKERL_UNORDERED_DENSE_HAS_SSE2 1 // NOLINT(cppcoreguidelines-macro-usage)
 #    else
 #        define ANKERL_UNORDERED_DENSE_HAS_SSE2 0 // NOLINT(cppcoreguidelines-macro-usage)
 #    endif
+#endif
+
+// The same sixteen-at-once compare on AArch64, which is the other baseline worth having: NEON is
+// mandatory there, so this needs no runtime dispatch either. Restricted to little endian because
+// the mask below reads the comparison result as one 64 bit word, and to AArch64 because 32 bit ARM
+// lacks the horizontal ops -- both fall back to SWAR, which is correct everywhere.
+#if !defined(ANKERL_UNORDERED_DENSE_HAS_NEON)
+#    if defined(__ARM_NEON) && defined(__aarch64__) && \
+        (!defined(__BYTE_ORDER__) || !defined(__ORDER_BIG_ENDIAN__) || (__BYTE_ORDER__ != __ORDER_BIG_ENDIAN__))
+#        define ANKERL_UNORDERED_DENSE_HAS_NEON 1 // NOLINT(cppcoreguidelines-macro-usage)
+#    else
+#        define ANKERL_UNORDERED_DENSE_HAS_NEON 0 // NOLINT(cppcoreguidelines-macro-usage)
+#    endif
+#endif
+#if ANKERL_UNORDERED_DENSE_HAS_SSE2 && ANKERL_UNORDERED_DENSE_HAS_NEON
+#    error "ANKERL_UNORDERED_DENSE_HAS_SSE2 and ANKERL_UNORDERED_DENSE_HAS_NEON cannot both be on"
 #endif
 
 #if defined(__clang__) && defined(__has_attribute)
@@ -112,7 +144,10 @@
 #        include "stl.h"
 #    endif
 #    if ANKERL_UNORDERED_DENSE_HAS_SSE2
-#        include <emmintrin.h> // for _mm_loadu_si128, _mm_cmpeq_epi32, ...
+#        include <emmintrin.h> // for _mm_loadu_si128, _mm_cmpeq_epi8, ...
+#    endif
+#    if ANKERL_UNORDERED_DENSE_HAS_NEON
+#        include <arm_neon.h> // for vld1q_u8, vceqq_u8, vshrn_n_u16, ...
 #    endif
 #    if defined(_MSC_VER)
 #        include <intrin.h> // for _BitScanForward
@@ -170,7 +205,7 @@ namespace detail {
 
 #    endif
 
-// Index of the lowest set bit, for the lane masks of the vector probe and of the group index. x
+// Index of the lowest set bit, for the lane mask a group compare produces. x
 // must not be zero.
 [[nodiscard]] inline auto countr_zero(std::uint32_t x) -> unsigned {
 #    if defined(_MSC_VER)
@@ -181,6 +216,19 @@ namespace detail {
     return static_cast<unsigned>(__builtin_ctz(x));
 #    endif
 }
+
+#    if ANKERL_UNORDERED_DENSE_HAS_NEON
+// NEON's match mask is one bit per lane four bits apart, so it needs the whole word.
+[[nodiscard]] inline auto countr_zero(std::uint64_t x) -> unsigned {
+#        if defined(_MSC_VER)
+    unsigned long idx{};
+    _BitScanForward64(&idx, x);
+    return static_cast<unsigned>(idx);
+#        else
+    return static_cast<unsigned>(__builtin_ctzll(x));
+#        endif
+}
+#    endif
 
 } // namespace detail
 
@@ -597,23 +645,37 @@ namespace bucket_type {
 // is placed and no tombstone is left behind. The value indices sit in a second array beside the
 // groups: 24 + 64 bytes per sixteen slots, 5.5 bytes per slot. See "5. Design" in the README.
 //
-// `group` indexes up to 2^32 values, `group_big` up to 2^63.
-struct group {
-    using value_idx_type = std::uint32_t;
+// The width of the value index is the one thing the two bucket types differ in: `group` indexes
+// up to 2^32 values at 24 + 64 bytes per sixteen slots, `group_big` up to 2^63 at 24 + 128.
+template <typename ValueIdx>
+struct basic_group {
+    using value_idx_type = ValueIdx;
     std::array<std::uint8_t, 16> m_fingerprints; // one per slot; 0 is an empty slot
     std::array<std::uint8_t, 8> m_overflows;     // how many entries with (fingerprint & 7) == i probed past this group
 };
 
-// 24 + 128 bytes per sixteen slots.
-struct group_big {
-    using value_idx_type = std::size_t;
-    std::array<std::uint8_t, 16> m_fingerprints; // one per slot; 0 is an empty slot
-    std::array<std::uint8_t, 8> m_overflows;     // how many entries with (fingerprint & 7) == i probed past this group
-};
+using group = basic_group<std::uint32_t>;
+using group_big = basic_group<std::size_t>;
 
 } // namespace bucket_type
 
 namespace detail {
+
+// The fingerprint word of every low byte of a hash: the fingerprint in all four bytes, so that
+// the vector compare can broadcast it as one 32 bit lane. 0 maps to 8 so that 0 means empty and
+// the low three bits, which pick the counter, are unchanged. A table rather than the arithmetic
+// (and, compare, shift, or, multiply) because it is five instructions on the critical path of
+// every probe, placement and erase, and one aligned load from a kilobyte that stays in L1 is
+// cheaper: measured paired, integer misses 1.05-1.06x on both compilers, big-value finds 1.03x
+// under clang and 1.14x under gcc, strings level. Boost's group15 keeps the same table.
+[[nodiscard]] constexpr auto make_fingerprint_words() -> std::array<std::uint32_t, 256> {
+    auto t = std::array<std::uint32_t, 256>{};
+    for (std::uint32_t i = 0; i < 256; ++i) {
+        t[i] = (i == 0 ? 8U : i) * 0x01010101U;
+    }
+    return t;
+}
+inline constexpr std::array<std::uint32_t, 256> fingerprint_words = make_fingerprint_words();
 
 template <typename T>
 using detect_is_transparent = typename T::is_transparent;
@@ -1164,15 +1226,20 @@ namespace detail {
 // rather than one struct because the groups are what a probe reads -- a miss touches nothing else,
 // and a rehash writes them at random -- and 24 bytes per sixteen slots keeps far more of them in
 // cache than 88 would. Measured, the split is 10% faster on a build for the same lookups.
+//
+// Alloc is the table's value allocator; both arrays rebind it.
 template <typename Group, typename Alloc>
 class group_storage {
 public:
     using value_idx_type = typename Group::value_idx_type;
     using allocator_type = typename std::allocator_traits<Alloc>::template rebind_alloc<Group>;
 
+    // How many arrays this allocates, for a test that counts what an empty table costs.
+    static constexpr std::size_t array_count = 2;
+
 private:
     using index_allocator_type = typename std::allocator_traits<Alloc>::template rebind_alloc<value_idx_type>;
-    static constexpr std::size_t slots = 16;
+    static constexpr std::size_t slots = std::tuple_size_v<decltype(Group::m_fingerprints)>;
 
     std::vector<Group, allocator_type> m_groups{};
     std::vector<value_idx_type, index_allocator_type> m_index{}; // slots * m_groups.size()
@@ -1189,8 +1256,7 @@ public:
     group_storage(group_storage const&) = default;
     group_storage(group_storage&&) noexcept = default;
     auto operator=(group_storage const&) -> group_storage& = default;
-    auto operator=(group_storage&&) noexcept(std::is_nothrow_move_assignable_v<std::vector<Group, allocator_type>>)
-        -> group_storage& = default;
+    auto operator=(group_storage&&) -> group_storage& = default;
     ~group_storage() = default;
 
     [[nodiscard]] auto get_allocator() const -> allocator_type {
@@ -1255,16 +1321,16 @@ public:
         conditional_t<is_detected_v<detect_iterator, AllocatorOrContainer>, AllocatorOrContainer, underlying_container_type>;
 
 private:
-    using bucket_alloc =
-        typename std::allocator_traits<typename value_container_type::allocator_type>::template rebind_alloc<Bucket>;
-
     // IsSegmented is about the values -- stable references, no reallocation of the payload. The
     // index is two plain arrays either way: it is 5.5 bytes per slot, and a probe reads it by
     // pointer.
-    using bucket_container_type = detail::group_storage<Bucket, bucket_alloc>;
+    using bucket_container_type = detail::group_storage<Bucket, typename value_container_type::allocator_type>;
 
-    // Slots per group. bucket_count() counts slots, m_group_mask counts groups.
-    static constexpr std::size_t slots_per_group = 16;
+    // Slots per group, from the group. bucket_count() counts slots, m_group_mask counts groups.
+    static constexpr std::size_t slots_per_group = std::tuple_size_v<decltype(Bucket::m_fingerprints)>;
+    static_assert(slots_per_group == 16 && std::tuple_size_v<decltype(Bucket::m_overflows)> == 8,
+                  "a group is sixteen fingerprints, matched as one vector or two words, and eight counters, picked by "
+                  "the low three bits of the fingerprint");
 
     static constexpr std::uint8_t initial_shifts = 64 - 2; // 2^(64-m_shifts) groups
     static constexpr float default_max_load_factor = 0.8F;
@@ -1332,7 +1398,7 @@ private:
         }
     }
 
-    [[nodiscard]] constexpr auto bucket_idx_from_hash(std::uint64_t hash) const -> value_idx_type {
+    [[nodiscard]] constexpr auto group_idx_from_hash(std::uint64_t hash) const -> value_idx_type {
         return static_cast<value_idx_type>(hash >> m_shifts);
     }
 
@@ -1351,23 +1417,37 @@ private:
     // index of every slot, quadratic probing over groups, and eight overflow counters per group
     // that an insert increments in every full group it passes and an erase decrements again. A
     // probe stops at the first group whose counter for this hash is zero, since no entry with
-    // those bits ever went past it. Nothing moves after it is placed, so a table that has churned
-    // is as good as a fresh one, and there are no tombstones to rehash away.
+    // those bits ever went past it. Nothing moves after it is placed and there are no tombstones,
+    // so no rehash is ever needed to repair the index -- an erase undoes exactly what its insert
+    // did to the counters.
     //
-    // That a miss terminates is the counters being exact: each one counts live entries that landed
-    // further along this sequence, so the group after the furthest of them has nothing counted in
-    // it. A counter saturates at 255 and is then never decremented, which costs every later probe
-    // for that fingerprint class one more group for the rest of the array's life -- and needs 255
-    // live entries of one class to have overflowed one group at the same moment to happen at all.
+    // What an erase cannot undo is where the element went. One that arrived while its home group
+    // was full sits in a later group and stays there even after the home group empties again, so a
+    // table that has churned probes a little further than one built from the same contents: at
+    // load 0.76, measured, 1.14 groups per hit against 1.03 and 1.27 per miss against 1.05. It
+    // plateaus after about a dozen turnovers rather than growing, which is the difference from a
+    // design that leaves tombstones behind. `rehash(size())` rebuilds the index and takes the
+    // difference back; nothing else does, since an erase cannot know where the element it frees
+    // would have gone had the table been built from what is left.
+    //
+    // A miss usually stops within a group or two, at the first counter that is zero: the counters
+    // are exact, so zero means no live entry of this class ever overflowed past that group.
+    // Usually, not always. A counter counts entries that passed the group on *their* sequence,
+    // which need not be this one, so every group on a sequence can be positive at once -- eight
+    // keys chosen against a known hash do it, each overflowed past one group while fillers made it
+    // full and the fillers erased again -- and then no zero is ever reached. So a miss also stops
+    // once it has visited every group, which is as far as any key that exists can have been
+    // placed, and that bound is what makes a lookup terminate for any input at all. A counter
+    // saturates at 255 and is then never decremented, which costs every later probe for that
+    // fingerprint class one more group for the rest of the array's life -- and needs 255 live
+    // entries of one class to have overflowed one group at the same moment to happen at all.
     //
     // The group is hash >> m_shifts, the fingerprint the low byte of the hash with 0 mapped to
     // 8 so that 0 means empty and (fingerprint & 7), which picks the counter, is unchanged.
 
-    // the fingerprint in all four bytes of a word, which is what the vector compare broadcasts
+    // the fingerprint in all four bytes of a word, from the table above
     [[nodiscard]] static constexpr auto fingerprint_word(std::uint64_t hash) -> std::uint32_t {
-        auto f = static_cast<std::uint32_t>(hash & 0xFFU);
-        f |= static_cast<std::uint32_t>(f == 0) << 3U;
-        return f * 0x01010101U;
+        return detail::fingerprint_words[hash & 0xFFU];
     }
 
     // quadratic: the triangular numbers reach every group of a power-of-two array
@@ -1409,12 +1489,40 @@ private:
     }
 #    endif
 
+    // What a compare of sixteen fingerprints answers with: one bit per matching lane. SSE2 and the
+    // word-at-a-time fallback put those bits next to each other; NEON has no movemask, and the
+    // cheapest stand-in leaves them four apart, so the stride is a constant rather than 1 and
+    // first_lane() divides by it. Everything else -- testing for any match, taking the lowest,
+    // clearing it with `m & (m - 1)` -- is then written once for all three.
+#    if ANKERL_UNORDERED_DENSE_HAS_NEON
+    using lane_mask = std::uint64_t;
+    static constexpr unsigned lane_stride = 4;
+#    else
+    using lane_mask = unsigned;
+    static constexpr unsigned lane_stride = 1;
+#    endif
+
+    [[nodiscard]] static auto first_lane(lane_mask lanes) -> unsigned {
+        return detail::countr_zero(lanes) / lane_stride;
+    }
+
     // lanes whose fingerprint is the word's; every byte of the word is the same
-    [[nodiscard]] static auto match_fingerprint(Bucket const& group, std::uint32_t word) -> unsigned {
+    [[nodiscard]] static auto match_fingerprint(Bucket const& group, std::uint32_t word) -> lane_mask {
 #    if ANKERL_UNORDERED_DENSE_HAS_SSE2
         // NOLINTBEGIN(portability-simd-intrinsics)
         auto const fingerprints = _mm_loadu_si128(reinterpret_cast<__m128i const*>(group.m_fingerprints.data())); // NOLINT
         return static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi8(fingerprints, _mm_set1_epi32(static_cast<int>(word)))));
+        // NOLINTEND(portability-simd-intrinsics)
+#    elif ANKERL_UNORDERED_DENSE_HAS_NEON
+        // NOLINTBEGIN(portability-simd-intrinsics)
+        // vceqq_u8 gives 0xFF per matching byte. Reading that as eight 16 bit lanes, shifting each
+        // right by four and narrowing back to bytes packs the two comparisons of a 16 bit lane into
+        // one byte -- lane 2j as its low nibble, lane 2j+1 as its high one -- so the whole answer
+        // fits in a 64 bit word with lane i at nibble i. Keeping only the low bit of each nibble
+        // leaves exactly one bit per matching lane, four apart, which is what lane_stride is.
+        auto const cmp = vceqq_u8(vld1q_u8(group.m_fingerprints.data()), vdupq_n_u8(static_cast<std::uint8_t>(word)));
+        auto const nibbles = vshrn_n_u16(vreinterpretq_u16_u8(cmp), 4);
+        return vget_lane_u64(vreinterpret_u64_u8(nibbles), 0) & UINT64_C(0x1111111111111111);
         // NOLINTEND(portability-simd-intrinsics)
 #    else
         auto const wanted = static_cast<std::uint64_t>(static_cast<std::uint8_t>(word)) * UINT64_C(0x0101010101010101);
@@ -1423,43 +1531,52 @@ private:
 #    endif
     }
 
-    [[nodiscard]] static auto match_empty(Bucket const& group) -> unsigned {
+    [[nodiscard]] static auto match_empty(Bucket const& group) -> lane_mask {
         return match_fingerprint(group, 0);
     }
 
     // The value indices of a group are the next thing a hit reads, and their address needs only
     // the group, so they are asked for before the fingerprints have arrived: the two latencies
     // overlap instead of adding. Measured 3 cycles off every hit, 0.2 onto every miss.
-    void prefetch_index(value_idx_type group_idx) const {
-        auto const* p = m_buckets.index() + std::size_t{group_idx} * 16;
+    static void prefetch_index(value_idx_type const* index, value_idx_type group_idx) {
+        auto const* p = index + std::size_t{group_idx} * slots_per_group;
         ANKERL_UNORDERED_DENSE_PREFETCH(p);
-        ANKERL_UNORDERED_DENSE_PREFETCH(p + 15); // the array is not line aligned, so the sixteen may straddle
+        ANKERL_UNORDERED_DENSE_PREFETCH(p + slots_per_group - 1); // the array is not line aligned, so it may straddle
         if constexpr (sizeof(value_idx_type) > 4) {
             ANKERL_UNORDERED_DENSE_PREFETCH(p + 8);
         }
     }
 
+    // Forced inline because gcc does not do it on its own in a large translation unit, and the
+    // whole design assumes it is: the prefetch, the hoisted pointers and the early exit only pay
+    // inside the caller. Found in the paired harness, where gcc left the integer probe out of line
+    // and every lookup paid a call -- with SWAR, whose match is bigger, random integer misses
+    // measured 0.66 of the robin hood index, and forcing it took them to 1.23; with SSE2 the same
+    // change was churn 1.32, string hits 1.22 and the integer build 1.42 against the commit before.
+    // clang inlined it already and measures 1.00 everywhere.
     template <typename K>
-    auto probe_group(K const& key, std::uint64_t mh) const -> probe_result {
+    ANKERL_UNORDERED_DENSE_FORCEINLINE auto probe(K const& key, std::uint64_t mh) const -> probe_result {
         auto const word = fingerprint_word(mh);
         auto const counter = word & 7U;
-        auto group_idx = bucket_idx_from_hash(mh);
+        auto group_idx = group_idx_from_hash(mh);
         auto const* groups = m_buckets.data();
         auto const* index = m_buckets.index();
         value_idx_type delta = 0;
         while (true) {
-            prefetch_index(group_idx);
+            prefetch_index(index, group_idx);
             auto const& group = groups[group_idx];
             auto lanes = match_fingerprint(group, word);
             while (lanes != 0) {
-                auto const slot = static_cast<value_idx_type>(std::size_t{group_idx} * 16 + detail::countr_zero(lanes));
+                auto const slot = static_cast<value_idx_type>(std::size_t{group_idx} * slots_per_group + first_lane(lanes));
                 auto const value_idx = index[slot];
                 if (m_equal(key, get_key(m_values[value_idx]))) {
                     return {slot, value_idx, true};
                 }
                 lanes &= lanes - 1;
             }
-            if (group.m_overflows[counter] == 0) {
+            // Not here if nothing of this class ever overflowed past this group, and not anywhere
+            // once every group has been looked at: see the note on termination above.
+            if (group.m_overflows[counter] == 0 || delta == m_group_mask) {
                 return {0, 0, false};
             }
             group_idx = next_group(group_idx, delta);
@@ -1468,19 +1585,19 @@ private:
 
     // The first free slot on the key's probe sequence takes it; every full group on the way
     // counts it.
-    void place_group(std::uint64_t mh, value_idx_type value_idx) {
+    ANKERL_UNORDERED_DENSE_FORCEINLINE void place_group(std::uint64_t mh, value_idx_type value_idx) {
         auto const word = fingerprint_word(mh);
         auto const counter = word & 7U;
-        auto group_idx = bucket_idx_from_hash(mh);
+        auto group_idx = group_idx_from_hash(mh);
         auto* groups = m_buckets.data();
         value_idx_type delta = 0;
         while (true) {
             auto& group = groups[group_idx];
             auto const empties = match_empty(group);
             if (empties != 0) {
-                auto const lane = detail::countr_zero(empties);
+                auto const lane = first_lane(empties);
                 group.m_fingerprints[lane] = static_cast<std::uint8_t>(word);
-                m_buckets.index()[std::size_t{group_idx} * 16 + lane] = value_idx;
+                m_buckets.index()[std::size_t{group_idx} * slots_per_group + lane] = value_idx;
                 return;
             }
             if (group.m_overflows[counter] != 255) {
@@ -1494,9 +1611,9 @@ private:
     // from home that placed it, up to the group it landed in.
     void erase_group_slot(value_idx_type slot, std::uint64_t mh) {
         auto* groups = m_buckets.data();
-        auto const found_in = static_cast<value_idx_type>(slot / 16);
-        groups[found_in].m_fingerprints[slot % 16] = 0;
-        auto group_idx = bucket_idx_from_hash(mh);
+        auto const found_in = static_cast<value_idx_type>(slot / slots_per_group);
+        groups[found_in].m_fingerprints[slot % slots_per_group] = 0;
+        auto group_idx = group_idx_from_hash(mh);
         if (group_idx != found_in) {
             auto const counter = fingerprint_word(mh) & 7U;
             value_idx_type delta = 0;
@@ -1513,15 +1630,15 @@ private:
     // so there is no other stopping condition.
     [[nodiscard]] auto slot_of_value(std::uint64_t mh, value_idx_type value_idx) const -> value_idx_type {
         auto const word = fingerprint_word(mh);
-        auto group_idx = bucket_idx_from_hash(mh);
+        auto group_idx = group_idx_from_hash(mh);
         auto const* groups = m_buckets.data();
         auto const* index = m_buckets.index();
         value_idx_type delta = 0;
         while (true) {
-            prefetch_index(group_idx);
+            prefetch_index(index, group_idx);
             auto lanes = match_fingerprint(groups[group_idx], word);
             while (lanes != 0) {
-                auto const slot = static_cast<value_idx_type>(std::size_t{group_idx} * 16 + detail::countr_zero(lanes));
+                auto const slot = static_cast<value_idx_type>(std::size_t{group_idx} * slots_per_group + first_lane(lanes));
                 if (index[slot] == value_idx) {
                     return slot;
                 }
@@ -1539,9 +1656,13 @@ private:
         }
     }
 
+    [[nodiscard]] static constexpr auto calc_num_groups(std::uint8_t shifts) -> std::size_t {
+        return (std::min)(max_bucket_count() / slots_per_group, std::size_t{1} << (64U - shifts));
+    }
+
+    // in slots, which is what the bucket interface counts in
     [[nodiscard]] static constexpr auto calc_num_buckets(std::uint8_t shifts) -> std::size_t {
-        // in slots; the array is a sixteenth as many groups
-        return (std::min)(max_bucket_count(), (std::size_t{1} << (64U - shifts)) * slots_per_group);
+        return calc_num_groups(shifts) * slots_per_group;
     }
 
     [[nodiscard]] constexpr auto calc_shifts_for_size(std::size_t s) const -> std::uint8_t {
@@ -1569,20 +1690,18 @@ private:
             // first insert allocate. Copying an empty table therefore allocates nothing either.
             m_shifts = initial_shifts;
         } else {
-            {
-                // One pass, not two. This used to grow the array with resize(), which value
-                // initialises every bucket it adds, and then memcpy over all of it -- so every byte
-                // of the bucket array was written twice, and for a large map the wasted half is a
-                // memset of megabytes. assign() copies straight into the new storage.
-                //
-                // assign() and not m_buckets = other.m_buckets, which would consult pocca: the
-                // allocator question is answered by the caller, and this is also reached from the
-                // move assignment's differing-allocator branch, where adopting other's would be
-                // exactly wrong.
-                m_buckets.assign(other.m_buckets);
-                m_shifts = other.m_shifts;
-                describe_buckets(other.bucket_count());
-            }
+            // One pass, not two. This used to grow the array with resize(), which value
+            // initialises every bucket it adds, and then memcpy over all of it -- so every byte
+            // of the bucket array was written twice, and for a large map the wasted half is a
+            // memset of megabytes. assign() copies straight into the new storage.
+            //
+            // assign() and not m_buckets = other.m_buckets, which would consult pocca: the
+            // allocator question is answered by the caller, and this is also reached from the
+            // move assignment's differing-allocator branch, where adopting other's would be
+            // exactly wrong.
+            m_buckets.assign(other.m_buckets);
+            m_shifts = other.m_shifts;
+            describe_buckets(other.m_buckets.size());
         }
     }
 
@@ -1685,7 +1804,7 @@ private:
     // written until an array of that size exists. Callers used to assign m_shifts and then
     // allocate, which left a gap for a failed allocation to stop in.
     void allocate_buckets_from_shift(std::uint8_t shifts) {
-        auto num_buckets = calc_num_buckets(shifts);
+        auto const num_groups = calc_num_groups(shifts);
         {
             // Built beside the old array rather than over it, so that a failure here leaves the
             // table exactly as it was. Callers used to give the old array back first, which made
@@ -1693,9 +1812,12 @@ private:
             // no buckets to find them by, which is not a state anything can recover from without
             // allocating again.
             auto fresh = bucket_container_type(m_buckets.get_allocator());
-            fresh.resize(num_buckets / slots_per_group);
+            fresh.resize(num_groups);
             m_buckets = std::move(fresh);
         }
+        // The groups come back zeroed, which is an empty index: every slot free, every counter at
+        // zero. Nothing that allocates clears afterwards.
+        //
         // All three commit here, together, and only once the array they describe exists. They have
         // to move as one: a probe indexes its first group with hash >> m_shifts and does not mask,
         // so a shift that has run ahead of the array reads past the end of it, and a mask published
@@ -1703,13 +1825,14 @@ private:
         // index-allocating path goes through, which is what makes a failed growth leave the old
         // index intact and consistent rather than unusable.
         m_shifts = shifts;
-        describe_buckets(num_buckets);
+        describe_buckets(num_groups);
     }
 
     // The two values derived from the bucket array's size. Only ever called once the array of that
     // size exists; see the note above.
-    void describe_buckets(std::size_t num_buckets) {
-        m_group_mask = static_cast<value_idx_type>(num_buckets / slots_per_group - 1);
+    void describe_buckets(std::size_t num_groups) {
+        m_group_mask = static_cast<value_idx_type>(num_groups - 1);
+        auto const num_buckets = num_groups * slots_per_group;
         if (num_buckets == max_bucket_count()) {
             // reached the maximum, make sure we can use each bucket
             m_max_bucket_capacity = max_bucket_count();
@@ -1729,7 +1852,6 @@ private:
         if (ANKERL_UNORDERED_DENSE_UNLIKELY(m_buckets.empty()))
             ANKERL_UNORDERED_DENSE_UNLIKELY_ATTR {
                 allocate_buckets_from_shift(m_shifts);
-                clear_buckets();
             }
     }
 
@@ -1743,20 +1865,32 @@ private:
         }
         // Clearing the groups empties every slot and zeroes every counter; the value indices
         // beside them are never read for an empty slot.
-        std::memset(m_buckets.data(), 0, sizeof(Bucket) * (bucket_count() / slots_per_group));
+        std::memset(m_buckets.data(), 0, sizeof(Bucket) * m_buckets.size());
     }
 
-    void clear_and_fill_buckets_from_values() {
-        clear_buckets();
-        // Counted in std::size_t, for the reason spelled out in replace(): max_size() is exactly
-        // what value_idx_type can hold, so a container of precisely that many has a size that is
-        // not representable in it and the cast wraps to zero. Latent here rather than live -- a
-        // table at max_size() already has the smallest shift, so rehash() and reserve() early out
-        // before reaching this -- but the rule is the same and only one place was following it.
-        for (std::size_t value_idx = 0, end_idx = m_values.size(); value_idx < end_idx; ++value_idx) {
-            auto const& key = get_key(m_values[value_idx]);
+    // Into an index just allocated, so already empty.
+    void fill_buckets_from_values() {
+        // Walked with an iterator rather than indexed with m_values[i], which is not a style
+        // choice: placing an entry stores a fingerprint, a std::uint8_t store may alias any object
+        // at all, and the container's own data pointer is such an object -- so after every
+        // placement an indexed read has to load that pointer back out of the container before it
+        // can even form the address of the next key. That is a store-to-load chain through every
+        // element of the rehash, and it costs exactly one memory latency per element because the
+        // random group access that follows cannot start until it resolves. An iterator lives in a
+        // register across the loop, so the next key's address is ready immediately and the group
+        // accesses overlap. Measured on a 200000 element build under clang: growth 10.43 ns per
+        // insert to 2.74, the whole build 16.72 to 8.96. gcc disambiguated it on its own and does
+        // not move (2.15 to 2.48, noise); this is what made the same build 1.7x slower under clang
+        // than under gcc, and it is now faster.
+        //
+        // The index is counted in value_idx_type and never in the container's size, for the reason
+        // spelled out in replace(): max_size() is exactly what value_idx_type can hold, so a
+        // container of precisely that many has a size that is not representable in it.
+        auto value_idx = value_idx_type{};
+        for (auto const& value : m_values) {
             // we know for certain that key has not yet been inserted, so no need to check it.
-            place_group(mixed_hash(key), static_cast<value_idx_type>(value_idx));
+            place_group(mixed_hash(get_key(value)), value_idx);
+            ++value_idx;
         }
     }
 
@@ -1782,7 +1916,7 @@ private:
         } else {
             allocate_buckets_from_shift(static_cast<std::uint8_t>(m_shifts - 1));
         }
-        clear_and_fill_buckets_from_values();
+        fill_buckets_from_values();
     }
 
     // Closes the hole that the erased value left in m_values, by moving the last value into it and repointing that
@@ -1807,7 +1941,7 @@ private:
     // on the way to it are undone with.
     template <typename Op>
     void do_erase(value_idx_type slot, value_idx_type value_idx_to_remove, std::uint64_t mh, Op handle_erased_value) {
-        // both values are needed after the shift down; start fetching them now to overlap the latencies
+        // both values are needed once the slot is freed; start fetching them now to overlap the latencies
         ANKERL_UNORDERED_DENSE_PREFETCH(&m_values[value_idx_to_remove]);
         ANKERL_UNORDERED_DENSE_PREFETCH(&m_values.back());
 
@@ -1856,8 +1990,21 @@ private:
 
     // Appends the value and points a slot at it. What it needs to know is the key's hash: the
     // probe that found the key absent left nothing an insert could reuse.
+    //
+    // Forced inline, and the reason is a trade worth knowing. clang prices this function at 480
+    // against an inlining threshold of 250 (vector::emplace_back with piecewise_construct is 225
+    // of it) and so calls it out of line from do_try_emplace, which costs every insert a call, a
+    // six register prologue and epilogue: 28 of the 128 instructions an insert took, measured
+    // net of the benchmark loop. Merged, an insert is 100 instructions and builds and churn are
+    // 6-7% faster -- and operator[] on a key that is already present pays 14 instructions more,
+    // because the merged function's register pressure is paid on the path that never places, so
+    // a workload that mixes hits and inserts loses 3.5%. 1.012 on the geomean, every interval
+    // excluding 100%. gcc had already inlined all of this on its own, so for gcc this is a no-op.
+    // Handing the probe's fingerprint to the callee, returning the index in a register, and moving
+    // increase_size() out of line were each measured and each changed nothing: the cost is the
+    // boundary itself.
     template <typename... Args>
-    auto do_place_element(std::uint64_t mh, Args&&... args) -> std::pair<iterator, bool> {
+    ANKERL_UNORDERED_DENSE_FORCEINLINE auto do_place_element(std::uint64_t mh, Args&&... args) -> std::pair<iterator, bool> {
         // emplace the new value. If that throws an exception, no harm done; index is still in a valid state
         m_values.emplace_back(std::forward<Args>(args)...);
 
@@ -1894,11 +2041,6 @@ private:
             }
 
         return do_find_hashed(key, mixed_hash(key));
-    }
-
-    template <typename K>
-    auto probe(K const& key, std::uint64_t mh) const -> probe_result {
-        return probe_group(key, mh);
     }
 
     // Same lookup with the hashing already done. Requires the bucket array to be allocated, which
@@ -2256,7 +2398,7 @@ public:
 
         m_values = std::move(container);
 
-        // can't use clear_and_fill_buckets_from_values() because container elements might not be unique
+        // can't use fill_buckets_from_values() because container elements might not be unique
         //
         // Counted in std::size_t rather than in value_idx_type. max_size() is exactly the number
         // values that type can hold, so a container of precisely that many has a size that is not
@@ -2355,7 +2497,7 @@ public:
             return {begin() + static_cast<difference_type>(r.value_idx), false};
         }
 
-        // value is new, place the bucket and shift up until we find an empty spot
+        // value is new, place it in the first free slot on its probe sequence
         auto value_idx = static_cast<value_idx_type>(m_values.size() - 1);
         if (ANKERL_UNORDERED_DENSE_UNLIKELY(is_full()))
             ANKERL_UNORDERED_DENSE_UNLIKELY_ATTR {
@@ -2448,25 +2590,33 @@ public:
         return {it, true};
     }
 
-    auto erase(iterator it) -> iterator {
-        auto const value_idx_to_remove = static_cast<value_idx_type>(it - cbegin());
-        auto const mh = mixed_hash(get_key(*it));
-        auto const slot = slot_of_value(mh, value_idx_to_remove);
+    // What do_erase needs of the element an iterator points at: its index, the mixed hash of its
+    // key, and the slot pointing at it, which is searched from the hash.
+    struct located {
+        value_idx_type value_idx;
+        std::uint64_t mh;
+        value_idx_type slot;
+    };
 
+    [[nodiscard]] auto locate(iterator it) const -> located {
+        auto const value_idx = static_cast<value_idx_type>(it - cbegin());
+        auto const mh = mixed_hash(get_key(*it));
+        return {value_idx, mh, slot_of_value(mh, value_idx)};
+    }
+
+    auto erase(iterator it) -> iterator {
+        auto const e = locate(it);
         // The noexcept here and on the other two erase callbacks is what keeps erase() out of do_erase()'s exception
         // guard: a call expression is noexcept only if the callee says so, an empty body is not enough.
-        do_erase(slot, value_idx_to_remove, mh, [](value_type const& /*unused*/) noexcept -> void {
+        do_erase(e.slot, e.value_idx, e.mh, [](value_type const& /*unused*/) noexcept -> void {
         });
-        return begin() + static_cast<difference_type>(value_idx_to_remove);
+        return begin() + static_cast<difference_type>(e.value_idx);
     }
 
     auto extract(iterator it) -> value_type {
-        auto const value_idx_to_remove = static_cast<value_idx_type>(it - cbegin());
-        auto const mh = mixed_hash(get_key(*it));
-        auto const slot = slot_of_value(mh, value_idx_to_remove);
-
+        auto const e = locate(it);
         auto tmp = std::optional<value_type>{};
-        do_erase(slot, value_idx_to_remove, mh, [&tmp](value_type&& val) -> void {
+        do_erase(e.slot, e.value_idx, e.mh, [&tmp](value_type&& val) -> void {
             tmp = std::move(val);
         });
         return std::move(tmp).value();
@@ -2821,12 +2971,23 @@ public:
 
     void rehash(std::size_t count) {
         count = (std::min)(count, max_size());
-        auto shifts = calc_shifts_for_size((std::max)(count, size()));
+        auto const shifts = calc_shifts_for_size((std::max)(count, size()));
         if (shifts != m_shifts) {
             allocate_buckets_from_shift(shifts);
-            m_values.shrink_to_fit();
-            clear_and_fill_buckets_from_values();
+        } else if (m_buckets.empty()) {
+            // Nothing allocated and nothing to index: stay in the state a default constructed
+            // table is in, so that rehash() on an empty map still allocates nothing.
+            return;
+        } else {
+            // The array is already the right size, and rehash() still has to rehash. It used to
+            // return here, which made it a no-op in exactly the case a caller reaches for it: a
+            // table whose probe sequences have drifted under churn is the same size as a fresh
+            // one, so the only thing that repairs the drift did nothing. It is also what the
+            // standard asks for -- rehash(n) sets the bucket count and *then* rehashes.
+            clear_buckets();
         }
+        m_values.shrink_to_fit();
+        fill_buckets_from_values();
     }
 
     void reserve(std::size_t capa) {
@@ -2838,7 +2999,7 @@ public:
         auto shifts = calc_shifts_for_size((std::max)(capa, size()));
         if (0 == bucket_count() || shifts < m_shifts) {
             allocate_buckets_from_shift(shifts);
-            clear_and_fill_buckets_from_values();
+            fill_buckets_from_values();
         }
     }
 

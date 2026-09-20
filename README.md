@@ -129,7 +129,7 @@ clang++ -std=c++20 -fprebuilt-module-path=. ankerl.unordered_dense.o module_test
 
 A simple demo script can be found in `test/modules`.
 
-The module is built with the scalar probe, see [3.6. Disabling the SSE2 Probe](#36-disabling-the-sse2-probe). If you
+The module compares fingerprints without SSE2, see [3.6. Disabling the SSE2 Probe](#36-disabling-the-sse2-probe). If you
 wrap the header in a module of your own and build it with gcc, you need to do the same.
 
 ### 3.2. Hash
@@ -410,29 +410,33 @@ works.
 * Up to 2^63 = 9,223,372,036,854,775,808 elements.
 * 9.5 bytes overhead per slot: an 8 byte value index instead of a 4 byte one.
 
-### 3.6. Disabling the SSE2 Probe
+### 3.6. Disabling the Vector Probe
 
-On x86-64 a probe compares a group's sixteen fingerprints with one SSE2 instruction. That needs no
-compiler flag, because SSE2 is part of the x86-64 baseline. Defining
-`ANKERL_UNORDERED_DENSE_HAS_SSE2` to 0 before the header is included switches to the portable
-fallback, which compares eight fingerprints per machine word with ordinary arithmetic, e.g. with
-cmake:
+A probe compares a group's sixteen fingerprints at once: with one SSE2 instruction on x86-64, and
+with NEON on AArch64. Neither needs a compiler flag, because both are part of their target's
+baseline. Defining `ANKERL_UNORDERED_DENSE_HAS_SSE2` or `ANKERL_UNORDERED_DENSE_HAS_NEON` to 0
+before the header is included switches to the portable fallback, which compares eight fingerprints
+per machine word with ordinary arithmetic, e.g. with cmake:
 
 ```cmake
 target_compile_definitions(your_target PRIVATE ANKERL_UNORDERED_DENSE_HAS_SSE2=0)
 ```
 
-The module in `src/` sets it already, because the intrinsics are declared by a header included in
+The module in `src/` sets both already, because the intrinsics are declared by headers included in
 the global module fragment and those declarations do not reach a translation unit that imports the
-module. Wrapping the header in a module of your own means doing the same. The fallback is within a
-few percent of the SSE2 path on the benchmark's workloads, so this costs little.
+module. Wrapping the header in a module of your own means doing the same.
+
+All three compare the same sixteen bytes and differ only in how they report which lanes matched, so
+translation units that disagree about these macros still agree about every byte of the index they
+share. On x86-64 the word-at-a-time fallback is within a few percent of SSE2 on the benchmark's
+workloads; on AArch64 it is not, which is why the NEON path exists.
 
 ## 4. `segmented_map` and `segmented_set`
 
 `ankerl::unordered_dense` provides a custom container implementation that has lower memory requirements than the default `std::vector`. Memory is not contiguous, but it can allocate segments without having to reallocate and move all the elements. In summary, this leads to
 
-* Much smoother memory usage, memory usage increases continuously.
-* No high peak memory usage.
+* Much smoother memory usage of the values, which increases continuously.
+* No high peak memory usage from the values.
 * Faster insertion because elements never need to be moved to newly allocated blocks
 * Slightly slower indexing compared to `std::vector` because an additional indirection is needed.
 
@@ -443,13 +447,15 @@ Abseil is fastest for this simple insertion test, taking a bit over 0.8 seconds.
 
 `ankerl::unordered_dense::segmented_map` doesn't have these peaks, and instead has a smooth increase in memory usage. Note there are still sudden drops & increases in memory because the indexing data structure still needs to increase by a fixed factor.
 
-The segmenting is about the values, which are the larger part and the ones whose references stay valid. The index is two plain arrays either way, so growing it does allocate the new one beside the old; at 5.5 bytes per slot that peak is small next to the values.
+The segmenting is about the values: it is those that grow smoothly and whose references stay valid. The index is two plain contiguous arrays either way, and growing it still allocates the new one beside the old, so the index alone keeps a doubling spike that `segmented_map` does not remove. Since 5.0.0 that is a change from before, when the index was segmented too.
+
+How much it matters depends on the size of your value. The index is 5.5 bytes per slot, so at the moment it doubles it needs about 16.5 bytes per slot transiently, against `sizeof(value_type)` bytes per element for the values. For `map<uint64_t, uint64_t>` that spike is roughly two thirds of the value storage; for a map with a large value it is a rounding error; for a `set<uint64_t>` it is larger than the values. If you need the index to grow smoothly as well, `reserve()` up front avoids the doubling entirely, which is worth doing for a large map whatever container it uses.
 
 ## 5. Design
 
 The map/set has two data structures:
 * `std::vector<value_type>` which holds all data. map/set iterators are just `std::vector<value_type>::iterator`!
-* An indexing structure (bucket array), which is a flat array with 8-byte buckets.
+* An indexing structure, which is a flat array of groups of sixteen slots, and the value index of each slot beside it.
 
 ### 5.1. Inserts
 
@@ -476,10 +482,21 @@ key's fingerprint in one instruction, and the result is a 16 bit mask of candida
 candidate the value index is read and the key in the data vector is compared; when equal, the value
 is returned. If no candidate matched, the one overflow counter that the fingerprint selects decides:
 zero means no entry with those bits ever left this group, so the key is absent, and otherwise the
-probe moves to the next group.
+probe moves to the next group. It also gives up once it has visited every group, which is as far as
+any key that exists can have been placed. That bound matters: a counter counts the entries that
+overflowed past its group on *their* probe sequences, so with a hash the caller controls every
+group's counter can be left positive by a handful of keys, and a miss would then have nothing on
+its sequence to stop at.
 
 The value indices of a group have an address that depends only on the group, so they are prefetched
 while the fingerprints are still on their way.
+
+An element that arrived while its home group was full sits in a later group, and it stays there
+even after the home group empties again. So a long-churned table probes a little further than one
+built from the same contents: at a load of 0.76, 1.14 groups per hit against 1.03, and 1.27 per
+miss against 1.05. It settles there after about a dozen turnovers instead of growing, which is the
+difference from a design that leaves tombstones behind and has to rehash them away; `rehash()`
+rebuilds the index if you want the difference back.
 
 Without SSE2 the same sixteen bytes are compared eight at a time with ordinary arithmetic, see
 [3.6. Disabling the SSE2 Probe](#36-disabling-the-sse2-probe).
@@ -490,9 +507,8 @@ Since all data is stored in a vector, removals are a bit more complicated:
 
 1. First, look up the element to delete in the index.
 2. Clear its fingerprint, and decrement the overflow counter in every group between its home group
-   and the one it landed in. That leaves the index exactly as it would have been had the element
-   never been inserted, so a table that has churned for a long time is as good as a fresh one, and
-   there are no tombstones and no rehash to repair them. Nothing else moves.
+   and the one it landed in. An erase undoes exactly what the insert did, so there are no
+   tombstones and no rehash is ever needed to repair the index. Nothing else moves.
 3. Replace that element in the vector with the last element in the vector.
 4. Update the slot of the moved element, which requires another lookup.
 

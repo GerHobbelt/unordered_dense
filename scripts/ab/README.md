@@ -12,6 +12,69 @@ five, a `map<uint64_t, big_value>` whose 64 byte mapped value is what separates 
 flat one -- plus all-hits and no-hits lookups. Its string keys run from 8 to 135 bytes, skewed towards short; a fixed length
 would leave the length dispatch of the hash perfectly predicted. Believe a change when the interval excludes 100%.
 
+## Lookup cost against table size
+
+`scripts/ab/sweep.cpp` walks the size axis instead of the workload axis: it builds
+`map<uint64_t, size_t>` at every power of two from 16 to 8 million and times lookups that hit and
+lookups that miss, for the working tree, a baseline revision and boost. `scripts/ab/plot.py` draws
+the CSV as an SVG with no dependency beyond the standard library.
+
+```sh
+clang++ -O3 -DNDEBUG -std=c++17 -DUDM_AB_HAVE_BOOST -I"$build" -Iinclude -Itest \
+    scripts/ab/sweep.cpp "$build/nanobench.o" -o sweep     # $build/base.h as run.sh makes it
+taskset -c 2 ./sweep 27 12 300000 > doc/lookup_vs_size.csv   # max 2^27, 12 points per octave
+scripts/ab/plot.py doc/lookup_vs_size.csv doc/lookup_vs_size.svg
+```
+
+It exists because the scored benchmark stops at 200000 entries, whose index is about a megabyte
+and lives in cache on any machine that runs it, and the one structural cost of a dense map -- the
+value index is a dependent load a flat map does not pay -- is invisible there and large once the
+index leaves cache.
+
+The measurement is the scored find workload's: a random lookup with a **50% hit rate**, decided by
+an rng of its own rather than alternating, because a predictable sequence of hits and misses is
+learned by the branch predictor and stops measuring the branchy part of a probe. It costs about
+8 ns where a pure hit costs 3.7 and a pure miss 3.0, and that gap is the misprediction.
+
+Three decisions make the picture say something rather than being a smooth line. **Nothing is
+reserved**, so each table grows on its own and its load factor sweeps from about a half up to the
+maximum and falls back at every doubling; that is the sawtooth, and the dotted verticals are where
+this map doubles. **Twelve points per octave**, not one, because a sawtooth sampled once per octave
+is a straight line. And there are **two panels**: sizes to 64K, which is every table most programs
+build and where the full range would squeeze everything into a few pixels, and the whole range.
+They carry their own y scales, which is what a detail view is for. The map is grown *through* the
+sample points rather than rebuilt at each, so the sweep costs one build per map, not one per point.
+
+What to read off it. On the left the sawtooth: cost climbing with the load factor and dropping at
+each doubling, with robin hood swinging about twice as far as the other two because its probe
+length grows with the load, where a group is compared whole whatever its occupancy. On the right
+the cliff: all three flat to about 128K entries, then every line turning upward as the index
+outgrows the caches, and a plateau above about 8M where everything is bound by memory latency.
+The gap to boost is not monotonic and it is worth knowing that before quoting it -- 1.05x while
+everything is in cache, a peak of 1.63x around 2M entries, and 1.2-1.3x from 32M up. Going to 134M
+is what showed that; two points had suggested a trend that is not there.
+
+The largest sizes are about 5 GB of map, so the sweep wants a machine with room and takes a couple
+of minutes; `./sweep 23` stops at 8M and is enough for the shape. Committed with its CSV, which is also
+the table view of the chart.
+
+The same sweep runs two more workloads, chosen with the fourth argument: `1` is churn, an erase and
+an insert at a fixed size, and `2` is insert-and-erase, an `operator[]` and an `erase` of which half
+of each find nothing. Both keep the size where it is -- and both erase before they insert, because
+the other order crosses the growth threshold and one operation ends up paying for rehashing the
+whole table, which at 64M entries is 1219 ns against the 20 the steady state costs.
+
+![cost of a random find against table size](../../doc/find_vs_size.svg)
+![cost of churn against table size](../../doc/churn_vs_size.svg)
+![cost of insert and erase against table size](../../doc/insert_erase_vs_size.svg)
+
+The two mutating charts are the ones that repay study. Below 64K this map's line is nearly flat
+where both others saw-tooth by a factor of two or three, which is the erasable counters doing what
+they exist for. Above 1M boost is about twice as fast, because a dense erase must close the hole it
+leaves in the value vector and find the moved element's slot with a second probe, and out of cache
+that is a second random access. The scored `churn` workload reports the opposite sign because its
+round is erase, insert *and two finds*: the finds carry it.
+
 ## What the hot paths are bound by (Ryzen 9 7950X, clang 22, default `-march`, 2026-09)
 
 A cost model that predicted every experiment of the SSE2-probe work within a cycle or two:
