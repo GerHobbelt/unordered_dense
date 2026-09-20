@@ -36,6 +36,7 @@ test_sources = [
     'unit/equal_range.cpp',
     'unit/erase_if.cpp',
     'unit/erase_range.cpp',
+    'unit/erase_throwing_move.cpp',
     'unit/erase.cpp',
     'unit/explicit.cpp',
     'unit/extract.cpp',
@@ -51,6 +52,7 @@ test_sources = [
     'unit/initializer_list.cpp',
     'unit/insert_or_assign.cpp',
     'unit/insert.cpp',
+    'unit/lazy_bucket_allocation.cpp',
     'unit/iterators_empty.cpp',
     'unit/iterators_erase.cpp',
     'unit/iterators_insert.cpp',
@@ -60,6 +62,7 @@ test_sources = [
     'unit/move_to_moved.cpp',
     'unit/multiple_apis.cpp',
     'unit/namespace.cpp',
+    'unit/noexcept_contract.cpp',
     'unit/not_copyable.cpp',
     'unit/not_moveable.cpp',
     'unit/pmr_move_with_allocators.cpp',
@@ -71,10 +74,12 @@ test_sources = [
     'unit/reserve_and_assign.cpp',
     'unit/reserve.cpp',
     'unit/segmented_vector.cpp',
+    'unit/segmented_vector_allocators.cpp',
     'unit/set_or_map_types.cpp',
     'unit/set.cpp',
     'unit/std_hash.cpp',
     'unit/swap.cpp',
+    'unit/table_allocators.cpp',
     'unit/transparent.cpp',
     'unit/try_emplace.cpp',
     'unit/tuple_hash.cpp',
@@ -173,7 +178,13 @@ test_exe = executable(
         dependency('threads'), # add dependency for threads (-lpthread, see https://mesonbuild.com/howtox.html),
 
         # see what's in the [provide] sections for the dependency names
-        dependency('doctest'),
+        # As a system include, so that -Werror applies to this project's code and not to
+        # doctest's. Its DOCTEST_ANONYMOUS uses __COUNTER__, which C2y standardises and clang 22
+        # therefore warns about under -Wc2y-extensions, and the diagnostic is reported against
+        # whichever test file used INFO() or REQUIRE(). Warnings in code this project actually
+        # wrote are unaffected, including expressions handed to those macros: clang suppresses
+        # what a system macro expands to, not what is passed into it.
+        dependency('doctest', include_type: 'system'),
         dependency('fmt', method: fmt_method, fallback: ['fmt', 'fmt_dep']),
 
         # disable these two if you don't want them
@@ -193,4 +204,69 @@ test(
     'unit',
     test_exe,
     verbose: true)
+
+# libFuzzer targets. The unit suite replays data/fuzz/<name> on every build, which by construction
+# only finds what has already been found; these are the binaries that go looking. They are clang
+# only (-fsanitize=fuzzer), and not built by default because nothing in a normal build or test run
+# needs them -- ask for one by name:
+#
+#     ninja -C builddir test/fuzz_api
+#     ./builddir/test/fuzz_api -max_total_time=60 corpus-scratch data/fuzz/fuzz_api
+#
+# or use scripts/fuzz_run.sh, which drives them across all cores.
+if compiler.get_id() == 'clang'
+    # -fsanitize=fuzzer is a link-time thing: it asks for the driver, the main() that feeds
+    # LLVMFuzzerTestOneInput. The instrumentation it needs is a separate, compile-time request,
+    # which is what fuzzer-no-link is for. Passing plain -fsanitize=fuzzer to the compile step as
+    # well is what AFL++ reads as "add libAFLDriver.a to this command", and it duly adds an archive
+    # to a -c command line, where -Werror turns clang's complaint about it into a failed build.
+    #
+    # Under afl-clang-fast++ the compile-time half has to go entirely. It instruments on its own,
+    # and its runtime implements only the trace-pc-guard half of SanitizerCoverage; asking for
+    # libFuzzer's instrumentation on top leaves references to __sanitizer_cov_8bit_counters_init,
+    # __sanitizer_cov_pcs_init and __sancov_lowest_stack that nothing on the link line defines.
+    # Whether it happens depends on the clang version -- AFL's own pass rewrites the coverage it
+    # can, and what it leaves behind differs -- so this links on some machines and not others.
+    # The link-time -fsanitize=fuzzer stays: AFL++ substitutes libAFLDriver.a for it.
+    is_afl = compiler.get_define('__AFL_COMPILER') != ''
+
+    fuzz_compile_sanitizers = is_afl ? [] : ['-fsanitize=fuzzer-no-link']
+    fuzz_link_sanitizers = ['-fsanitize=fuzzer']
+    if get_option('fuzz_sanitizers')
+        fuzz_compile_sanitizers += '-fsanitize=address,undefined'
+        fuzz_link_sanitizers += '-fsanitize=address,undefined'
+    endif
+    foreach fuzz_target : ['fuzz_api', 'fuzz_insert_erase', 'fuzz_replace_map', 'fuzz_string']
+        executable(
+            fuzz_target,
+            ['unit/' + fuzz_target + '.cpp', 'app/counter.cpp'],
+            include_directories: incdir,
+            # FUZZ swaps the doctest test case for libFuzzer's entry point, see fuzz/run.h.
+            # FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION is what turns REQUIRE into an abort the
+            # fuzzer can see, see app/doctest.h.
+            # DOCTEST_CONFIG_DISABLE keeps doctest's per-TU registration out of a binary that has
+            # no doctest main to link against. The only assertion these targets use is REQUIRE,
+            # which app/doctest.h turns into an abort() the fuzzer can see.
+            cpp_args: cpp_args + [
+                '-DFUZZ',
+                '-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION',
+                '-DDOCTEST_CONFIG_DISABLE',
+                '-g',
+                # Optimized whatever the buildtype says, because these targets exist to be run
+                # millions of times. meson's default buildtype is debug, so a plain `meson setup`
+                # gave -O0, where every one-line accessor in the header and in std::deque is a
+                # real call: measured on fuzz_api, 28 executions per second against 136 at -O2.
+                # Target arguments come after the buildtype's, so this wins. Debugging a crash
+                # does not need this build -- the unit suite replays the corpus at -O0.
+                '-O2',
+            ] + fuzz_compile_sanitizers,
+            link_args: link_args + fuzz_link_sanitizers,
+            dependencies: [
+                dependency('threads'),
+                dependency('doctest', include_type: 'system'), # see above
+                dependency('fmt', method: fmt_method, fallback: ['fmt', 'fmt_dep']),
+            ],
+            build_by_default: false)
+    endforeach
+endif
 

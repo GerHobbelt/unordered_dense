@@ -1,7 +1,7 @@
 ///////////////////////// ankerl::unordered_dense::{map, set} /////////////////////////
 
 // A fast & densely stored hashmap and hashset based on robin-hood backward shift deletion.
-// Version 4.8.1
+// Version 4.9.0
 // https://github.com/martinus/unordered_dense
 //
 // Licensed under the MIT License <http://opensource.org/licenses/MIT>.
@@ -31,8 +31,8 @@
 
 // see https://semver.org/spec/v2.0.0.html
 #define ANKERL_UNORDERED_DENSE_VERSION_MAJOR 4 // NOLINT(cppcoreguidelines-macro-usage) incompatible API changes
-#define ANKERL_UNORDERED_DENSE_VERSION_MINOR 8 // NOLINT(cppcoreguidelines-macro-usage) backwards compatible functionality
-#define ANKERL_UNORDERED_DENSE_VERSION_PATCH 1 // NOLINT(cppcoreguidelines-macro-usage) backwards compatible bug fixes
+#define ANKERL_UNORDERED_DENSE_VERSION_MINOR 9 // NOLINT(cppcoreguidelines-macro-usage) backwards compatible functionality
+#define ANKERL_UNORDERED_DENSE_VERSION_PATCH 0 // NOLINT(cppcoreguidelines-macro-usage) backwards compatible bug fixes
 
 // API versioning with inline namespace, see https://www.foonathan.net/2018/11/inline-namespaces/
 
@@ -68,6 +68,13 @@
 #    define ANKERL_UNORDERED_DENSE_NOINLINE __declspec(noinline)
 #else
 #    define ANKERL_UNORDERED_DENSE_NOINLINE __attribute__((noinline))
+#endif
+
+// data prefetch hint, a no-op when not supported
+#if defined(__GNUC__) || defined(__clang__)
+#    define ANKERL_UNORDERED_DENSE_PREFETCH(addr) __builtin_prefetch(addr) // NOLINT(cppcoreguidelines-macro-usage)
+#else
+#    define ANKERL_UNORDERED_DENSE_PREFETCH(addr) static_cast<void>(addr) // NOLINT(cppcoreguidelines-macro-usage)
 #endif
 
 #if defined(__clang__) && defined(__has_attribute)
@@ -212,7 +219,10 @@ inline void mum(std::uint64_t* a, std::uint64_t* b) {
     static constexpr auto secret = std::array{UINT64_C(0xa0761d6478bd642f),
                                               UINT64_C(0xe7037ed1a0b428db),
                                               UINT64_C(0x8ebc6af09c88c6e3),
-                                              UINT64_C(0x589965cc75374cc3)};
+                                              UINT64_C(0x589965cc75374cc3),
+                                              UINT64_C(0x2d358dccaa6c78a5),
+                                              UINT64_C(0x8bb84b93962eacc9),
+                                              UINT64_C(0x4b33a62ed433d4a3)};
 
     auto const* p = static_cast<std::uint8_t const*>(key);
     std::uint64_t seed = secret[0];
@@ -220,12 +230,16 @@ inline void mum(std::uint64_t* a, std::uint64_t* b) {
     std::uint64_t b{};
     if (ANKERL_UNORDERED_DENSE_LIKELY(len <= 16))
         ANKERL_UNORDERED_DENSE_LIKELY_ATTR {
-            if (ANKERL_UNORDERED_DENSE_LIKELY(len >= 4))
+            if (ANKERL_UNORDERED_DENSE_LIKELY(len >= 8))
                 ANKERL_UNORDERED_DENSE_LIKELY_ATTR {
-                    a = (r4(p) << 32U) | r4(p + ((len >> 3U) << 2U));
-                    b = (r4(p + len - 4) << 32U) | r4(p + len - 4 - ((len >> 3U) << 2U));
+                    // two (potentially overlapping) 8 byte reads cover the whole input
+                    a = r8(p);
+                    b = r8(p + len - 8);
                 }
-            else if (ANKERL_UNORDERED_DENSE_LIKELY(len > 0))
+            else if (len >= 4) {
+                a = r4(p);
+                b = r4(p + len - 4);
+            } else if (ANKERL_UNORDERED_DENSE_LIKELY(len > 0))
                 ANKERL_UNORDERED_DENSE_LIKELY_ATTR {
                     a = r3(p, len);
                     b = 0;
@@ -241,14 +255,41 @@ inline void mum(std::uint64_t* a, std::uint64_t* b) {
             ANKERL_UNORDERED_DENSE_UNLIKELY_ATTR {
                 std::uint64_t see1 = seed;
                 std::uint64_t see2 = seed;
-                do {
+                if (i > 96) {
+                    // 6 independent lanes: twice the instruction level parallelism of the 48 byte loop below
+                    std::uint64_t see3 = seed;
+                    std::uint64_t see4 = seed;
+                    std::uint64_t see5 = seed;
+                    do {
+                        seed = mix(r8(p) ^ secret[1], r8(p + 8) ^ seed);
+                        see1 = mix(r8(p + 16) ^ secret[2], r8(p + 24) ^ see1);
+                        see2 = mix(r8(p + 32) ^ secret[3], r8(p + 40) ^ see2);
+                        see3 = mix(r8(p + 48) ^ secret[4], r8(p + 56) ^ see3);
+                        see4 = mix(r8(p + 64) ^ secret[5], r8(p + 72) ^ see4);
+                        see5 = mix(r8(p + 80) ^ secret[6], r8(p + 88) ^ see5);
+                        p += 96;
+                        i -= 96;
+                    } while (ANKERL_UNORDERED_DENSE_LIKELY(i > 96));
+                    seed ^= see3 ^ see4 ^ see5;
+                }
+                while (i > 48) {
                     seed = mix(r8(p) ^ secret[1], r8(p + 8) ^ seed);
                     see1 = mix(r8(p + 16) ^ secret[2], r8(p + 24) ^ see1);
                     see2 = mix(r8(p + 32) ^ secret[3], r8(p + 40) ^ see2);
                     p += 48;
                     i -= 48;
-                } while (ANKERL_UNORDERED_DENSE_LIKELY(i > 48));
+                }
                 seed ^= see1 ^ see2;
+                while (i > 16) {
+                    seed = mix(r8(p) ^ secret[1], r8(p + 8) ^ seed);
+                    i -= 16;
+                    p += 16;
+                }
+
+                // the tail lane only depends on the input, not on seed, so it can execute in parallel
+                // with the lane loops above, and a single dependent mix finishes the hash
+                auto tail = mix(r8(p + i - 16) ^ secret[2], r8(p + i - 8) ^ secret[3]);
+                return mix(secret[1] ^ len, seed ^ tail);
             }
         while (ANKERL_UNORDERED_DENSE_UNLIKELY(i > 16))
             ANKERL_UNORDERED_DENSE_UNLIKELY_ATTR {
@@ -530,6 +571,15 @@ public:
 
 private:
     using vec_alloc = typename std::allocator_traits<Allocator>::template rebind_alloc<pointer>;
+    using vec_alloc_traits = std::allocator_traits<vec_alloc>;
+
+    // The allocator lives in m_blocks, so these are what the assignment operators below act on --
+    // and what their noexcept specifications are written over, so that the condition and the
+    // promise cannot drift apart.
+    static constexpr bool propagates_on_copy_assign = vec_alloc_traits::propagate_on_container_copy_assignment::value;
+    static constexpr bool propagates_on_move_assign = vec_alloc_traits::propagate_on_container_move_assignment::value;
+    static constexpr bool allocators_always_equal = vec_alloc_traits::is_always_equal::value;
+
     std::vector<pointer, vec_alloc> m_blocks{};
     std::size_t m_size{};
 
@@ -564,7 +614,11 @@ private:
         using value_type = segmented_vector::value_type;
         using reference = std::conditional_t<IsConst, value_type const&, value_type&>;
         using pointer = std::conditional_t<IsConst, segmented_vector::const_pointer, segmented_vector::pointer>;
-        using iterator_category = std::forward_iterator_tag;
+        // Everything a random access iterator needs is right here -- the position is an index, so jumping and
+        // subtracting are single operations. Saying "forward" instead meant std::distance walked the whole container
+        // one element at a time to compute what operator-() answers directly, and every algorithm that requires
+        // random access, std::sort over values() among them, was ill-formed over an iterator that can do the job.
+        using iterator_category = std::random_access_iterator_tag;
 
         iter_t() noexcept = default;
 
@@ -611,8 +665,16 @@ private:
             return {m_data, static_cast<std::size_t>(static_cast<difference_type>(m_idx) + diff)};
         }
 
+        // n + it, which a random access iterator has to support just as it + n does
+        [[nodiscard]] friend constexpr auto operator+(difference_type diff, iter_t const& it) noexcept -> iter_t {
+            return it + diff;
+        }
+
+        // The cast is the one operator+() already does. Nothing instantiated these two before, because no algorithm
+        // could reach them through a forward iterator, so the implicit signed-to-unsigned conversion sat here
+        // unnoticed until clang's -Wsign-conversion saw std::sort use it.
         constexpr auto operator+=(difference_type diff) noexcept -> iter_t& {
-            m_idx += diff;
+            m_idx = static_cast<std::size_t>(static_cast<difference_type>(m_idx) + diff);
             return *this;
         }
 
@@ -621,7 +683,7 @@ private:
         }
 
         constexpr auto operator-=(difference_type diff) noexcept -> iter_t& {
-            m_idx -= diff;
+            m_idx = static_cast<std::size_t>(static_cast<difference_type>(m_idx) - diff);
             return *this;
         }
 
@@ -632,6 +694,10 @@ private:
 
         constexpr auto operator*() const noexcept -> reference {
             return m_data[m_idx >> num_bits][m_idx & mask];
+        }
+
+        [[nodiscard]] constexpr auto operator[](difference_type diff) const noexcept -> reference {
+            return *(*this + diff);
         }
 
         constexpr auto operator->() const noexcept -> pointer {
@@ -732,7 +798,8 @@ public:
     segmented_vector(segmented_vector&& other) noexcept
         : segmented_vector(std::move(other), other.get_allocator()) {}
 
-    segmented_vector(segmented_vector const& other) {
+    segmented_vector(segmented_vector const& other)
+        : m_blocks(vec_alloc_traits::select_on_container_copy_construction(other.m_blocks.get_allocator())) {
         append_everything_from(other);
     }
 
@@ -741,19 +808,42 @@ public:
             return *this;
         }
         clear();
+        if constexpr (propagates_on_copy_assign) {
+            if (m_blocks.get_allocator() != other.m_blocks.get_allocator()) {
+                // Everything still held has to go back through the old allocator before the new
+                // one is adopted. Copy assignment and not move: which of the two propagates is
+                // the inner vector's own pocca/pocma, and only pocca is known true here, so
+                // assigning a temporary would consult pocma and silently keep the old allocator.
+                dealloc();
+                auto const empty_with_other_allocator = std::vector<pointer, vec_alloc>(other.m_blocks.get_allocator());
+                m_blocks = empty_with_other_allocator;
+            }
+        }
         append_everything_from(other);
         return *this;
     }
 
-    auto operator=(segmented_vector&& other) noexcept -> segmented_vector& {
+    // Not unconditionally noexcept. When the allocator neither propagates nor compares equal --
+    // std::pmr::polymorphic_allocator, for one -- the elements are moved one at a time into memory
+    // this container allocates, so running out of it here has to be allowed to throw rather than
+    // terminate. std::vector spells the condition the same way.
+    auto operator=(segmented_vector&& other) noexcept(propagates_on_move_assign || allocators_always_equal)
+        -> segmented_vector& {
+        if (this == &other) {
+            return *this;
+        }
         clear();
-        dealloc();
-        if (other.get_allocator() == get_allocator()) {
+        // Either the allocator comes along with the blocks or it is already the same one, and
+        // either way the blocks can be taken over; std::vector's own move assignment does the
+        // propagating in the first case.
+        if (propagates_on_move_assign || m_blocks.get_allocator() == other.m_blocks.get_allocator()) {
+            dealloc();
             m_blocks = std::move(other.m_blocks);
             m_size = std::exchange(other.m_size, {});
         } else {
-            // make sure to construct with other's allocator!
-            m_blocks = std::vector<pointer, vec_alloc>(vec_alloc(other.get_allocator()));
+            // Keeps its own allocator, because nothing said to take other's -- so the blocks it
+            // already holds came from that same allocator and are reused rather than handed back
+            // and immediately asked for again.
             append_everything_from(std::move(other));
         }
         return *this;
@@ -943,18 +1033,14 @@ private:
     value_container_type m_values{}; // Contains all the key-value pairs in one densely stored container. No holes.
     bucket_container_type m_buckets{};
     std::size_t m_max_bucket_capacity = 0;
+    value_idx_type m_bucket_mask = 0; // bucket_count() - 1; works because bucket_count() is always a power of two
     float m_max_load_factor = default_max_load_factor;
     Hash m_hash{};
     KeyEqual m_equal{};
     std::uint8_t m_shifts = initial_shifts;
 
     [[nodiscard]] auto next(value_idx_type bucket_idx) const -> value_idx_type {
-        if (ANKERL_UNORDERED_DENSE_UNLIKELY(bucket_idx + 1U == bucket_count()))
-            ANKERL_UNORDERED_DENSE_UNLIKELY_ATTR {
-                return 0;
-            }
-
-        return static_cast<value_idx_type>(bucket_idx + 1U);
+        return static_cast<value_idx_type>((bucket_idx + 1U) & m_bucket_mask);
     }
 
     // Helper to access bucket through pointer types
@@ -1023,21 +1109,26 @@ private:
     }
 
     void place_and_shift_up(Bucket bucket, value_idx_type place) {
+        // cache mask in a local so the bucket stores can't alias it
+        auto const mask = m_bucket_mask;
         while (0 != at(m_buckets, place).m_dist_and_fingerprint) {
             bucket = std::exchange(at(m_buckets, place), bucket);
             bucket.m_dist_and_fingerprint = dist_inc(bucket.m_dist_and_fingerprint);
-            place = next(place);
+            place = static_cast<value_idx_type>((place + 1U) & mask);
         }
         at(m_buckets, place) = bucket;
     }
 
     void erase_and_shift_down(value_idx_type bucket_idx) {
+        // cache mask in a local so the bucket stores can't alias it
+        auto const mask = m_bucket_mask;
+
         // shift down until either empty or an element with correct spot is found
-        auto next_bucket_idx = next(bucket_idx);
+        auto next_bucket_idx = static_cast<value_idx_type>((bucket_idx + 1U) & mask);
         while (at(m_buckets, next_bucket_idx).m_dist_and_fingerprint >= Bucket::dist_inc * 2) {
             auto& next_bucket = at(m_buckets, next_bucket_idx);
             at(m_buckets, bucket_idx) = {dist_dec(next_bucket.m_dist_and_fingerprint), next_bucket.m_value_idx};
-            bucket_idx = std::exchange(next_bucket_idx, next(next_bucket_idx));
+            bucket_idx = std::exchange(next_bucket_idx, static_cast<value_idx_type>((next_bucket_idx + 1U) & mask));
         }
         at(m_buckets, bucket_idx) = {};
     }
@@ -1058,9 +1149,9 @@ private:
     void copy_buckets(table const& other) {
         // assumes m_values has already the correct data copied over.
         if (empty()) {
-            // when empty, at least allocate an initial buckets and clear them.
-            allocate_buckets_from_shift();
-            clear_buckets();
+            // Nothing to index, so stay in the state a default constructed table is in and let the
+            // first insert allocate. Copying an empty table therefore allocates nothing either.
+            m_shifts = initial_shifts;
         } else {
             m_shifts = other.m_shifts;
             allocate_buckets_from_shift();
@@ -1085,10 +1176,12 @@ private:
         m_buckets.clear();
         m_buckets.shrink_to_fit();
         m_max_bucket_capacity = 0;
+        m_bucket_mask = 0;
     }
 
     void allocate_buckets_from_shift() {
         auto num_buckets = calc_num_buckets(m_shifts);
+        m_bucket_mask = static_cast<value_idx_type>(num_buckets - 1);
         if constexpr (IsSegmented || !std::is_same_v<BucketContainer, default_container_t>) {
             if constexpr (has_reserve<bucket_container_type>) {
                 m_buckets.reserve(num_buckets);
@@ -1107,7 +1200,28 @@ private:
         }
     }
 
+    // The bucket array is not allocated until the first element goes in, so that a default
+    // constructed table does not allocate. Every path that probes the buckets either returns early
+    // while the table is empty (do_find, do_erase_key), or needs an iterator into m_values and so
+    // cannot be reached in this state (erase, extract, replace_key), or calls this first -- which
+    // is the three insert entry points, the only ones that reach the buckets without a prior
+    // emptiness check.
+    void allocate_buckets_if_none() {
+        if (ANKERL_UNORDERED_DENSE_UNLIKELY(0 == bucket_count()))
+            ANKERL_UNORDERED_DENSE_UNLIKELY_ATTR {
+                allocate_buckets_from_shift();
+                clear_buckets();
+            }
+    }
+
     void clear_buckets() {
+        // Reachable now that a table can have no buckets at all -- extract() clears them on the way
+        // out whether or not there are any. data() is null in that state, and memset's pointer has
+        // to be valid even for a zero length. Neither sanitizer in CI objects, so this is on the
+        // language rule rather than on a diagnostic.
+        if (0 == bucket_count()) {
+            return;
+        }
         if constexpr (IsSegmented || !std::is_same_v<BucketContainer, default_container_t>) {
             for (auto&& e : m_buckets) {
                 std::memset(&e, 0, sizeof(e));
@@ -1136,27 +1250,25 @@ private:
             on_error_bucket_overflow();
         }
         --m_shifts;
-        if constexpr (!IsSegmented || std::is_same_v<BucketContainer, default_container_t>) {
+        if constexpr (!IsSegmented && std::is_same_v<BucketContainer, default_container_t>) {
             deallocate_buckets();
         }
         allocate_buckets_from_shift();
         clear_and_fill_buckets_from_values();
     }
 
-    template <typename Op>
-    void do_erase(value_idx_type bucket_idx, Op handle_erased_value) {
-        auto const value_idx_to_remove = at(m_buckets, bucket_idx).m_value_idx;
-        erase_and_shift_down(bucket_idx);
-        handle_erased_value(std::move(m_values[value_idx_to_remove]));
-
-        // update m_values
+    // Closes the hole that the erased value left in m_values, by moving the last value into it and repointing that
+    // value's bucket. Runs after the erased value has been handed over, and has to run even when handing it over threw:
+    // by that point the bucket is already gone, so leaving the value in place would mean size() counts an element that
+    // nothing can find.
+    void finish_erase(value_idx_type value_idx_to_remove) {
         if (value_idx_to_remove != m_values.size() - 1) {
             // no luck, we'll have to replace the value with the last one and update the index accordingly
             auto& val = m_values[value_idx_to_remove];
             val = std::move(m_values.back());
 
             // update the values_idx of the moved entry. No need to play the info game, just look until we find the values_idx
-            bucket_idx = bucket_idx_from_hash(mixed_hash(get_key(val)));
+            auto bucket_idx = bucket_idx_from_hash(mixed_hash(get_key(val)));
             auto const values_idx_back = static_cast<value_idx_type>(m_values.size() - 1);
             while (values_idx_back != at(m_buckets, bucket_idx).m_value_idx) {
                 bucket_idx = next(bucket_idx);
@@ -1164,6 +1276,33 @@ private:
             at(m_buckets, bucket_idx).m_value_idx = value_idx_to_remove;
         }
         m_values.pop_back();
+    }
+
+    template <typename Op>
+    void do_erase(value_idx_type bucket_idx, Op handle_erased_value) {
+        auto const value_idx_to_remove = at(m_buckets, bucket_idx).m_value_idx;
+
+        // both values are needed after the shift down; start fetching them now to overlap the latencies
+        ANKERL_UNORDERED_DENSE_PREFETCH(&m_values[value_idx_to_remove]);
+        ANKERL_UNORDERED_DENSE_PREFETCH(&m_values.back());
+
+        erase_and_shift_down(bucket_idx);
+        auto&& erased_value = std::move(m_values[value_idx_to_remove]);
+
+        // erase() hands the value to a callback that cannot throw, so the branch below is not even instantiated for it.
+        // extract() moves the value out into the caller's storage, and that move is the one that can throw.
+        if constexpr (ANKERL_UNORDERED_DENSE_HAS_EXCEPTIONS() && !noexcept(handle_erased_value(std::move(erased_value)))) {
+            try {
+                handle_erased_value(std::move(erased_value));
+            } catch (...) {
+                finish_erase(value_idx_to_remove);
+                throw;
+            }
+        } else {
+            handle_erased_value(std::move(erased_value));
+        }
+
+        finish_erase(value_idx_to_remove);
     }
 
     template <typename K, typename Op>
@@ -1218,6 +1357,7 @@ private:
 
     template <typename K, typename... Args>
     auto do_try_emplace(K&& key, Args&&... args) -> std::pair<iterator, bool> {
+        allocate_buckets_if_none();
         auto hash = mixed_hash(key);
         auto dist_and_fingerprint = dist_and_fingerprint_from_hash(hash);
         auto bucket_idx = bucket_idx_from_hash(hash);
@@ -1309,11 +1449,11 @@ public:
         , m_buckets(alloc_or_container)
         , m_hash(hash)
         , m_equal(equal) {
+        // No bucket_count asked for means no buckets yet: the first insert allocates them. See
+        // allocate_buckets_if_none(). A default constructed table therefore costs no allocation at
+        // all, so one can sit in a scope that may never use it without paying for it.
         if (0 != bucket_count) {
             reserve(bucket_count);
-        } else {
-            allocate_buckets_from_shift();
-            clear_buckets();
         }
     }
 
@@ -1348,22 +1488,41 @@ public:
     table(InputIt first, InputIt last, size_type bucket_count, Hash const& hash, allocator_type const& alloc)
         : table(first, last, bucket_count, hash, KeyEqual(), alloc) {}
 
+    // Asks the allocator whether it wants to come along, which is what allocator_traits' default
+    // does and what an allocator like std::pmr::polymorphic_allocator declines: a copy of a map
+    // living in an arena should not silently keep that arena alive and keep allocating into it.
     table(table const& other)
-        : table(other, other.m_values.get_allocator()) {}
+        : table(other,
+                std::allocator_traits<allocator_type>::select_on_container_copy_construction(other.m_values.get_allocator())) {
+    }
 
+    // m_buckets takes the allocator too. Leaving it to its default member initialiser put the
+    // bucket array in the default resource while the values went where the caller asked, so half
+    // the container escaped the arena it was given -- and get_allocator(), which reports m_values'
+    // allocator, could not be used to reason about the buckets any more.
     table(table const& other, allocator_type const& alloc)
         : m_values(other.m_values, alloc)
+        , m_buckets(alloc)
         , m_max_load_factor(other.m_max_load_factor)
         , m_hash(other.m_hash)
         , m_equal(other.m_equal) {
         copy_buckets(other);
     }
 
+    // Unconditionally noexcept, and honestly so: it hands over other's own allocator, so the
+    // assignment below always takes the branch that takes the buffers over rather than the one
+    // that moves elements into freshly allocated memory.
     table(table&& other) noexcept
         : table(std::move(other), other.m_values.get_allocator()) {}
 
-    table(table&& other, allocator_type const& alloc) noexcept
-        : m_values(alloc) {
+    // Not unconditionally noexcept, unlike the above: this is the constructor whose whole purpose
+    // is a *differing* allocator, so the assignment below may have to move the elements one at a
+    // time, and that allocates. The specification is the assignment's own.
+    table(table&& other, allocator_type const& alloc) noexcept(std::is_nothrow_move_assignable_v<value_container_type> &&
+                                                               std::is_nothrow_move_assignable_v<Hash> &&
+                                                               std::is_nothrow_move_assignable_v<KeyEqual>)
+        : m_values(alloc)
+        , m_buckets(alloc) {
         *this = std::move(other);
     }
 
@@ -1397,9 +1556,12 @@ public:
         return *this;
     }
 
-    auto operator=(table&& other) noexcept(noexcept(std::is_nothrow_move_assignable_v<value_container_type> &&
-                                                    std::is_nothrow_move_assignable_v<Hash> &&
-                                                    std::is_nothrow_move_assignable_v<KeyEqual>)) -> table& {
+    // The condition used to be wrapped in another noexcept(), which asks whether evaluating a bool expression can
+    // throw. It cannot, so the specification was noexcept(true) whatever the traits said, and a type with a throwing
+    // move assignment terminated instead of propagating.
+    auto operator=(table&& other) noexcept(std::is_nothrow_move_assignable_v<value_container_type> &&
+                                           std::is_nothrow_move_assignable_v<Hash> &&
+                                           std::is_nothrow_move_assignable_v<KeyEqual>) -> table& {
         if (&other != this) {
             deallocate_buckets(); // deallocate before m_values is set (might have another allocator)
             m_values = std::move(other.m_values);
@@ -1410,12 +1572,15 @@ public:
                 m_buckets = std::move(other.m_buckets);
                 other.m_buckets.clear();
                 m_max_bucket_capacity = std::exchange(other.m_max_bucket_capacity, 0);
+                m_bucket_mask = std::exchange(other.m_bucket_mask, 0);
                 m_shifts = std::exchange(other.m_shifts, initial_shifts);
                 m_max_load_factor = std::exchange(other.m_max_load_factor, default_max_load_factor);
                 m_hash = std::exchange(other.m_hash, {});
                 m_equal = std::exchange(other.m_equal, {});
-                other.allocate_buckets_from_shift();
-                other.clear_buckets();
+                // The exchanges above leave "other" exactly as a default constructed table looks,
+                // so it is already usable and does not need buckets handed back to it. It used to
+                // get a freshly allocated set here, which is an allocation -- and a way to throw --
+                // inside an operation that is otherwise noexcept and needs neither.
             } else {
                 // set max_load_factor *before* copying the other's buckets, so we have the same
                 // behavior
@@ -1490,8 +1655,10 @@ public:
     // modifiers //////////////////////////////////////////////////////////////
 
     void clear() {
-        m_values.clear();
-        clear_buckets();
+        if (!empty()) {
+            m_values.clear();
+            clear_buckets();
+        }
     }
 
     auto insert(value_type const& value) -> std::pair<iterator, bool> {
@@ -1535,7 +1702,14 @@ public:
     // nonstandard API: *this is emptied.
     // Also see "A Standard flat_map" https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2022/p0429r9.pdf
     auto extract() && -> value_container_type {
-        return std::move(m_values);
+        auto values = std::move(m_values);
+
+        // Moving the values out does not empty the buckets, and they index into the container that just left. Emptying
+        // them here is what makes "*this is emptied" true: without it the table looks empty -- size() is 0, find()
+        // returns end() -- and then the next insert probes a bucket pointing at an element that is no longer there.
+        m_values.clear();
+        clear_buckets();
+        return values;
     }
 
     // nonstandard API:
@@ -1640,6 +1814,7 @@ public:
               typename KE = KeyEqual,
               std::enable_if_t<!is_map_v<Q> && is_transparent_v<H, KE>, bool> = true>
     auto emplace(K&& key) -> std::pair<iterator, bool> {
+        allocate_buckets_if_none();
         auto hash = mixed_hash(key);
         auto dist_and_fingerprint = dist_and_fingerprint_from_hash(hash);
         auto bucket_idx = bucket_idx_from_hash(hash);
@@ -1660,6 +1835,8 @@ public:
 
     template <class... Args>
     auto emplace(Args&&... args) -> std::pair<iterator, bool> {
+        allocate_buckets_if_none();
+
         // we have to instantiate the value_type to be able to access the key.
         // 1. emplace_back the object so it is constructed. 2. If the key is already there, pop it later in the loop.
         auto& key = get_key(m_values.emplace_back(std::forward<Args>(args)...));
@@ -1802,7 +1979,9 @@ public:
             bucket_idx = next(bucket_idx);
         }
 
-        do_erase(bucket_idx, [](value_type const& /*unused*/) -> void {
+        // The noexcept here and on the other two erase callbacks is what keeps erase() out of do_erase()'s exception
+        // guard: a call expression is noexcept only if the callee says so, an empty body is not enough.
+        do_erase(bucket_idx, [](value_type const& /*unused*/) noexcept -> void {
         });
         return begin() + static_cast<difference_type>(value_idx_to_remove);
     }
@@ -1858,7 +2037,7 @@ public:
     }
 
     auto erase(Key const& key) -> std::size_t {
-        return do_erase_key(key, [](value_type const& /*unused*/) -> void {
+        return do_erase_key(key, [](value_type const& /*unused*/) noexcept -> void {
         });
     }
 
@@ -1872,7 +2051,7 @@ public:
 
     template <class K, class H = Hash, class KE = KeyEqual, std::enable_if_t<is_transparent_v<H, KE>, bool> = true>
     auto erase(K&& key) -> std::size_t {
-        return do_erase_key(std::forward<K>(key), [](value_type const& /*unused*/) -> void {
+        return do_erase_key(std::forward<K>(key), [](value_type const& /*unused*/) noexcept -> void {
         });
     }
 
@@ -1885,10 +2064,20 @@ public:
         return tmp;
     }
 
-    void swap(table& other) noexcept(noexcept(std::is_nothrow_swappable_v<value_container_type> &&
-                                              std::is_nothrow_swappable_v<Hash> && std::is_nothrow_swappable_v<KeyEqual>)) {
+    void swap(table& other) noexcept(std::is_nothrow_swappable_v<value_container_type> && std::is_nothrow_swappable_v<Hash> &&
+                                     std::is_nothrow_swappable_v<KeyEqual>) {
+        // There is no free swap() for table, so "swap(other, *this)" used to resolve to the generic std::swap: three
+        // move assignments, each of which hands the moved-from table a freshly allocated set of buckets. That is three
+        // allocations for an operation that needs none, and three ways to throw out of a noexcept function.
         using std::swap;
-        swap(other, *this);
+        swap(m_values, other.m_values);
+        swap(m_buckets, other.m_buckets);
+        swap(m_max_bucket_capacity, other.m_max_bucket_capacity);
+        swap(m_bucket_mask, other.m_bucket_mask);
+        swap(m_max_load_factor, other.m_max_load_factor);
+        swap(m_hash, other.m_hash);
+        swap(m_equal, other.m_equal);
+        swap(m_shifts, other.m_shifts);
     }
 
     // lookup /////////////////////////////////////////////////////////////////
@@ -2019,7 +2208,11 @@ public:
     }
 
     void max_load_factor(float ml) {
-        m_max_load_factor = ml;
+        // A load factor above 1 is meaningful for a container that chains, and std::unordered_map takes one. Open
+        // addressing cannot use it: m_max_bucket_capacity would exceed bucket_count(), is_full() would never fire, the
+        // table would fill completely, and place_and_shift_up() would then probe forever for an empty bucket that does
+        // not exist. Exactly 1 is fine, because is_full() is checked after the value is appended.
+        m_max_load_factor = (std::min)(ml, 1.0F);
         if (bucket_count() != max_bucket_count()) {
             m_max_bucket_capacity = static_cast<value_idx_type>(static_cast<float>(bucket_count()) * max_load_factor());
         }
@@ -2095,6 +2288,12 @@ public:
 
     friend auto operator!=(table const& a, table const& b) -> bool {
         return !(a == b);
+    }
+
+    // Standard containers provide this, and generic code written as "using std::swap; swap(a, b);" needs it to find
+    // the member. Without it that call lands on the generic std::swap and moves three times.
+    friend void swap(table& a, table& b) noexcept(noexcept(a.swap(b))) {
+        a.swap(b);
     }
 };
 
