@@ -35,11 +35,14 @@ Additionally, there are `ankerl::unordered_dense::segmented_map` and `ankerl::un
     - [3.3.4. `[[nodiscard]] auto values() const noexcept -> value_container_type const&`](#334-nodiscard-auto-values-const-noexcept---value_container_type-const)
     - [3.3.5. `auto replace(value_container_type&& container)`](#335-auto-replacevalue_container_type-container)
     - [3.3.6. `auto hash_for(K const& key) const -> precomputed_hash`](#336-auto-hash_fork-const-key-const---precomputed_hash)
+    - [3.3.7. `auto visit(FwdIt first, FwdIt last, F f) -> size_t`](#337-auto-visitfwdit-first-fwdit-last-f-f---size_t)
+    - [3.3.8. `void merge(map& source)`](#338-void-mergemap-source)
   - [3.4. Custom Container Types](#34-custom-container-types)
   - [3.5. Custom Bucket Types](#35-custom-bucket-types)
     - [3.5.1. `ankerl::unordered_dense::bucket_type::group`](#351-ankerlunordered_densebucket_typegroup)
     - [3.5.2. `ankerl::unordered_dense::bucket_type::group_big`](#352-ankerlunordered_densebucket_typegroup_big)
   - [3.6. Disabling the Vector Probe](#36-disabling-the-vector-probe)
+  - [3.7. LLDB Data Formatters](#37-lldb-data-formatters)
 - [4. `segmented_map` and `segmented_set`](#4-segmented_map-and-segmented_set)
 - [5. Design](#5-design)
   - [5.1. Inserts](#51-inserts)
@@ -390,6 +393,66 @@ auto it = map.find("status"s, h);
 
 Only lookups take a precomputed hash, and insertion never will: a lookup given the wrong hash merely misses, while an insertion given one files the element under a probe chain it is not on, losing it for good and letting a second copy of the same key in beside it. Erase is left out for a duller reason — it hashes the moved element as well as the key, so precomputing the key's hash would save it only half its hashing.
 
+#### 3.3.7. `auto visit(FwdIt first, FwdIt last, F f) -> size_t`
+
+Looks up a whole range of keys, calls `f` on each one that is there, and returns how many that was.
+
+```cpp
+auto const keys = std::vector<std::string>{"alpha", "beta", "gamma"};
+auto total = 0;
+auto found = map.visit(keys.begin(), keys.end(), [&](auto const& kv) { total += kv.second; });
+```
+
+`f` receives `value_type&`, or `value_type const&` on a `const` map, so a visit can modify what it finds. Keys that are absent are not reported; the count says how many were there.
+
+**Why it is faster than the same loop of `find()`.** A lookup on a table past the cache is two dependent memory accesses — the group's block, and then the value the slot points at — and a loop doing one lookup at a time can only overlap them as far as the processor's own reordering reaches past a whole loop body. `visit` works a chunk at a time in three passes: every key's block is asked for, then the fingerprints are matched once the blocks have arrived, then the keys are compared. Every block in the chunk is in flight at once.
+
+`map<uint64_t, size_t>`, clang 22 on a 7950X, ns per lookup, against the same batch looked up one key at a time:
+
+| entries | | one at a time | `visit` | |
+| ------: | :--- | ----: | ----: | ---: |
+| 4 000 000 | all hits | 34.0 | 26.3 | 1.29x |
+| 4 000 000 | half hits | 34.4 | 28.4 | 1.21x |
+| 16 000 000 | all hits | 36.5 | 30.4 | 1.20x |
+| 16 000 000 | half hits | 37.3 | 31.5 | 1.18x |
+
+**It needs a table past the cache to be worth anything**, like every other memory-level trick here: on a map that fits in L2 there is nothing to overlap and the extra passes are a small loss.
+
+**And the batching itself matters more than `visit` does.** If the keys are being fetched from somewhere in the same loop that looks them up — a random index into another array, say — then the key's own cache miss sits in front of the map's and neither overlaps with anything. Collecting the keys first and looking them up afterwards is worth **1.5x** at four million entries before `visit` is involved at all:
+
+```cpp
+for (size_t i = 0; i < n; ++i) {              // 51 ns per lookup
+    auto it = map.find(keys[indices[i]]);
+}
+
+std::vector<key_type> batch;                  // 33 ns per lookup
+for (size_t i = 0; i < n; ++i) { batch.push_back(keys[indices[i]]); }
+for (auto const& k : batch) { auto it = map.find(k); }
+```
+
+That is a property of loops and memory parallelism rather than of this map, and it is the larger of the two effects. `visit` is what is left on top once the loop is already shaped that way.
+
+#### 3.3.8. `void merge(map& source)`
+
+This is the standard container's `merge`, with the guarantees a container without nodes can give. Every element of `source` whose key is not here already moves over, and the rest stay behind. An element whose key is already here is **not** overwritten -- the value already in this map wins, as with `insert` and `try_emplace`. `source` may hash and compare differently; the keys that move are re-hashed with this map's hasher. Both an lvalue and an rvalue `source` are accepted, and an rvalue one is still only emptied of what moved.
+
+```cpp
+auto a = ankerl::unordered_dense::map<std::string, int>{{"x", 1}, {"y", 2}};
+auto b = ankerl::unordered_dense::map<std::string, int>{{"y", 20}, {"z", 30}};
+a.merge(b);
+// a is {"x", 1}, {"y", 2}, {"z", 30}   -- "y" was already in a, so a's value stayed
+// b is {"y", 20}                       -- and so did b's
+```
+
+Two things differ from `std::unordered_map::merge`, and both follow from the elements living in a vector rather than in nodes:
+
+* **Iterators and references into either container are invalidated.** A node-based merge splices nodes, so references to the elements that move stay valid. Here an element that moves is move-constructed into the destination's vector, which may reallocate.
+* **The source's order changes.** Every element taken out of the middle of it leaves a gap that the elements behind it close. `erase()` already reorders for the same reason.
+
+`a.merge(a)` has no effect. If an operation throws -- a hash, a key comparison, or an element's move -- both containers are left valid and usable, `source` keeps everything not yet taken, and the one element that was being moved at the time may be lost.
+
+`merge` is worth using over the loop it replaces: about **2x** when the two maps mostly do not overlap, which is what a merge is usually for.
+
 ### 3.4. Custom Container Types
 
 `unordered_dense` accepts a custom allocator, but you can also specify a custom container for that template argument. That way it is possible to replace the internally used `std::vector` with e.g. `std::deque` or any other container like `boost::interprocess::vector`. This supports fancy pointers (e.g. [offset_ptr](https://www.boost.org/doc/libs/1_80_0/doc/html/interprocess/offset_ptr.html)), so the container can be used with e.g. shared memory provided by `boost::interprocess`.
@@ -430,6 +493,40 @@ All three compare the same sixteen bytes and differ only in how they report whic
 translation units that disagree about these macros still agree about every byte of the index they
 share. On x86-64 the word-at-a-time fallback is within a few percent of SSE2 on the benchmark's
 workloads; on AArch64 it is not, which is why the NEON path exists.
+
+### 3.7. LLDB Data Formatters
+
+The repository ships a formatter script for LLDB in [`lldb/unordered_dense.py`](lldb/unordered_dense.py). It makes
+`map`, `set`, `segmented_map`, `segmented_set` (including the `pmr::` variants) and `segmented_vector` print like
+regular containers instead of raw internals, across `map`'s every flavor with one provider:
+
+```
+(lldb) frame variable word_count
+(ankerl::unordered_dense::map<std::string, int> &) word_count = size=3 bucket_count=64 {
+  [alpha] = (first = "alpha", second = 1)
+  [beta] = (first = "beta", second = 2)
+  [gamma] = (first = "gamma", second = 3)
+}
+```
+
+Load it with
+
+```
+command script import /path/to/unordered_dense/lldb/unordered_dense.py
+```
+
+or put that line into `~/.lldbinit` to always have it. Elements are the densely stored values in the container's
+iteration order — insertion order until something is erased — and children are named after their key when the key
+renders as a short scalar or string (`v map[2]` works by index regardless). The script only reads memory, so it is
+safe on core dumps, and `frame variable -R <var>` still shows the raw members whenever they are wanted. Naming
+children by key can be turned off with
+
+```
+script unordered_dense.NAME_CHILDREN_BY_KEY = False
+```
+
+Custom value containers (see [3.4](#34-custom-container-types)) fall back to whatever LLDB itself can display for
+them.
 
 ## 4. `segmented_map` and `segmented_set`
 

@@ -87,6 +87,17 @@ Each of these was learned by getting an answer wrong first; `notes/index-design.
   octave and reports the geometric mean; `-p 1` restores the old single size. An eleven-slot group
   read 1.384 at one size and 1.039 over the octave; `churn64` read 1.199 and 0.974 — sign reversed.
   Every boost ratio not labelled "octave geomean" is a point measurement and must be re-taken.
+- **A prefetch pipeline can be a loss while the data is in cache, so sweep across that boundary
+  too.** The lookahead costs 13–17 instructions per element in the three loops measured, paid
+  whether or not the prefetch was needed — but only one of the three wants a gate, so measure, do
+  not assume. `replace()` was measured at 200k and 2M, both above its crossover, and shipped a
+  version that was a fifth slower below 65k. Two sizes on the same side of a cache are one size, and
+  the load factor still sweeps underneath: the *same* index size reads 0.75 and 1.05 at two n.
+- **The control for "does this pipeline pay" is the same entry point with the ring removed**, built
+  as a second binary (`solo.sh`, not the paired harness — removing a ring changes a function's
+  size). A caller's own loop of single calls is not it: that carries the call boundary's 15
+  instructions and shows the bulk entry point winning everywhere. Only the *time* needs the size
+  sweep; the instruction premium is flat, so one `perf` run gives it.
 - **The paired harness cannot measure anything that changes inlining, and gets the sign wrong.**
   It compiles both headers into one translation unit, which is exactly when a compiler exhausts its
   inlining budget. For anything touching `always_inline`, a function's size or a template boundary,
@@ -98,9 +109,42 @@ Each of these was learned by getting an answer wrong first; `notes/index-design.
 - **Code layout luck is ±3%**, from edits to code that never executes. Judge micro-optimizations by
   mechanism plus a focused microbenchmark, never by a single sub-benchmark delta.
 - **Rerun if nanobench prints `err%` above ~3.** A CPU-governor warning is normal noise.
+- **Take a null run before believing a sub-benchmark delta.** `scripts/ab/run.sh -r HEAD` on a clean
+  tree puts the *same* header on both sides; it reads `rmissstr` 1.036, `buildbig` 0.983 and
+  `hashstr` 0.872. That bias was reported as a win in two consecutive PRs before it was checked. One
+  run, and it retires anything under about 5% on those workloads.
+- **A benchmark's own input model can make a wrong heuristic look right.** `scripts/ab/range_insert.cpp`
+  draws duplicates from a pool that grows with the range, so the fresh-key rate is stationary — and a
+  range-insert sizing rule that extrapolated that rate reproduced the right bucket count at every
+  duplicate rate from 0% to 99% while being **64x wrong** on a fixed set of keys. The unit tests
+  caught it; the benchmark never would have. A benchmark says how fast, not whether it is right.
 - **A benchmark with a small per-epoch batch must advance its own randomness.** A replayed key
   sequence is learned by the branch predictor and flatters the branchiest probe by up to 2.7x. This
   mistake has been made twice, in two different tools.
+- **A benchmark that rebuilds its subject every round is measuring the allocator too, and bimodally.**
+  `replace_bulk.cpp` read 4.40, 2.85, 2.88, 4.76, 5.19, 2.76 ns/element for the *same* binary because
+  each round built a fresh map and the index allocation landed inside the clock. Replacing into the
+  same warmed map and reporting the **median round** rather than the mean took four repeats of one
+  cell from 3.32 / 3.33 / 3.31 / 3.27 (max 6.14) to 3.158 / 3.141 / 3.145 / 3.147 (max 3.92). Any
+  harness used to settle a 5–10% question needs both.
+- **A pipeline's payoff can depend on the caller's data, not only on the size.** `replace()`'s ring is
+  worth 1.5x to a `uint64_t` with no duplicates and costs 16% to one with a quarter of them, at the
+  *same* index size, because a duplicate refills its ring slot from the element read next and has no
+  distance to prefetch over. A single index threshold cannot serve both; pick it on the geomean across
+  key types and rates, and say in the comment what it gives up.
+- **An instruction count can move because you perturbed the inliner. That is real for the binary you
+  shipped and is not a property of the change.** Bounding `slot_of_value`'s `while (true)` reads
+  133.0 → 119.5 instructions and 0.92–0.95 of the time per erase under clang, and that does ship. It
+  is not a property of `[[noreturn]]` or of bounded loops, which is what it was first written up as:
+  force `slot_of_value` out of line and the three variants collapse to 137.0 / 138.1 / 137.1, and
+  under gcc they are 85.5 / 85.1 / 84.5. It landed on a different clang inlining decision — one a
+  compiler upgrade or an unrelated edit to those functions can flip, and one that transfers to
+  nothing else. **Instruction counts are immune to code layout, not to inlining.** Before
+  *generalising* one, pin the inlining with `noinline` and check a second compiler; both take
+  minutes. Keep the win, do not build a rule on it. #254. The contrast is #260, where the same kind of
+  count did transfer: taking a slot pack-and-unpack out of `finish_erase` reads -5.1 instructions per
+  erase under clang and -4.5 under gcc, from a mechanism visible in the disassembly and with nothing
+  else in the binary changed.
 - **Do not edit a shell script while it is running.** bash re-reads the file at its old byte offset.
 
 ### Rules the workloads themselves must obey
@@ -214,11 +258,19 @@ block. Fusing the insert's probe with its placement: more instructions, not fewe
 index prefetch: a clang win and a bigger gcc loss, so left alone.
 
 *The layout.* Merged 88 byte block: **kept**, 7% of a lookup's instructions and 28% of its dTLB
-misses at 4M. Splitting fingerprints from counters: a tie. Cache-line-aligning the indices: 0.993.
+misses at 4M. A quarter of those blocks span three cache lines, and `prefetch_block` steps
+by 64 from the start rather than asking for the first and the last — same instruction count, 3.3%,
+because it takes the middle line (counters and fingerprints) over the tail. Naming all three lines
+is *slower* than either (#250, `scripts/ab/prefetch_lines.cpp`). Splitting fingerprints from counters: a tie. Cache-line-aligning the indices: 0.993.
 A second fingerprint in the index's spare bits: 0.975. 16-bit indices for small maps: 0.986. A
 12-slot 64 byte block: 0.9888.
 
-*The values.* A slot back-pointer per value: pays only for string erase-by-iterator, loses the
+*The values.* A narrower value index, tiny pointers included: bounded at ~9% of memory and no speed
+by insertion order itself -- the referrer does not choose the position, so the index carries
+log2(n) - 1.44 bits per entry. The one speed idea behind it, a value address the group predicts and
+can prefetch, was measured on a layout built to make the prediction exact: 0.82 of a hit at 12M
+entries, **0.99 for a string**, and misses 13-24% worse at every size. Closed, #229.
+A slot back-pointer per value: pays only for string erase-by-iterator, loses the
 score. Distance nibbles with it: 0.959. `realloc` growth: available today via
 `AllocatorOrContainer`. A growth factor below 2: 7–13% of steady memory for 9–19% of a build —
 a knob, not a default. Not zeroing the index: 1.7% of a large build, and undefined behaviour in the
@@ -239,5 +291,61 @@ it** (96.4 to 69.3 instructions, 34.0 to 17.5 cycles) on both maps. No source ch
 six have been tried; what is left against boost once the boundary is gone is eleven instructions,
 and at 4M entries the two are level.
 
-*Still open.* Huge pages (22% of a large lookup, nothing asks for them). ARM prefetch tuning.
+*Range insert sizing.* `insert(first, last)` reserving from the range is **2x** and was **declined**,
+#248 — every version that gets the 2x is a heuristic about data the map cannot see, and an ordered
+range defeats all of them. `reserve(size() + distance())` is 128x the index at a 99% duplicate rate
+*and* 1.21 slower; a sampled fresh rate is 64x (2048 keys drawn from ten thousand come back 90% new
+— the birthday bound, not a duplicate rate); a capture-recapture read of the same sample is accurate
+and still guesses. Note the cost is the **value vector's** reallocation, not the index rehash:
+reserving only the values gets 10.4 ns/element against 9.9 for both and 19.6 for neither, and
+reserving only the buckets is *worse* than not reserving.
+
+*Probe termination.* Every probe that searches for a key or a value is bounded; the two *placement*
+walks are not, and deliberately -- they terminate on the free-slot invariant the load factor
+maintains, which no caller can break. The miss probe got its bound after a fuzz hang; `slot_of_value`
+got one after a five-line hang a mutable key could reach (#254). The bound costs one compare on the
+next-group path and nothing on a home-group hit.
+
+*Still open.* Huge pages (22% of a large lookup, nothing asks for them).
 A built-in probe-length statistics facility like boost's. The string erase's ~50 ns second hash.
+
+*Bulk lookups.* `visit(first, last, f)` is 1.07-1.14x over the same batch looked up one key at a
+time, past the cache. The larger effect is the caller's: **batching the keys at all is 1.5x**, and a
+`prefetch(key)` API that was credited with that was reverted the same day it shipped.
+
+*The five pipelines.* The rehash, the range insert, `replace()`'s dedup and `merge()` each have their
+own `pipeline_depth` ring, and the bulk visit has chunks instead (a ring there measured 15% worse);
+sharing them costs the rehash 1.9 instructions per element and was rejected. `replace()` and
+`merge()` are gated, on **index** bytes — counting the values too was measured wrong. The two
+thresholds are **not the same**: 256 KB and 1 MB. `replace()`'s was re-measured across both key types
+and both duplicate rates for #257 and kept: it is the best of four candidates on the geomean (0.9081
+against 0.9137 / 0.9143 / 0.9286), and it buys a 1.5x on one cell by accepting a 1.163 on its
+neighbour. A gate's crossover is where the ring's fixed 13–17
+instructions per element stop being worth the misses they hide, so it moves with what the *rest* of
+the loop costs — writing merge's walk with iterators instead of indices made it 5–11% cheaper and
+pushed its crossover two doublings up. Re-fit the constant whenever the gated loop changes; a shared
+one costs 7–12% in an octave. The range insert is slightly
+negative below a few thousand elements and a clear win above; the visit loses 8% only when every key
+hits a map below ~16k, where the same map at a 50% hit rate wins 11%, so its axis is the caller's
+hit rate. The rehash is the one that has never been measured below cache. #247, #242.
+
+**A gate that is a runtime branch inside the loop costs nearly everything it saves.** `merge()`'s
+first version read the gate per element; the ungated case then came back 10% slower than the same
+loop with the ring deleted, because a perfectly predicted branch is not free when a ring, a lambda
+and a live array hang off it. Two instantiations of one body (`walk(std::true_type{})`) get the
+plain loop back.
+
+**Walk a value container with iterators, never with an index, in any loop that also places
+elements.** `fill_buckets_from_values` records why — a `uint8_t` fingerprint store may alias the
+container's data pointer, so an indexed read reloads it after every placement, and that is a store-
+to-load chain per element (10.43 → 2.74 ns/insert there). `merge()`'s walk cost 0.89–0.95 for being
+written with indices first; `replace()`'s two loops cost 0.68–0.98 over 24 cells. All four loops that
+place are cursor-based now, `do_visit` indexes randomly from the probe and cannot be, and for a
+**string** key the win shows up as cycles with the instruction count flat — there the reload is not
+extra work, it is a latency in front of the next hash.
+
+**But hold one cursor fewer than feels natural: ask the container its `size()`.** `replace()`'s first
+cursor version also held `last` and tested `last - read`. It retired two *fewer* instructions per
+element and took **3.5% more cycles**, reproducibly — a fourth live value across a loop holding three
+ring arrays, and it cannot be decremented on a pop because `std::deque::pop_back` invalidates the
+past-the-end iterator, so it needs an `end()` after every one.

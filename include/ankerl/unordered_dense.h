@@ -190,6 +190,9 @@ namespace detail {
 [[noreturn]] inline ANKERL_UNORDERED_DENSE_NOINLINE void on_error_too_many_elements() {
     throw std::out_of_range("ankerl::unordered_dense::map::replace(): too many elements");
 }
+[[noreturn]] inline ANKERL_UNORDERED_DENSE_NOINLINE void on_error_key_changed() {
+    throw std::logic_error("ankerl::unordered_dense: an element's key changed after it was inserted; use replace_key()");
+}
 
 #    else
 
@@ -200,6 +203,9 @@ namespace detail {
     abort();
 }
 [[noreturn]] inline void on_error_too_many_elements() {
+    abort();
+}
+[[noreturn]] inline void on_error_key_changed() {
     abort();
 }
 
@@ -721,11 +727,74 @@ namespace detail {
 }
 inline constexpr std::array<std::uint32_t, 256> fingerprint_words = make_fingerprint_words();
 
+// Whether comparing two keys of this type is a *call*, which decides how the probe is shaped.
+//
+// A probe that leaves its home group needs the delta and the group mask, and about 3% of lookups
+// leave it. When the key compare is a register compare, those two values live in registers and cost
+// nothing; when it is a call -- a `memcmp` for a string -- everything the loop keeps live has to
+// survive the call, and the compiler builds a frame and spills them before the *first* group is
+// even compared. Splitting the rare part out of line then removes the frame from the common path,
+// and that is worth 8-9% of a string lookup and costs an integer one 20-40% (measured 2026-09-10,
+// `notes/index-design.md`), so it has to be decided per key type.
+//
+// No trait separates the two cases -- `std::string_view` and `std::pair<std::uint64_t,
+// std::uint64_t>` are both sixteen bytes and both trivially copyable, and they want opposite
+// answers -- so this is a heuristic plus the one exception the standard library provides. A type
+// whose copy constructor is trivial holds no indirection, and so is compared field by field unless
+// it is a view; `basic_string_view` is the view the library knows about.
+//
+// **Trivially copy-constructible, not trivially copyable**, and the difference is not pedantry:
+// `std::pair` and `std::tuple` write their own copy *assignment*, so both libstdc++ and libc++
+// report `is_trivially_copyable_v<std::pair<std::uint64_t, std::uint64_t>>` as false. Keying on
+// that would have split one of the commonest key types after string and integer and cost it 40%.
+//
+// A pair and a tuple are asked about their elements rather than about themselves, because that is
+// what comparing one does -- and because the answer for the aggregate is not portable: MSVC's
+// `std::tuple<int, int>` is not trivially copy-constructible where libstdc++'s and libc++'s is, so
+// without this a tuple key would take a different probe on Windows than everywhere else.
+//
+// A user type that is trivially copy-constructible and still compares through a call (a large byte
+// array) is treated as cheap and does not get the split. Measured, that costs it about 2%, and the
+// heuristic never misfires in the expensive direction.
+template <typename Key>
+struct key_compare_is_call : std::bool_constant<!std::is_trivially_copy_constructible_v<Key>> {};
+
+template <typename CharT, typename Traits>
+struct key_compare_is_call<std::basic_string_view<CharT, Traits>> : std::true_type {};
+
+template <typename A, typename B>
+struct key_compare_is_call<std::pair<A, B>>
+    : std::bool_constant<key_compare_is_call<A>::value || key_compare_is_call<B>::value> {};
+
+template <typename... Ts>
+struct key_compare_is_call<std::tuple<Ts...>> : std::bool_constant<(key_compare_is_call<Ts>::value || ...)> {};
+
+template <typename Key>
+constexpr bool key_compare_is_call_v = key_compare_is_call<Key>::value;
+
 template <typename T>
 using detect_is_transparent = typename T::is_transparent;
 
 template <typename T>
 using detect_iterator = typename T::iterator;
+
+template <typename T>
+using detect_iterator_category = typename std::iterator_traits<T>::iterator_category;
+
+// Whether a range can be walked twice, which is what reading ahead of where you are writing needs.
+// A type with no iterator_traits at all -- a test's hand-rolled iterator, say -- has to answer no
+// rather than fail to compile, which is what is_detected_v is for.
+template <typename T>
+[[nodiscard]] constexpr auto is_forward_iterator() -> bool {
+    if constexpr (is_detected_v<detect_iterator_category, T>) {
+        return std::is_convertible_v<detect_iterator_category<T>, std::forward_iterator_tag>;
+    } else {
+        return false;
+    }
+}
+
+template <typename T>
+constexpr bool is_forward_iterator_v = is_forward_iterator<T>();
 
 template <typename T>
 using detect_reserve = decltype(std::declval<T&>().reserve(std::size_t{}));
@@ -1346,11 +1415,6 @@ public:
     [[nodiscard]] auto data() const -> block const* {
         return m_blocks.data();
     }
-    // The few places that hold a flat slot number rather than a group and a lane. slots is a power
-    // of two, so this is a shift and a mask.
-    [[nodiscard]] auto index_at(std::size_t slot) -> value_idx_type& {
-        return m_blocks[slot / slots].m_index[slot % slots];
-    }
     // Zeroes the metadata of every block and leaves the indices alone, which is what the split
     // version's single memset did: an empty slot's index is never read.
     void clear_metadata() {
@@ -1390,6 +1454,64 @@ private:
                   "a group is sixteen fingerprints, matched as one vector or two words, and eight counters, picked by "
                   "the low three bits of the fingerprint");
 
+    // How far ahead the five loops that pipeline look: the rehash, the range insert, the bulk
+    // visit, replace()'s dedup and merge()'s walk. The visit uses it as a chunk size rather than a ring depth. It is a count
+    // of memory accesses that has to fit inside what the core keeps outstanding, which is about two dozen on a Zen 4 -- not a
+    // property of the map, and every size from 8 to 32 measured within 2% of this one. Boost's bulk visit uses the same
+    // number.
+    static constexpr std::size_t pipeline_depth = 16;
+
+    // Below this much *index*, a pipeline costs more than it saves: the ring round trip is about 13
+    // instructions per element, and a prefetch of a line already in cache still occupies a load
+    // port. The index is the right thing to measure because it is the only array the prefetch is
+    // for -- the values are walked in order and the hardware handles them. Counting the values too
+    // was tried first and is wrong: at one value size the two models cannot be told apart, and with
+    // a 1032 byte value the footprint model opens the gate at ten thousand elements, where the
+    // pipeline is a **14% loss**. Both value sizes cross over at the same index size instead.
+    //
+    // replace()'s threshold; see the sweep beside its only use. The range insert and the bulk visit
+    // were measured against the same question and neither wants a gate at all; the visit's crossover
+    // is set by the caller's hit rate, which the map does not know until it has already done a
+    // chunk's worth of work. Issue #247.
+    //
+    // Re-measured on a fixed harness for #257 -- it was first fitted on `std::uint64_t` alone -- and
+    // kept. Ring over the same loop with the ring deleted, by how much index the array holds, for
+    // `std::uint64_t` and `std::string` keys at 0% and 25% duplicates:
+    //
+    //      88 KiB   1.265  1.225  1.006  1.037
+    //     176 KiB   0.833  1.194  1.156  1.033
+    //     352 KiB   0.667  1.163  1.064  1.002    <- the first size the gate opens at
+    //     704 KiB   0.632  0.999  1.039  0.987
+    //    1408 KiB   0.626  0.944  0.998  0.985
+    //    5632 KiB   0.537  0.912  0.950  0.944
+    //
+    // The four curves cross in four different places, because the ring's payoff depends on the
+    // **duplicate rate** as much as on the size: a duplicate refills its ring slot from the element
+    // that just moved into it, which is read by the very next iteration and has no distance to
+    // prefetch over. At 352 KiB the same gate is worth 1.5x to a `std::uint64_t` with no duplicates
+    // and costs 16% to one with a quarter of them, and the map cannot tell which it has until it has
+    // walked. So the constant is a compromise and is chosen as one: over all 28 cells the realised
+    // geometric mean is 0.9081 here, 0.9137 at 128 KiB, 0.9143 at 512 KiB and 0.9286 at a mebibyte.
+    // A threshold that never loses exists -- a mebibyte, worst cell 1.000 -- and costs two points of
+    // that mean. This one keeps the 1.5x and accepts a worst cell of 1.163.
+    static constexpr std::size_t pipeline_min_index_bytes = std::size_t{256} << 10U;
+
+    // merge()'s, and it is two doublings higher than replace()'s rather than the same number -- which
+    // was the first guess, and wrong. A gate's crossover is where the ring's fixed cost per element
+    // stops being worth the misses it hides, so it moves with what the *rest* of the loop costs, and
+    // merge's walk is cheaper per element than replace()'s dedup. Measured on this loop, ring over
+    // the same loop with the ring deleted, at no overlap / half / nine tenths of it duplicated:
+    //
+    //     352 KiB of index   1.068 / 1.119 / 1.086   a clear loss
+    //     704 KiB            1.019 / 1.043 / 1.031 and 0.994 / 1.014 / 1.050 at two load factors
+    //    1408 KiB            0.966 / 0.988 / 0.986 and 0.927 / 0.968 / 1.005
+    //    2816 KiB            0.921 / 0.926 / 0.956
+    //     22 MiB             0.812 / 0.749 / 0.769
+    //
+    // The index doubles, so anything inside (704 KiB, 1408 KiB] switches at the same places; a
+    // mebibyte sits in the middle of that window with a doubling of margin either side. Issue #242.
+    static constexpr std::size_t merge_min_index_bytes = std::size_t{1} << 20U;
+
     static constexpr std::uint8_t initial_shifts = 64 - 2; // 2^(64-m_shifts) groups
     static constexpr float default_max_load_factor = 0.8F;
 
@@ -1425,6 +1547,22 @@ public:
 
 private:
     using value_idx_type = typename Bucket::value_idx_type;
+
+    // merge(source) takes the source apart and puts it back together: it compacts the elements that
+    // stay behind and rebuilds the index over them once, neither of which the public API can
+    // express. The standard lets the source differ in its hash and its key_equal, so it is a
+    // different instantiation of this same template and not otherwise a friend of it.
+    // Wider than the need -- every table is a friend of every other, where merge wants only the ones
+    // holding the same value type in the same container -- and C++17 has no way to say less: a friend
+    // template cannot constrain its own argument list.
+    template <class, class, class, class, class, class, bool>
+    friend class table;
+
+    // What merge() accepts: this table with another hash or another key_equal, which is the pair the
+    // standard allows to differ. Everything else has to match, because the elements move out of one
+    // container and into the other.
+    template <class H2, class KE2>
+    using sibling_table = table<Key, T, H2, KE2, AllocatorOrContainer, Bucket, IsSegmented>;
 
     static_assert(std::is_trivially_destructible_v<Bucket>, "assert there's no need to call destructor / std::destroy");
     static_assert(std::is_trivially_copyable_v<Bucket>, "assert we can just memset / memcpy");
@@ -1599,23 +1737,60 @@ private:
     // MERGED VARIANT: the indices sit inside the block, so what has to be pulled in is the rest of
     // the block rather than a second array. One block is 88 bytes and unaligned, so it covers two or
     // three lines; the first is the one the fingerprints are already being read from.
+    //
+    // The second address is the block's last byte for `group` and a fixed 128 for `group_big`, which
+    // is the same rule read twice: **the two lines after the one being read, clamped into the
+    // block**. 88 bytes never reaches past 128, so for the default type this is the `p + 87` it has
+    // always asked for and the generated code does not move. 152 bytes does: it spans four lines
+    // whenever `p % 64 > 40`, which is 36% of blocks, and asking for the first and the *last* of
+    // them leaves out the middle -- where eight of the sixteen value indices live. Naming all three
+    // instead is not the fix; it measured no better than the pair it replaces (15.65 against 15.64
+    // ns/block) while the two consecutive lines read 15.01, the same shape and the same reason as
+    // #250's fix to prefetch_block. gcc agrees, 15.54 / 15.60 against 15.00.
+    // scripts/ab/prefetch_lines.cpp, issue #252.
     template <typename Block>
     static void prefetch_index(Block const* blocks, value_idx_type group_idx) {
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- byte arithmetic on the block
         auto const* p = reinterpret_cast<char const*>(blocks + std::size_t{group_idx});
         ANKERL_UNORDERED_DENSE_PREFETCH(p + 64);
-        ANKERL_UNORDERED_DENSE_PREFETCH(p + sizeof(Block) - 1);
+        ANKERL_UNORDERED_DENSE_PREFETCH(p + (sizeof(Block) - 1 < 128 ? sizeof(Block) - 1 : 128));
     }
 
-    // Every line of a block, for a caller that has not touched the group at all. prefetch_index
-    // skips the first line because the probe is about to read it anyway; a rehash is about to
-    // write a group it has never read, so it wants that line too.
+    // The first and last line of a block, for a caller that has not touched the group at all.
+    // prefetch_index skips the first line because the probe is about to read it anyway; a rehash is
+    // about to write a group it has never read, so it wants that line too.
+    //
+    // Consecutive lines from the block's start -- *not* its first and its last, which is what this
+    // asked for until 2026-09-11 and is a line short. A block is 88 bytes with four byte alignment,
+    // `88 % 64 == 24` and `gcd(24, 64) == 8`, so `p % 64` walks the whole cycle whatever the array's
+    // alignment and a quarter of blocks span three lines. Asking for `p` and `p + 87` then covers
+    // the first and the *last*, leaving out the middle -- which holds all eight counters and half
+    // the fingerprints, the two things a probe reads first. Stepping by 64 instead covers the first
+    // two and leaves out the last, which holds only the top two index entries.
+    //
+    // Same instruction count, **3.3% faster**: 12.28 ns per block against 12.67, seven rounds of
+    // seven with no overlap, on a 176 MiB array walked at random with a sixteen-deep lookahead and a
+    // probe-shaped read. Adding a third prefetch to cover the tail as well is a loss (12.85) -- the
+    // hardware fetches what it can see coming, so the job here is to start it in the right place
+    // rather than to name every line. scripts/ab/prefetch_lines.cpp, issue #250.
+    //
+    // The loop is what makes it right for group_big too: 152 bytes spans up to four lines, and the
+    // old pair covered the first and the last of them.
+    template <typename Block>
+    static void prefetch_block(Block const* block) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- byte arithmetic on the block
+        auto const* p = reinterpret_cast<char const*>(block);
+        for (std::size_t off = 0; off < sizeof(Block); off += 64) {
+            ANKERL_UNORDERED_DENSE_PREFETCH(p + off);
+        }
+    }
+
+    // The same for a caller holding a group number rather than a pointer. A block is 88 bytes, so
+    // the difference is a multiply, and a caller that already formed the address should not pay it
+    // twice.
     template <typename Block>
     static void prefetch_block(Block const* blocks, std::size_t group_idx) {
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- byte arithmetic on the block
-        auto const* p = reinterpret_cast<char const*>(blocks + group_idx);
-        ANKERL_UNORDERED_DENSE_PREFETCH(p);
-        ANKERL_UNORDERED_DENSE_PREFETCH(p + sizeof(Block) - 1);
+        prefetch_block(blocks + group_idx);
     }
 
     // Forced inline because gcc does not do it on its own in a large translation unit, and the
@@ -1625,13 +1800,15 @@ private:
     // measured 0.66 of the robin hood index, and forcing it took them to 1.23; with SSE2 the same
     // change was churn 1.32, string hits 1.22 and the integer build 1.42 against the commit before.
     // clang inlined it already and measures 1.00 everywhere.
+    // The probe's loop, from a group and the distance already walked. Written out rather than built
+    // from a per-group helper: returning a probe_result from an inner function costs gcc 26% of an
+    // integer hit even fully inlined, and this path must stay exactly what it was for a key whose
+    // compare is cheap.
     template <typename K>
-    ANKERL_UNORDERED_DENSE_FORCEINLINE auto probe(K const& key, std::uint64_t mh) const -> probe_result {
-        auto const word = fingerprint_word(mh);
-        auto const counter = word & 7U;
-        auto group_idx = group_idx_from_hash(mh);
+    ANKERL_UNORDERED_DENSE_FORCEINLINE auto
+    probe_from(K const& key, std::uint32_t word, unsigned counter, value_idx_type group_idx, value_idx_type delta) const
+        -> probe_result {
         auto const* groups = m_buckets.data();
-        value_idx_type delta = 0;
         while (true) {
             prefetch_index(groups, group_idx);
             auto const& group = groups[group_idx];
@@ -1654,12 +1831,122 @@ private:
         }
     }
 
+    // Everything past the home group, out of line, for a key whose compare is a call. See
+    // detail::key_compare_is_call for what that buys and what it would cost the other kind of key.
+    // Entered by a tail call, so the caller keeps nothing live across it.
+    template <typename K>
+    ANKERL_UNORDERED_DENSE_NOINLINE auto
+    probe_past_home(K const& key, std::uint32_t word, unsigned counter, value_idx_type group_idx, value_idx_type delta) const
+        -> probe_result {
+        return probe_from(key, word, counter, group_idx, delta);
+    }
+
+    // What happens once the home group has been looked at and did not hold the key: whether it is
+    // worth walking on at all, and the walk. Shared by probe() and by the bulk visit, so that the
+    // probe's termination invariant is written once -- it was copied into the second of those, and
+    // a copy of an invariant is silent when it drifts, because the result is a wrong answer and not
+    // a crash.
+    //
+    // `m_group_mask == 0` cannot fire while the smallest array is four groups; it is here because it
+    // is what the loop tests at delta zero, so a mutation survivor on it is expected. The counter
+    // beside it is not: turning that `== 0` into `== 1` makes a key that overflowed its home group
+    // with exactly one same-class neighbour unfindable, and a steered test covers it.
+    template <typename K>
+    ANKERL_UNORDERED_DENSE_FORCEINLINE auto
+    probe_after_home(K const& key, std::uint32_t word, unsigned counter, Bucket const& home, value_idx_type home_idx) const
+        -> probe_result {
+        if (home.m_overflows[counter] == 0 || m_group_mask == 0) {
+            return {0, 0, false};
+        }
+        value_idx_type delta = 0;
+        auto const next = next_group(home_idx, delta);
+        if constexpr (detail::key_compare_is_call_v<Key>) {
+            return probe_past_home(key, word, counter, next, delta);
+        } else {
+            // A compare that needs no frame needs no call either: the same choice probe() makes for
+            // such a key, and the reason the bulk path must not simply always take the out-of-line
+            // one.
+            return probe_from(key, word, counter, next, delta);
+        }
+    }
+
+    template <typename K>
+    ANKERL_UNORDERED_DENSE_FORCEINLINE auto probe(K const& key, std::uint64_t mh) const -> probe_result {
+        auto const word = fingerprint_word(mh);
+        return probe(key, word, word & 7U, group_idx_from_hash(mh));
+    }
+
+    // The probe for a caller that is holding the home group already -- a pipelined insert formed it
+    // to prefetch against. It cannot prefetch, because it was handed the group rather than a number
+    // to find it by, which is the same shape probe_after_home has and the reason it is written this
+    // way rather than as a flag: "the caller already asked for this block" is then true by
+    // construction and scoped to exactly the one group the caller knows about. A flag was tried and
+    // is wrong twice over -- it suppressed the walk's prefetches too, for groups nobody had asked
+    // for, and it kept suppressing them on the sixteen elements after a growth, which are the ones
+    // whose earlier prefetch went to the array that growth replaced.
+    template <typename K>
+    ANKERL_UNORDERED_DENSE_FORCEINLINE auto probe_at_home(K const& key,
+                                                          std::uint32_t word,
+                                                          unsigned counter,
+                                                          typename bucket_container_type::block const& home,
+                                                          value_idx_type home_idx) const -> probe_result {
+        auto lanes = match_fingerprint(home, word);
+        while (lanes != 0) {
+            auto const lane = first_lane(lanes);
+            auto const slot = static_cast<value_idx_type>(std::size_t{home_idx} * slots_per_group + lane);
+            auto const value_idx = home.m_index[lane];
+            if (m_equal(key, get_key(m_values[value_idx]))) {
+                return {slot, value_idx, true};
+            }
+            lanes &= lanes - 1;
+        }
+        return probe_after_home(key, word, counter, home, home_idx);
+    }
+
+    // The same probe for a caller that has already taken the hash apart. A pipelined insert has all
+    // three in hand -- it derived the group to prefetch it -- and re-deriving them per element is a
+    // table load, an and and a shift on the hot path of a loop that is doing nothing else.
+    template <typename K>
+    ANKERL_UNORDERED_DENSE_FORCEINLINE auto
+    probe(K const& key, std::uint32_t word, unsigned counter, value_idx_type home_idx) const -> probe_result {
+        if constexpr (!detail::key_compare_is_call_v<Key>) {
+            return probe_from(key, word, counter, home_idx, 0);
+        } else {
+            // The home group inline and the rest behind a call, which is where the frame goes.
+            auto const* groups = m_buckets.data();
+            prefetch_index(groups, home_idx);
+            auto const& home = groups[home_idx];
+            auto lanes = match_fingerprint(home, word);
+            while (lanes != 0) {
+                auto const lane = first_lane(lanes);
+                auto const slot = static_cast<value_idx_type>(std::size_t{home_idx} * slots_per_group + lane);
+                auto const value_idx = home.m_index[lane];
+                if (m_equal(key, get_key(m_values[value_idx]))) {
+                    return {slot, value_idx, true};
+                }
+                lanes &= lanes - 1;
+            }
+            // The loop's two stopping conditions at delta 0: nothing of this class ever overflowed
+            // past home, or there is nowhere else to look. The second is `delta == m_group_mask`
+            // with delta zero, and it cannot fire while the smallest array is four groups -- it is
+            // kept because it is what the loop tests, not because it is reachable, so a mutation
+            // survivor on it is expected rather than a hole.
+            return probe_after_home(key, word, counter, home, home_idx);
+        }
+    }
+
     // The first free slot on the key's probe sequence takes it; every full group on the way
     // counts it.
     ANKERL_UNORDERED_DENSE_FORCEINLINE void place_group(std::uint64_t mh, value_idx_type value_idx) {
         auto const word = fingerprint_word(mh);
-        auto const counter = word & 7U;
-        auto group_idx = group_idx_from_hash(mh);
+        place_group(word, word & 7U, group_idx_from_hash(mh), value_idx);
+    }
+
+    // The placement for a caller that has already taken the hash apart, and has just probed with
+    // exactly these three -- so this is the second of the two walks an insert does, not a third
+    // derivation of where to start it.
+    ANKERL_UNORDERED_DENSE_FORCEINLINE void
+    place_group(std::uint32_t word, unsigned counter, value_idx_type group_idx, value_idx_type value_idx) {
         auto* groups = m_buckets.data();
         value_idx_type delta = 0;
         while (true) {
@@ -1753,8 +2040,32 @@ private:
         uncount(groups, mask, home_idx, counter, found_in);
     }
 
-    // The slot that points at a value, searched from the value's home group. Every value has one,
-    // so there is no other stopping condition.
+    // Which slot points at this value, searched from the value's home group. Its precondition is that one does, and the map's
+    // own callers always satisfy it -- but the key is *not* const here, so a caller can break it with an assignment and no
+    // cast: `it->first = x; m.erase(it);` then asks for a slot on a probe sequence the element is not on.
+    //
+    // Bounded for that, the same way the miss probe is and after the same kind of hang: `delta ==
+    // m_group_mask` means the triangular sequence has now visited every group, so there is nowhere
+    // left. Returning "not found" is not available -- every caller's contract says the element is
+    // there and the return is a slot number -- so the useful outcome is a diagnosable abort rather
+    // than a core spinning at 100% forever, which is what this did until 2026-09-11 (#254).
+    //
+    // Two things the throw is not. It is not recoverable: the twin below reaches it from the backfill
+    // in finish_erase, where the slot is already gone, so the table is in the state that comment
+    // describes as unusable and the exception says what happened rather than offering to continue.
+    // And it is not a guarantee --
+    // if the mutated key's sequence happens to cross the element's real slot with a matching
+    // fingerprint, a wrong-but-valid slot comes back and the counters are unwound from the wrong
+    // home instead. Bounding turns a hang into a diagnosis; only `replace_key()` turns it into a
+    // supported operation.
+    //
+    // The test is after the lane loop, so the common case -- the element is in its home group --
+    // returns without reaching it, and a group that does fall through was about to call next_group
+    // anyway: one compare, on the walking path only.
+    //
+    // It measured 10% *faster* than the unbounded version under clang, and that is an artifact, not
+    // a reason -- see notes/index-design.md. Forcing this function out of line makes the difference
+    // vanish and gcc never had it. The reason to bound the loop is that it hangs.
     [[nodiscard]] auto slot_of_value(std::uint64_t mh, value_idx_type value_idx) const -> value_idx_type {
         auto const word = fingerprint_word(mh);
         auto group_idx = group_idx_from_hash(mh);
@@ -1772,6 +2083,45 @@ private:
                 }
                 lanes &= lanes - 1;
             }
+            if (ANKERL_UNORDERED_DENSE_UNLIKELY(delta == m_group_mask))
+                ANKERL_UNORDERED_DENSE_UNLIKELY_ATTR {
+                    on_error_key_changed();
+                }
+            group_idx = next_group(group_idx, delta);
+        }
+    }
+
+    // The same walk, for the one caller that does not want a slot number but only to overwrite the
+    // index it finds. Handing that caller a slot cost 5.1 instructions per erase under clang and 4.5
+    // under gcc: the loop has the group base and the lane in registers, packs them into `group_idx *
+    // slots_per_group + lane`, and the store then took that straight back apart. Clang folds it away
+    // on the erase(iterator) path, where erase_group_slot gets the same slot, and did not fold it
+    // here; gcc folds it at none of the sites that still pack one. notes/index-design.md has the
+    // before and after (#260).
+    //
+    // Precondition, bound and exhaustion are slot_of_value's; its comment is the one to read, and
+    // the half of it about the throw not being recoverable is about this function.
+    void repoint_value(std::uint64_t mh, value_idx_type value_idx, value_idx_type new_value_idx) {
+        auto const word = fingerprint_word(mh);
+        auto group_idx = group_idx_from_hash(mh);
+        auto* groups = m_buckets.data();
+        value_idx_type delta = 0;
+        while (true) {
+            prefetch_index(groups, group_idx);
+            auto& group = groups[group_idx];
+            auto lanes = match_fingerprint(group, word);
+            while (lanes != 0) {
+                auto const lane = first_lane(lanes);
+                if (group.m_index[lane] == value_idx) {
+                    group.m_index[lane] = new_value_idx;
+                    return;
+                }
+                lanes &= lanes - 1;
+            }
+            if (ANKERL_UNORDERED_DENSE_UNLIKELY(delta == m_group_mask))
+                ANKERL_UNORDERED_DENSE_UNLIKELY_ATTR {
+                    on_error_key_changed();
+                }
             group_idx = next_group(group_idx, delta);
         }
     }
@@ -1791,6 +2141,13 @@ private:
     // in slots, which is what the bucket interface counts in
     [[nodiscard]] static constexpr auto calc_num_buckets(std::uint8_t shifts) -> std::size_t {
         return calc_num_groups(shifts) * slots_per_group;
+    }
+
+    // How much index an array with these shifts is, which is what both pipeline gates are measured
+    // against. One spelling of the quantity; the threshold is the gated loop's own, because the two
+    // do not have the same one.
+    [[nodiscard]] static constexpr auto index_bytes_for(std::uint8_t shifts) -> std::size_t {
+        return calc_num_groups(shifts) * sizeof(typename bucket_container_type::block);
     }
 
     [[nodiscard]] constexpr auto calc_shifts_for_size(std::size_t s) const -> std::uint8_t {
@@ -1974,7 +2331,7 @@ private:
     // while the table is empty (do_find and do_find_hashed's callers, do_erase_key), or needs an
     // iterator into m_values and so
     // cannot be reached in this state (erase, extract, replace_key), or calls this first -- which
-    // is the three insert entry points, the only ones that reach the buckets without a prior
+    // is the four insert entry points, the only ones that reach the buckets without a prior
     // emptiness check.
     void allocate_buckets_if_none() {
         if (ANKERL_UNORDERED_DENSE_UNLIKELY(m_buckets.empty()))
@@ -2016,8 +2373,14 @@ private:
         // them is read through `this`, which the fingerprint store may alias too.
         //
         // The loop hashes sixteen elements ahead of the one it places and prefetches the group
-        // each will land in. Below cache that is worth 1.26x on the loop (2.05 to 1.63 ns per
-        // element at 200000 entries) for the pipelining alone: the hash, which is a chain, is
+        // each will land in. A sliding ring rather than the bulk visit's chunks, and measured
+        // against it: chunking this loop is 5-17% slower, worst for a string key, for the same
+        // instructions and 12.5% more cycles. An element here has one dependent random access --
+        // the block it is placed in -- where a visit has two, so there is no second batch to issue
+        // concurrently and the only thing that matters is how much time separates a prefetch from
+        // its use. A ring gives every element a full sixteen placements of that; a chunk gives its
+        // first elements only the rest of the hashing pass, which is far cheaper than placing. Below cache that is worth 1.26x
+        // on the loop (2.05 to 1.63 ns per element at 200000 entries) for the pipelining alone: the hash, which is a chain, is
         // decoupled from the placement, which is a random access, so neither waits for the other.
         // Above cache the prefetch is what matters for a key whose hash has work to hide a miss
         // behind -- a string rehash at four million entries goes 30.6 to 12.4 ns per element -- and
@@ -2032,7 +2395,7 @@ private:
         // The index is counted in value_idx_type and never in the container's size, for the reason
         // spelled out in replace(): max_size() is exactly what value_idx_type can hold, so a
         // container of precisely that many has a size that is not representable in it.
-        constexpr auto ahead = std::size_t{16};
+        constexpr auto ahead = pipeline_depth;
         auto* const groups = m_buckets.data();
         auto const mask = m_group_mask;
         auto const shifts = m_shifts;
@@ -2114,7 +2477,7 @@ private:
             // update the value index of the moved entry
             auto const values_idx_back = static_cast<value_idx_type>(m_values.size() - 1);
             auto const mh = mixed_hash(get_key(val));
-            m_buckets.index_at(slot_of_value(mh, values_idx_back)) = value_idx_to_remove;
+            repoint_value(mh, values_idx_back, value_idx_to_remove);
         }
         m_values.pop_back();
     }
@@ -2170,8 +2533,9 @@ private:
         return it_isinserted;
     }
 
-    // Appends the value and points a slot at it. What it needs to know is the key's hash: the
-    // probe that found the key absent left nothing an insert could reuse.
+    // Appends the value and points a slot at it. What it needs to know is where the key belongs;
+    // place_element below takes that from the probe that just missed, rather than deriving it
+    // again.
     //
     // Forced inline, and the reason is a trade worth knowing. clang prices this function at 480
     // against an inlining threshold of 250 (vector::emplace_back with piecewise_construct is 225
@@ -2201,6 +2565,17 @@ private:
     // places (clang 73.2 instructions against 48.4) -- it is simply smaller than 17% of a build.
     template <typename... Args>
     ANKERL_UNORDERED_DENSE_FORCEINLINE auto do_place_element(std::uint64_t mh, Args&&... args) -> std::pair<iterator, bool> {
+        auto const word = fingerprint_word(mh);
+        return place_element_at(word, word & 7U, group_idx_from_hash(mh), std::forward<Args>(args)...);
+    }
+
+    // As above for a caller holding the hash in pieces. The home group is only used on the branch
+    // that does not grow; growth rebuilds the whole index and places this element with the rest, so
+    // a stale group index cannot escape it.
+    template <typename... Args>
+    ANKERL_UNORDERED_DENSE_FORCEINLINE auto
+    place_element_at(std::uint32_t word, unsigned counter, value_idx_type home_idx, Args&&... args)
+        -> std::pair<iterator, bool> {
         // emplace the new value. If that throws an exception, no harm done; index is still in a valid state
         m_values.emplace_back(std::forward<Args>(args)...);
 
@@ -2210,24 +2585,451 @@ private:
                 increase_size(); // places every value, the new one included
             }
         else {
-            place_group(mh, value_idx);
+            place_group(word, counter, home_idx, value_idx);
         }
         return {begin() + static_cast<difference_type>(value_idx), true};
+    }
+
+    // The pipelined half of insert(first, last); see the comment there for what it buys.
+    //
+    // Growth during the loop is safe and not special-cased: it moves the bucket array, so prefetches
+    // already in flight are aimed at the old one and simply do nothing, and the hashes stay valid
+    // because a hash does not depend on the table. That is also why the array and the shift are read
+    // fresh for every element rather than hoisted the way the rehash hoists them -- the rehash never
+    // grows, and this may.
+    template <typename FwdIt>
+    void do_insert_range(FwdIt first, FwdIt last) {
+        if (first == last) {
+            return;
+        }
+        allocate_buckets_if_none();
+        auto ring = std::array<std::uint64_t, pipeline_depth>{};
+        auto lookahead = first;
+        auto hash_and_prefetch = [this](auto const& value) -> std::uint64_t {
+            auto const mh = mixed_hash(get_key(value));
+            prefetch_block(m_buckets.data(), std::size_t{group_idx_from_hash(mh)});
+            return mh;
+        };
+        for (auto i = std::size_t{}; i < pipeline_depth && lookahead != last; ++i) {
+            ring[i] = hash_and_prefetch(*lookahead);
+            ++lookahead;
+        }
+        for (auto i = std::size_t{}; first != last; ++first, ++i) {
+            // This element's hash out of the ring before the slot it frees is refilled: the slot
+            // holding element i is the one element i + pipeline_depth goes into. Getting that
+            // backwards returns a wrong answer rather than crashing, and it has been got backwards
+            // twice. fill_buckets_from_values has the same ordering for the same reason.
+            //
+            // The three rings in this file -- here, fill_buckets_from_values and
+            // do_replace_pipelined -- are deliberately not one shared loop. Extracting the ring into
+            // a helper taking both halves as callables was built and measured on 2026-09-11: it
+            // costs the rehash **1.9 instructions per element**, 45.7 to 47.6, and 1.3% of its time
+            // on six of six interleaved pairs, because that loop wants its group pointer, mask and
+            // shift in locals and this one cannot have them -- growth moves them. Passing the
+            // element index through the callable did not recover it either. The duplication is real
+            // and measured to be cheaper than the fix.
+            auto const slot = i % pipeline_depth;
+            auto const mh = ring[slot];
+            if (lookahead != last) {
+                ring[slot] = hash_and_prefetch(*lookahead);
+                ++lookahead;
+            }
+            do_insert_hashed(mh, *first);
+        }
+    }
+
+    // The pipelined part of replace()'s dedup walk; see there for why it is allowed to exist and
+    // where it has to stop. Advances value_idx to the first element it did not handle.
+    //
+    // The ring holds the hash already taken apart -- the fingerprint word, the home group and the
+    // block that group lives in -- rather than the mixed hash. Nothing here grows the index, so a
+    // block pointer stays valid, and holding it is the difference between forming an 88 byte block's
+    // address once per element and forming it again in the probe and a third time in the placement.
+    void do_replace_pipelined(std::size_t& value_idx) {
+        auto const* const groups = m_buckets.data();
+        auto ring_word = std::array<std::uint32_t, pipeline_depth>{};
+        auto ring_home = std::array<value_idx_type, pipeline_depth>{};
+        auto ring_block = std::array<typename bucket_container_type::block const*, pipeline_depth>{};
+
+        // Cursors for the elements, a counter for the index, and both are needed: place_group wants
+        // the index, and reading m_values[value_idx] to get the element wants the container's data
+        // pointer back after every placement, because placing stores a fingerprint and a
+        // std::uint8_t store may alias that pointer. fill_buckets_from_values has the full argument
+        // and the measurement. The counter costs an increment in a register; re-deriving it from
+        // `read - first` would be a divide by the element size on any value type whose size is not a
+        // power of two.
+        //
+        // Two cursors, and deliberately not a third for the end. Holding `last` as well and testing
+        // `last - read` was built and measured and is the slower of the two -- 3.83 ns against 3.54
+        // at two hundred thousand elements with no duplicates -- because it costs a register across a
+        // loop that already holds three ring arrays, and because it cannot simply be decremented on a
+        // pop: std::deque::pop_back invalidates the past-the-end iterator and a deque is a value
+        // container this map supports, so it would need an m_values.end() after every duplicate. The
+        // container's own size() answers the same question for nothing.
+        auto const first = m_values.begin();
+        auto read = first;                  // element value_idx
+        auto look = first + pipeline_depth; // element value_idx + pipeline_depth
+
+        // Hashes and decomposes, but does not ask for the block: the caller decides that, because
+        // the one refill that happens on a duplicate is read by the very next iteration and has no
+        // distance to run.
+        auto fetch = [&](std::size_t slot, value_type const& value) {
+            auto const mh = mixed_hash(get_key(value));
+            ring_word[slot] = fingerprint_word(mh);
+            ring_home[slot] = group_idx_from_hash(mh);
+            ring_block[slot] = groups + std::size_t{ring_home[slot]};
+        };
+
+        auto prime = first;
+        for (auto i = std::size_t{}; i < pipeline_depth; ++i, ++prime) {
+            fetch(i, *prime);
+            prefetch_block(ring_block[i]);
+        }
+        while (m_values.size() > value_idx + pipeline_depth + 1) {
+            auto const slot = value_idx % pipeline_depth;
+            auto const word = ring_word[slot];
+            auto const counter = word & 7U;
+            auto const home_idx = ring_home[slot];
+            // The group is handed over rather than looked up: this loop asked for it
+            // pipeline_depth elements ago, so the probe must not ask again.
+            if (probe_at_home(get_key(*read), word, counter, *ring_block[slot], home_idx).found) {
+                // The slot the duplicate vacated is refilled from the element that just moved into
+                // it -- read by the very next iteration, so there is no distance to prefetch over.
+                // `read` is below the last element here, by the loop's own condition, so the plain
+                // loop's self-move guard cannot be needed.
+                *read = std::move(m_values.back());
+                m_values.pop_back();
+                fetch(slot, *read);
+            } else {
+                place_group(word, counter, home_idx, static_cast<value_idx_type>(value_idx));
+                // The slot holding this element is the one `look` goes into, and the loop's own
+                // condition says that element exists. `look` moves only here, so it stays exactly
+                // pipeline_depth ahead of `read`.
+                fetch(slot, *look);
+                ++look;
+                prefetch_block(ring_block[slot]);
+                ++read;
+                ++value_idx;
+            }
+        }
+    }
+
+    // An insert whose key has already been hashed, which is what lets a range insert hash ahead of
+    // where it is placing.
+    //
+    // It is emplace()'s job rather than do_try_emplace's: it takes a whole value, not a key and
+    // pieces to build one from. Unlike emplace() it probes before constructing anything, which it
+    // can because a value_type already carries its key -- emplace() has to build the element first
+    // to find out what the key is, and pop it back off again when the key turns out to be present.
+    // Routing the single-element insert(value) through here too would save it that, and is left for
+    // its own change because the insert path is measured and this one is not about it.
+    //
+    // The caller allocates the buckets; every other insert helper does that itself, and this one
+    // cannot because the range insert has to prefetch against an array that already exists.
+    //
+    // Returns nothing on purpose: the only caller is the range insert, which has nothing to do with
+    // an iterator to each element, and a returned pair nobody reads is surface no test can defend.
+    template <typename V>
+    void do_insert_hashed(std::uint64_t mh, V&& value) {
+        // Taken apart once and handed to both halves. A probe that misses is followed by a placement
+        // that starts from the same group with the same fingerprint, and deriving those twice is
+        // work this loop is otherwise not doing.
+        //
+        auto const word = fingerprint_word(mh);
+        auto const counter = word & 7U;
+        auto const home_idx = group_idx_from_hash(mh);
+        // The group is formed here and handed to the probe, which therefore does not ask for it a
+        // second time -- the pipelined caller asked for this block sixteen elements ago. Read from
+        // the current array, so a growth since then is simply a prefetch that did nothing.
+        auto r = probe_at_home(get_key(value), word, counter, m_buckets.data()[home_idx], home_idx);
+        if (r.found) {
+            move_home(r.slot, mh);
+            return;
+        }
+        place_element_at(word, counter, home_idx, std::forward<V>(value));
+    }
+
+    // Closes the gaps a merge left behind, on the table it took them out of: compacts everything
+    // from `from` on down onto `keep`, drops the tail that is now moved-from, and rebuilds the index
+    // once over what is left. Called on the *source*, which is why it pairs with
+    // fill_buckets_from_values rather than living beside do_merge.
+    //
+    // That one rebuild is the point of the whole design. The loop a caller could write instead --
+    // try_emplace here, erase(it) there -- repairs the index once per element taken, and each repair
+    // is a second hash of the key leaving plus a third of the element the backfill drags into its
+    // place. Over a source that mostly does not overlap, that is most of the work.
+    void drop_tail_and_reindex(std::size_t keep) {
+        auto const n = m_values.size();
+        if (keep == n) {
+            // nothing was taken, so the index still describes the values exactly
+            return;
+        }
+        // Counted rather than "while size() > keep": the compaction above does not change the size,
+        // so the count is known, and the container is only required to have pop_back -- vector's
+        // resize(n) would need the value type to be default constructible, which nothing else here
+        // asks of it, and segmented_vector has no erase(first, last) to take a range out with.
+        for (auto k = n; k > keep; --k) {
+            m_values.pop_back();
+        }
+        clear_buckets();
+        fill_buckets_from_values();
+    }
+
+    // As above for the path that has gaps to close first. Kept apart from it because the walk's
+    // normal exit has none by construction, and folding the two would inline a compaction loop that
+    // can never run into the merge's hot path.
+    void compact_and_reindex(std::size_t keep, std::size_t from) {
+        auto const n = m_values.size();
+        for (auto i = from; i < n; ++i, ++keep) {
+            if (keep != i) {
+                m_values[keep] = std::move(m_values[i]);
+            }
+        }
+        drop_tail_and_reindex(keep);
+    }
+
+    // The engine behind merge(). One pass over the source's values, taking every element whose key
+    // is not here already and compacting the ones left behind down over the gaps.
+    //
+    // Compaction rather than the backfill erase() does, because the two have opposite best cases and
+    // this one's best case is the common one: a merge of sources that barely overlap takes nearly
+    // every element, so there is nearly nothing left to compact, where a backfill moves one element
+    // for every element it takes.
+    //
+    // The probe and the placement are written out here rather than calling do_insert_hashed, and the
+    // reason is the repair below. A throw out of the probe -- the hash, or the key compare -- leaves
+    // the source's element untouched, and a throw out of the placement leaves a husk the source must
+    // not keep, because a moved-from key can collide with a key that is still there and the source
+    // would then hold two elements that compare equal. Inside do_insert_hashed that boundary is not
+    // visible from outside.
+    template <typename Source>
+    void do_merge(Source& source) {
+        if constexpr (std::is_same_v<Source, table>) {
+            // "if (this == &source) there are no effects", which is worth honouring for its own sake
+            // and not only because the walk below would be reading a container it is emptying
+            if (this == &source) {
+                return;
+            }
+        }
+        if (source.empty()) {
+            // Ahead of allocate_buckets_if_none() and load-bearing there: without it, merging an
+            // empty source into a default constructed map allocates that map an index it never asked
+            // for. do_erase_key owns its own emptiness check for the same reason.
+            return;
+        }
+        allocate_buckets_if_none();
+        auto& src_values = source.m_values;
+        auto const n = src_values.size();
+        // Three cursors rather than three indices, and it is the same reason fill_buckets_from_values
+        // gives at length: placing an element stores a fingerprint, a std::uint8_t store may alias any
+        // object at all including the container's own data pointer, so every indexed read after a
+        // placement has to load that pointer back before it can even form the next element's address.
+        // An iterator is already the address. Worth 0.89 to 0.95 of the indexed loop in cache (four
+        // thousand elements, no overlap / half / nine tenths: 0.92 / 0.89 / 0.91) and 0.95 to 1.00
+        // above it, 26 of 27 cells, and 2 to 4.5 fewer instructions retired per element at every size.
+        //
+        // The source never changes size while the walk runs -- the repair at the end is what shrinks
+        // it -- so all three stay valid, and the destination's growth cannot reach them.
+        auto const first = src_values.begin();
+        auto const last = src_values.end();
+        auto read = first;  // the element being handled; also what the repair calls `from`
+        auto write = first; // where the next survivor goes; also what the repair calls `keep`
+        auto look = first;  // the element being hashed ahead
+        // `read` is the first element the source still owns, which is the one thing the repair below
+        // needs to know and the one thing an exception cannot tell it: a throw out of the probe leaves
+        // this element untouched and the source keeps it, a throw out of the placement leaves a husk
+        // it must drop. Advancing it *before* the placement rather than after the iteration is what
+        // says which, and it costs the loop nothing because it is the loop's own cursor.
+
+        // Hashed ahead of where it is placing, the same ring the range insert uses and for the same
+        // reason -- the source's elements are all in hand, so the hash of a later one can be computed
+        // while this one waits for its block. The compaction underneath cannot disturb it: the only
+        // writes go to `write`, which never passes `read`, and the ring reads at `look`, which is
+        // pipeline_depth ahead of it.
+        //
+        // Gated, like replace()'s ring and unlike the range insert's, because the loss below the
+        // crossover is not inside the noise: 1.10 / 1.19 / 1.14 of the ringless loop at a source of a
+        // thousand elements, at no overlap / half / nine tenths. See merge_min_index_bytes for where
+        // the crossover is and why it is not replace()'s number. With the gate in, the same
+        // comparison reads 0.97 / 0.97 / 1.00 there and 0.81 / 0.75 / 0.77 at two million: the worst
+        // cell anywhere on the sweep is 1.009.
+        //
+        // Measured against the index the destination will end up with rather than the one it has:
+        // every source element is new until the probe says otherwise, so this bounds it from above,
+        // and reading today's index instead gets the case the ring is most for -- a large source into
+        // a small map, where nothing is in cache and everything moves -- exactly wrong.
+        auto const pipelined = index_bytes_for(calc_shifts_for_size(size() + n)) > merge_min_index_bytes;
+        auto ring = std::array<std::uint64_t, pipeline_depth>{};
+        // The group array is handed in rather than read here: it has to be read fresh once per
+        // element, because placing one may grow the index and move it, but the prefetch and the probe
+        // that follows it are separated by nothing that can grow it -- so once, not twice.
+        auto const fetch =
+            [&](typename bucket_container_type::block const* groups, std::size_t slot, value_type const& value) -> void {
+            auto const mh = mixed_hash(get_key(value));
+            ring[slot] = mh;
+            prefetch_block(groups, std::size_t{group_idx_from_hash(mh)});
+        };
+        if (pipelined) {
+            auto const* const groups = m_buckets.data();
+            for (auto s = std::size_t{0}; s < pipeline_depth && look != last; ++s, ++look) {
+                // Outside the repair below on purpose: nothing has been moved yet, so a hash that
+                // throws here leaves the source exactly as it was.
+                fetch(groups, s, *look);
+            }
+        }
+
+        // Two loops out of one body rather than one loop with the gate inside it. A runtime branch
+        // is the obvious way to write this and costs the gated-off case nearly the whole difference
+        // the gate was there to save -- 5.09 ns at four thousand elements and half of them
+        // overlapping, against 4.63 for the same loop with the ring taken out. A perfectly predicted
+        // branch is not free when a ring, a lambda and an array hang off it and the loop has to keep
+        // them live.
+        auto const walk = [&](auto is_pipelined) -> void {
+            auto slot = std::size_t{0};
+            while (read != last) {
+                auto& value = *read;
+                auto const* const groups = m_buckets.data();
+                auto mh = std::uint64_t{};
+                if constexpr (decltype(is_pipelined)::value) {
+                    // this element's hash out of the ring before the slot it frees is refilled
+                    mh = ring[slot];
+                    if (look != last) {
+                        fetch(groups, slot, *look);
+                        ++look;
+                    }
+                    slot = (slot + 1) % pipeline_depth;
+                } else {
+                    mh = mixed_hash(get_key(value));
+                }
+                // taken apart once for both halves, exactly as do_insert_hashed does it
+                auto const word = fingerprint_word(mh);
+                auto const counter = word & 7U;
+                auto const home_idx = group_idx_from_hash(mh);
+                auto const r = probe_at_home(get_key(value), word, counter, groups[home_idx], home_idx);
+                if (r.found) {
+                    // Stays behind. merge() is a writing operation, so a hit here pays for its own
+                    // drift the same way one inside try_emplace does.
+                    move_home(r.slot, mh);
+                    if (write != read) {
+                        *write = std::move(value);
+                    }
+                    ++write;
+                    ++read;
+                    continue;
+                }
+                ++read; // this one is leaving, however the placement below ends
+                place_element_at(word, counter, home_idx, std::move(value));
+            }
+        };
+
+        auto const walk_either = [&]() -> void {
+            if (pipelined) {
+                walk(std::true_type{});
+            } else {
+                walk(std::false_type{});
+            }
+        };
+        if constexpr (ANKERL_UNORDERED_DENSE_HAS_EXCEPTIONS()) {
+            try {
+                walk_either();
+            } catch (...) {
+                // The source's index stopped describing its values at the first element taken, and
+                // the source is a container the caller still owns and did not hand over. Putting it
+                // back together is what keeps the throw at the basic guarantee instead of leaving a
+                // map whose next lookup reads an index into elements that have gone.
+                source.compact_and_reindex(static_cast<std::size_t>(write - first), static_cast<std::size_t>(read - first));
+                throw;
+            }
+        } else {
+            walk_either();
+        }
+        source.drop_tail_and_reindex(static_cast<std::size_t>(write - first));
     }
 
     template <typename K, typename... Args>
     auto do_try_emplace(K&& key, Args&&... args) -> std::pair<iterator, bool> {
         allocate_buckets_if_none();
         auto const mh = mixed_hash(key);
-        auto r = probe(key, mh);
+        // Taken apart once for both halves: a probe that misses is followed by a placement starting
+        // from the same group with the same fingerprint.
+        auto const word = fingerprint_word(mh);
+        auto const counter = word & 7U;
+        auto const home_idx = group_idx_from_hash(mh);
+        auto r = probe(key, word, counter, home_idx);
         if (r.found) {
             move_home(r.slot, mh);
             return {begin() + static_cast<difference_type>(r.value_idx), false};
         }
-        return do_place_element(mh,
+        return place_element_at(word,
+                                counter,
+                                home_idx,
                                 std::piecewise_construct,
                                 std::forward_as_tuple(std::forward<K>(key)),
                                 std::forward_as_tuple(std::forward<Args>(args)...));
+    }
+
+    // The engine behind visit(); see the comment there for what the three passes are for.
+    // f by value, the way the standard algorithms take a callable: it is invoked once per key that
+    // is found, so it cannot be forwarded -- forwarding it would move from the same object on every
+    // hit. The public overloads move into this parameter.
+    template <typename FwdIt, typename F>
+    auto do_visit(FwdIt first, FwdIt last, F f) -> std::size_t {
+        if (ANKERL_UNORDERED_DENSE_UNLIKELY(empty())) {
+            return 0;
+        }
+        constexpr auto bulk = pipeline_depth;
+        auto const* groups = m_buckets.data();
+        // The block pointer rather than the group number: a block is 88 bytes, so forming its
+        // address is a multiply, and passes two and three would each redo it.
+        auto block = std::array<decltype(groups), bulk>{};
+        auto word = std::array<std::uint32_t, bulk>{};
+        auto home = std::array<value_idx_type, bulk>{};
+        auto lanes = std::array<lane_mask, bulk>{};
+        auto found = std::size_t{0};
+
+        while (first != last) {
+            auto n = std::size_t{0};
+            auto it = first;
+            for (; n < bulk && it != last; ++n, ++it) {
+                auto const mh = mixed_hash(*it);
+                word[n] = fingerprint_word(mh);
+                home[n] = group_idx_from_hash(mh);
+                block[n] = groups + std::size_t{home[n]};
+                prefetch_block(block[n]);
+            }
+            for (auto i = std::size_t{}; i < n; ++i) {
+                lanes[i] = match_fingerprint(*block[i], word[i]);
+            }
+            for (auto i = std::size_t{}; i < n; ++i, ++first) {
+                auto const& group = *block[i];
+                // The element, once it is known: converging on a pointer rather than a found-flag
+                // keeps the call to f in one place instead of one per way of arriving at it.
+                value_type* element = nullptr;
+                auto remaining = lanes[i];
+                while (remaining != 0) {
+                    auto const lane = first_lane(remaining);
+                    auto const value_idx = group.m_index[lane];
+                    if (m_equal(*first, get_key(m_values[value_idx]))) {
+                        element = &m_values[value_idx];
+                        break;
+                    }
+                    remaining &= remaining - 1;
+                }
+                if (element == nullptr) {
+                    // Not at home. About 5% of keys get here and none of their work was pipelined,
+                    // which is what keeps the common path straight.
+                    auto const r = probe_after_home(*first, word[i], word[i] & 7U, group, home[i]);
+                    if (r.found) {
+                        element = &m_values[r.value_idx];
+                    }
+                }
+                if (element != nullptr) {
+                    f(*element);
+                    ++found;
+                }
+            }
+        }
+        return found;
     }
 
     template <typename K>
@@ -2555,11 +3357,25 @@ public:
         return insert(std::forward<P>(value)).first;
     }
 
+    // Inserting a range hashes ahead of the element it is placing, and asks for the block each of
+    // those will come home to.
+    //
+    // A single insert cannot do this: the hash is the first thing it computes and the block is the
+    // next thing it needs, so there is nothing to put between them. Over a range there is -- the
+    // hash of a later element, which depends on nothing the table is doing. It is the same trick the
+    // growth rehash uses, where it is worth 1.26x on that loop.
+    //
+    // Only for an iterator that can be walked twice. An input iterator is single-pass, so reading
+    // ahead would mean buffering the elements, and those copies would cost more than the prefetch
+    // saves; such a range takes the plain loop.
     template <class InputIt>
     void insert(InputIt first, InputIt last) {
-        while (first != last) {
-            insert(*first);
-            ++first;
+        if constexpr (detail::is_forward_iterator_v<InputIt>) {
+            do_insert_range(first, last);
+        } else {
+            for (; first != last; ++first) {
+                insert(*first);
+            }
         }
     }
 
@@ -2604,18 +3420,69 @@ public:
         // index the loop produces is representable -- it is the count that is not.
         auto value_idx = std::size_t{};
 
+        // Hashing ahead of where it places, which this loop could not simply be given because of how
+        // it removes a duplicate: it pulls back() into the hole, and a lookahead has already hashed
+        // the elements near the back.
+        //
+        // What makes it possible anyway is that the pull disturbs exactly *one* position, the last.
+        // So while the container is longer than the window by more than one, the window cannot
+        // contain the element that moves, and every hash in it stays valid. Only the tail -- the last
+        // pipeline_depth + 1 elements -- has to run unpipelined, and it is the loop below.
+        //
+        // A duplicate inside the pipelined region therefore costs one re-hash, not a flush: the
+        // element at value_idx is a different one afterwards, and nothing else in the ring moved.
+        // The index does not advance, exactly as it does not in the plain loop.
+        //
+        // The exact condition for safety is size > value_idx + pipeline_depth; the + 1 below is one
+        // stricter than it needs to be, which costs one element of pipelining and buys margin on a
+        // loop where an off-by-one is a wrong answer rather than a crash. A mutation sweep confirms
+        // there is slack on both sides -- loosening the bound by one still passes, because the
+        // iteration that could read a stale entry is the one after which the loop exits -- so the
+        // boundary is not balanced on a knife edge in either direction.
+        //
+        // The bucket array is sized once before this and never grows here, so the pipelined loop can
+        // hold its base in a local -- which is what lets the ring carry block pointers rather than
+        // group indices.
+        //
+        // And it only runs when the work does not fit in cache. The pipeline is not free: the ring
+        // round trip costs **13.6 instructions per element**, 73.4 against 86.6 at n = 1024, and a
+        // prefetch of a line already in L2 still occupies a load port. Measured against the
+        // unpipelined loop on 2026-09-11, at 0% duplicates, the ratio tracks the footprint against
+        // this machine's 1 MiB L2 and nothing else:
+        //
+        //     688 KiB (n=32768)   1.20x -- a fifth slower
+        //    1376 KiB (n=65536)   1.03x
+        //    2064 KiB (n=98304)   0.92x
+        //    5504 KiB (n=262144)  0.90x
+        //    22 MiB   (n=4000000) 0.74x
+        //
+        // So the gate is the footprint the loop streams -- the values plus the index -- against
+        // pipeline_min_bytes. Getting it wrong in the safe direction (a machine with more L2) costs
+        // at most that 1.20x on one octave of sizes; omitting the gate costs it on every size below
+        // a quarter million.
+        // m_shifts describes the array that was just allocated or kept above, so this is the index
+        // the dedup will actually run against.
+        if (m_values.size() > pipeline_depth + 1 && index_bytes_for(m_shifts) > pipeline_min_index_bytes) {
+            do_replace_pipelined(value_idx);
+        }
+
         // loop until we reach the end of the container. duplicated entries will be replaced with back().
+        // On a cursor rather than m_values[value_idx], for the reason do_replace_pipelined gives: the
+        // placement below stores a fingerprint, and an indexed read after it has to load the
+        // container's data pointer back before it can form the next element's address.
+        auto read = m_values.begin() + static_cast<difference_type>(value_idx);
         while (value_idx != m_values.size()) {
-            auto const& key = get_key(m_values[value_idx]);
+            auto const& key = get_key(*read);
             auto const mh = mixed_hash(key);
             auto r = probe(key, mh);
             if (r.found) {
                 if (value_idx != m_values.size() - 1) {
-                    m_values[value_idx] = std::move(m_values.back());
+                    *read = std::move(m_values.back());
                 }
                 m_values.pop_back();
             } else {
                 place_group(mh, static_cast<value_idx_type>(value_idx));
+                ++read;
                 ++value_idx;
             }
         }
@@ -2907,6 +3774,26 @@ public:
         swap(m_shifts, other.m_shifts);
     }
 
+    // Every element of source whose key is not here already moves over; the rest stay behind. The
+    // source may hash and compare differently -- that is the overload std::unordered_map has, and
+    // the keys are re-hashed with this table's hasher on the way in.
+    //
+    // Two differences from the standard's merge are worth knowing, and both follow from the elements
+    // living in a vector rather than in nodes. References and iterators into *either* table are
+    // invalidated, where a node splice preserves the ones into the elements it moves; and the
+    // source's order changes, because every element taken out of the middle of it leaves a gap that
+    // the elements behind it close. erase() already carries both, and this is the same mechanism.
+    template <class H2, class KE2>
+    void merge(sibling_table<H2, KE2>& source) {
+        do_merge(source);
+    }
+
+    template <class H2, class KE2>
+    // NOLINTNEXTLINE(cppcoreguidelines-rvalue-reference-param-not-moved)
+    void merge(sibling_table<H2, KE2>&& source) {
+        merge(source);
+    }
+
     // lookup /////////////////////////////////////////////////////////////////
 
     template <typename Q = T, std::enable_if_t<is_map_v<Q>, bool> = true>
@@ -3047,6 +3934,59 @@ public:
     template <class K, class H = Hash, class KE = KeyEqual, std::enable_if_t<is_transparent_v<H, KE>, bool> = true>
     [[nodiscard]] auto hash_for(K const& key) const -> precomputed_hash {
         return {mixed_hash(key)};
+    }
+
+    // Looks up a range of keys, calls f on each one that is there, and returns how many that was.
+    //
+    // A batch is worth having because a lookup here is two dependent memory accesses -- the group's
+    // block, then the value -- and a loop that does one lookup at a time can only overlap them as
+    // far as the core's out-of-order window reaches past a whole loop body. Splitting the batch into
+    // passes reaches further: every key's block is asked for before any key's block is waited on.
+    //
+    //   1. hash each key in the chunk and fetch the block it comes home to
+    //   2. match the fingerprints, by which time the blocks have arrived
+    //   3. compare the keys and call f
+    //
+    // Measured against the same batch looked up one key at a time with find(), a map of eight byte
+    // keys to eight byte values, ns per lookup: at four million entries 34.0 to 26.3 on all hits and
+    // 34.4 to 28.4 at half, at sixteen million 36.5 to 30.4 and 37.3 to 31.5. About 1.2x, and it
+    // needs a table past the cache to be worth anything.
+    //
+    // Two things this deliberately does not do. It does not prefetch the *value* in pass 2, which is
+    // what boost::concurrent_flat_map's bulk visit does and what this was built to try: the address
+    // is known there, unlike in a single lookup, and it measured +3.8% on all hits and **-4.8% at
+    // half hits**, because an absent key has nothing to fetch and a present one is already covered
+    // once the passes are separated.
+    //
+    // And it is a fixed-size chunk with straight passes rather than a sliding ring. A ring is the
+    // obvious shape and it is worse, measured: at four million entries 31.8 ns against 26.6 on all
+    // hits, at sixteen million 34.7 against 30.4. Not because of code generation -- both retire
+    // 224.5 instructions per lookup, identical to the tenth -- but because the ring takes 15% more
+    // cycles waiting. The gap is 15% on all hits and 6% at half hits, and a miss reads no value, so
+    // what it is losing is the *value* loads: the third pass issues sixteen of them back to back and
+    // nothing else here creates that parallelism, since the value is the one access not prefetched.
+    // A ring even has the better block prefetch -- a full depth of work for every element, where a
+    // chunk gives its last element less than its first -- and still loses.
+    //
+    // The second reason is that a ring has to be read before the slot it frees is refilled, and
+    // getting that backwards is a wrong answer rather than a crash.
+    //
+    // f is taken by value, as the standard algorithms take a callable, and is called with
+    // value_type& -- or value_type const& on a const map. Keys that are absent are not reported; the
+    // return value counts the ones that were found.
+    template <typename FwdIt, typename F>
+    auto visit(FwdIt first, FwdIt last, F f) -> std::size_t {
+        return do_visit(first, last, std::move(f));
+    }
+
+    template <typename FwdIt, typename F>
+    auto visit(FwdIt first, FwdIt last, F f) const -> std::size_t {
+        return const_cast<table*>(this)->do_visit( // NOLINT(cppcoreguidelines-pro-type-const-cast)
+            first,
+            last,
+            [&f](value_type const& v) -> void {
+                f(v);
+            });
     }
 
     auto find(Key const& key, precomputed_hash ph) -> iterator {
