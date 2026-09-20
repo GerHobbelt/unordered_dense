@@ -42,6 +42,78 @@ compiled -- turning a literal loop bound into a runtime value would be a change 
 benchmark even at the same value, and its absolute numbers are only comparable across time if its
 workloads do not move.
 
+## Every other map, on the same workloads
+
+    scripts/ab/maps.sh [-c COMPILER] [-s] [-r REV] <check|speed|memory|names> [u64|str|big] [base]
+    scripts/ab/maps_one.sh [-c COMPILER] [-k u64|str|big] <workload> <entries> <reps> [map...]
+
+`run.sh` compares this header against another revision of itself. `maps.sh` compares it against
+everything else: `boost::unordered_flat_map` and `unordered_node_map`, `absl::flat_hash_map` and
+`node_hash_map`, `folly::F14ValueMap`/`F14VectorMap`/`F14NodeMap`, `emhash8::HashMap`,
+`emilib::HashMap`, `indivi::flat_umap` and `flat_wmap`, Verstable, ihtab, `std::unordered_map`, and
+this header at `v4.11.0` -- eighteen maps for an integer key, sixteen for a string, all in one
+process with `compare()` interleaving them. `boost` and `absl` appear twice, once with this
+library's hash and once with their own, because the same-hash convention is the right way to
+compare *indexes* and is not what a caller gets by typing the type name; for a string key that
+control moves boost by 31% on a hit.
+
+Every map that is found on the machine is compiled in and one that is not is left out with a note.
+The include paths come from the environment (`ABSL_ROOT`, `FOLLY_ROOT`, `FOLLY_CONFIG`,
+`EMHASH_INCLUDE`, `INDIVI_INCLUDE`, `VERSTABLE_INCLUDE`, `IHTAB_INCLUDE`, `NANOBENCH_INCLUDE`) and
+are documented at the top of the script. F14 needs C++20, so the whole harness is built as C++20 --
+the harness's dialect, not the library's.
+
+`check` runs every adapter against this map operation for operation over 400000 mixed operations,
+and nothing it measures means anything until that is green; `-s` runs the same thing under ASan and
+UBSan, minus abseil, whose installed library half is not built with a sanitizer and whose headers
+turn on generation-counter debugging when one is present. `check` is what caught Verstable's
+`vt_insert` being `insert_or_assign` where the honest counterpart of `try_emplace` is
+`vt_get_or_insert`.
+
+`speed` sweeps three octaves (1000, 32000 and 500000 entries) at five sizes each and reports the
+geometric mean per workload, for the same reason `run.sh` does. `UDM_POINTS` changes the count --
+two dozen draws the sawtooth itself rather than averaging it out -- and `UDM_INTERVAL`,
+`UDM_EPOCHS` and `UDM_CSV` do what they say. `big` is the integer key again with a 64 byte mapped
+value, which is the axis that separates a flat map from a dense one and the one an eight byte value
+hides completely.
+
+`maps_one.sh` builds **one map per binary** and runs it under `perf stat`, because a binary holding
+several maps has a code layout that moves by more than a 3% question every time any of them
+changes. Anything under about 10% is decided there, with counters, and not by the paired harness.
+Its third argument is a count of operations and its default is 30000000; passing a small number
+measures the machine's noise floor rather than the map. `AB_CORE` pins the measured binary to one
+core, which the cycle columns want and the instruction counts do not need.
+
+Two of its workloads are the insert path taken apart, because that is where this map is furthest
+behind a flat one and nothing measured it on its own. `insert` builds a map that was told its size
+first, so growth and the rehash are out of it and what is left is a probe that misses, a value
+appended and a slot pointed at it; `bump` is `++m[k]` on a key that is already there, which places
+nothing and is the commonest map operation there is. Both count `reps` in operations, so every
+column is per insert and per bump, and both put their round in a `noinline` function so that
+`objdump -d` has a symbol -- which is the whole point of them, since the question is which
+instructions are in it.
+
+`scripts/ab/hash_others.sh` is the same idea for the *hash* rather than the index: this library's
+wyhash, its own older version, `boost::hash`, `absl::Hash` and `folly::hasher` over six key lengths
+and the scored suite's own mix, in one process, reporting **latency and throughput separately**
+because they order the candidates differently -- a map pays latency, since the hash's result is the
+address of the group to probe. The chain is built by writing a byte of each answer into the *next
+key*, not by choosing the next key with it: choosing puts the key's length and address on the chain,
+which a real lookup does not have, and a harness that did read a 1.40x for a change worth nothing.
+A row that hashes nothing (`size ^ first byte`) measures what the chain itself costs, ~1.5 ns, which
+is in every number and is not part of anybody's hash.
+
+Two smaller tools answer questions the harnesses cannot. `scripts/ab/probe_length.sh` patches a
+counter into a copy of the probe and reports **groups visited per lookup**, fresh and after churn,
+with an argument for how many writing lookups each churn round does -- which is the only path
+`move_home()` runs on, so 0 measures the drift and 4 measures what taking it back is worth. And
+`scripts/ab/placement.cpp` simulates bucketized placement against sliding-window placement with no
+map involved, which is how the ungrouped-window idea was priced without building it.
+
+`scripts/ab/mapsplot.py` draws the CSVs (`bars`, `memory`, `octave`) and prints them
+(`table`, `swing`); `scripts/ab/diagrams.py` draws the byte-level layout figures of every index in
+one house style. Both are stdlib only.
+
 ## Regenerating all of it
 
 `scripts/ab/regen.sh` is the whole pipeline: renamed baseline headers, three compiled tools, seven
@@ -94,6 +166,13 @@ allocator's version -- and a size prefix of one's own is not a way out, since it
 is trying to measure. And it stamps each change with `std::chrono::steady_clock` **as it happens**,
 so the x axis is elapsed time rather than a reconstruction, on a clock nothing can step underneath
 it.
+
+Two events are recorded that are not allocations, because without them the chart lies. One at the
+end of the fill: a line otherwise ends at the last *allocation*, so a map that finished resizing
+early and coasted to the end looks like it stopped there -- boost's line ended at 0.34 s when its
+fill ran to 0.41. And the teardown, so each line drops to zero where the map actually handed its
+memory back, which for a dense map is two steps and for `segmented_map` is a walk down through its
+segments.
 
 `doc/allocated_memory.png` and `doc/allocated_memory.gnuplot` are the only things under `doc/` that
 are committed, because that chart is the one the top-level README embeds. The CSVs behind it are not.

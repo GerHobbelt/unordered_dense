@@ -685,8 +685,9 @@ namespace bucket_type {
 // The index is groups of sixteen slots. A group holds one byte of fingerprint per slot, compared
 // sixteen at a time, and eight overflow counters that record how many entries with those low three
 // fingerprint bits had to probe past it. An erase decrements them, so nothing ever moves after it
-// is placed and no tombstone is left behind. The value indices sit in a second array beside the
-// groups: 24 + 64 bytes per sixteen slots, 5.5 bytes per slot. See "5. Design" in the README.
+// is placed and no tombstone is left behind. The value indices sit in the same block as the group
+// they belong to: 24 + 64 bytes per sixteen slots, 5.5 bytes per slot. See "5. Design" in the
+// README, and group_storage::block below for why one block rather than two arrays.
 //
 // The width of the value index is the one thing the two bucket types differ in: `group` indexes
 // up to 2^32 values at 24 + 64 bytes per sixteen slots, `group_big` up to 2^63 at 24 + 128.
@@ -2176,14 +2177,28 @@ private:
     // against an inlining threshold of 250 (vector::emplace_back with piecewise_construct is 225
     // of it) and so calls it out of line from do_try_emplace, which costs every insert a call, a
     // six register prologue and epilogue: 28 of the 128 instructions an insert took, measured
-    // net of the benchmark loop. Merged, an insert is 100 instructions and builds and churn are
-    // 6-7% faster -- and operator[] on a key that is already present pays 14 instructions more,
-    // because the merged function's register pressure is paid on the path that never places, so
-    // a workload that mixes hits and inserts loses 3.5%. 1.012 on the geomean, every interval
-    // excluding 100%. gcc had already inlined all of this on its own, so for gcc this is a no-op.
-    // Handing the probe's fingerprint to the callee, returning the index in a register, and moving
-    // increase_size() out of line were each measured and each changed nothing: the cost is the
-    // boundary itself.
+    // net of the benchmark loop. Handing the probe's fingerprint to the callee, returning the
+    // index in a register, and moving increase_size() out of line were each measured and each
+    // changed nothing: the cost is the boundary itself.
+    //
+    // Removed on 2026-09-08 and put back the same day, which is the part worth keeping. The
+    // removal rested on the scored suite built one header per binary, where it reads 1.7% faster
+    // under clang and 3.9% under gcc. That binary is ~90 translation units of test suite and its
+    // inlining budget is exhausted, so an always_inline there displaces something else; a caller's
+    // is not. Measured in a translation unit holding one map, which is what a caller has, building
+    // from empty, with the attribute against without -- 251633 ns against 287833 at 32000 entries,
+    // 1749840 against 2087600 at 200000, 13064800 against 15670600 at a million, so 14 to 20%
+    // slower without it at every size. The instruction counts are what settle it, because neither
+    // code layout nor drift can move them: 5.08M against 5.98M, 28.09M against 33.71M, 162.3M
+    // against 190.4M, i.e. 17 to 20% more work retired without the attribute. Two other harnesses
+    // agree (maps.cpp, eighteen maps in one unit: build 17% slower at 32000).
+    //
+    // So the rule this leaves is narrower than "one header per binary": the *size* of the
+    // translation unit decides what an always_inline is worth, a benchmark binary is the largest
+    // unit anyone compiles this into, and an instruction count is the only number in the argument
+    // that none of that moves. What the attribute costs is real and stays true -- operator[] on a
+    // key already present pays for the placement code's register pressure on a path that never
+    // places (clang 73.2 instructions against 48.4) -- it is simply smaller than 17% of a build.
     template <typename... Args>
     ANKERL_UNORDERED_DENSE_FORCEINLINE auto do_place_element(std::uint64_t mh, Args&&... args) -> std::pair<iterator, bool> {
         // emplace the new value. If that throws an exception, no harm done; index is still in a valid state
