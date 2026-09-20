@@ -65,6 +65,109 @@ meson test -C builddir/clang_release unit --verbose
 ./builddir/clang_release/test/udm-test
 ```
 
+## Mutation testing
+
+Coverage says a line ran. `scripts/mutate/mutate.py` says something would have noticed it
+misbehaving: it breaks the header, rebuilds, runs the suite and asks whether anything went red.
+What nothing notices is a hole in the tests. It never touches the working tree — every build
+happens in a throwaway copy of the repo.
+
+The everyday use is putting a *specific* bug back, which is the check that decides whether a new
+test earns its place. Bugs worth keeping live in `scripts/mutate/bugs/`:
+
+```sh
+scripts/mutate/mutate.py --replace OLD NEW               # one, must match exactly once
+scripts/mutate/mutate.py --bugs scripts/mutate/bugs/erase-path.txt
+scripts/mutate/mutate.py --reverse HEAD                  # undo a fix, keep today's tests
+```
+
+The other mode sweeps for holes nobody thought of, changing the header one place at a time. The two
+modes compose, and a change is best asked both questions at once:
+
+```sh
+scripts/mutate/mutate.py --diff                          # whatever is uncommitted
+scripts/mutate/mutate.py --diff HEAD~1                   # only what that change touched
+scripts/mutate/mutate.py --lines 1278-1290,1400 --dry-run
+scripts/mutate/mutate.py --bugs bugs.txt --lines 1278-1290 --reuse
+```
+
+`--diff` is the everyday mode and measures from the merge base, so a branch that has not caught up
+with main does not sweep what main moved on without it.
+
+`--operators` picks what to change. The default is all of them, so a plain run asks every question
+this knows how to ask — which is what you want from `--diff`, where the cost is proportional to the
+lines you touched. Over the whole header that default is ~1600 mutants and something like an hour
+and a half, so a full sweep is usually worth naming one operator instead. That is the reason they
+are named at all.
+
+Swept over the whole header at 4.9.1, they are not equally worth your time. Re-measure before
+relying on these: they describe one header at one commit, and the kill rates move every time a
+test is added.
+
+| operator | mutants | time | killed | by a test | survivors to triage |
+|---|---|---|---|---|---|
+| `tokens` | 841 | ~47 min | not re-measured | | |
+| `bitwise` | 76 | 4 min | **99%** | 87% | **1** |
+| `deletions` | 665 | 14 min | 94% | 30% | 37 |
+
+`bitwise` mutates `^` and `|`, which the token table leaves alone (`&` is three operators sharing a
+spelling — bitwise and, address-of, and the reference declarator — and only a parser can tell them
+apart). Few sites and a header made of masks and fingerprints is what makes it cheap and sharp. The
+mechanism worth remembering rather than the number: a *surviving* bitwise mutant usually means the
+two operands are provably disjoint, which is how the one survivor reads — `dist_inc | (hash &
+fingerprint_mask)` turned into `^` is the same function, exactly as the
+`static_assert(fingerprint_mask < dist_inc)` right above it guarantees.
+
+`deletions` removes whole statements. Nearly every bug in `bugs/invariants.txt` is a form of "the
+code forgot to do this", and none of those is one token. It costs *less* than the token sweep, since
+half of them are rejected by the `-fsyntax-only` pre-filter rather than costing a rebuild.
+
+Reordering is the operator that is *not* here — it was written, measured and removed, so there is
+nothing in the tree to go and look at. Swapping two adjacent statements killed 45% of what it
+generated and left a hundred survivors, essentially all of them two statements that never touched
+the same state — member-copy chains, the run of `HASH_STATICCAST`
+macros, blocks of declarations. Triaging every one of them produced no test worth writing. Reaching
+the orderings in `bugs/invariants.txt` needs to move a statement *out of its enclosing block*, which
+adjacent-swapping cannot do, so that operator is worth building only alongside something that can.
+
+Mutants that could not have an effect are not generated: comments, string literals and preprocessor
+lines are not code, and `std::enable_if_t<..., bool> = true>` is the SFINAE idiom whose value is
+never read. A mutant in a branch this configuration does not compile is dropped once the lanes
+exist, and the run says which lines those were.
+
+A mutant costs one full rebuild of the test binary — all ~90 translation units include the header,
+so there is no incremental mutant build and ccache cannot help either. That is ~100 CPU-seconds of
+compiling against 3 of running the suite, which is why the lanes default to one ninja job each and
+a single named bug instead gets the whole machine. Budget roughly a minute for a handful of
+mutants and an hour for a sweep of a whole function.
+
+Verdicts are `caught` (a test failed — the number worth moving), `compiler` (the build refused it),
+`hang`, `oom` and `survived`. Without a sanitizer, a mutant that reads one slot past a bucket comes
+back `survived` however good the tests are, so re-run anything surprising with
+`--meson-arg=-Db_sanitize=address,undefined` before believing it.
+
+Each lane runs inside a cgroup with a memory cap (`systemd-run --user --scope`), because a mutated
+growth policy turns an insert into a request for more memory than the machine has. Capped, that is
+one `oom` verdict; uncapped, the kernel picks the victim and it is as likely to be another lane as
+the mutant that caused it. `--memory-limit` overrides the default, which is the smaller of a lane's
+share of the machine and 1 GiB per ninja job; a build is never capped below what its jobs need. On
+a machine with no user scope to be had — another init, no session bus, an undelegated container —
+the run says so up front rather than pretending.
+
+The lanes are the other half of the same problem: ~90 MB each in a workdir defaulting to `/tmp`,
+which is a tmpfs on most current distributions, so `--lanes` buys memory as much as parallelism.
+The run prints how much room it is about to take and whether that room is RAM, and refuses before
+copying rather than part way through. Core dumps are disabled for the same reason — a crashing
+mutant is an ordinary verdict, and each one would leave ~30 MB in a lane about to be deleted.
+
+Lanes are configured `--unity=on`, which is 2.5x less compiling for the same work — measured, one
+mutant rebuild of the whole suite: 67 CPU-seconds separately, 27 merged. The usual objection to
+unity builds (touching one file recompiles its whole chunk) cannot apply to a mutant, which
+recompiles every file anyway. `--meson-arg=--unity=off` turns it off.
+
+`scripts/test_mutate.py` covers the half of the tool that decides what a verdict *means*, and runs
+in CI. It is hermetic: no compiler, no meson, no lanes, no cgroups.
+
 ## Fuzzing
 
 The `fuzz` test suite replays the committed corpora in `data/fuzz/<target>` on every test run, which
@@ -156,6 +259,13 @@ meson test -C builddir --print-errorlogs
 `--force-fallback-for=fmt` is what makes every runner build against the vendored fmt instead of
 whatever the machine happens to have installed.
 
+One leg builds `--unity=on`. It is off by default because merging translation units is bad for
+development — touching one file recompiles its whole chunk — but it catches a class of problem
+separate compilation hides, and an anonymous namespace stops isolating a file once its neighbours
+share the chunk. Everything it caught the first time had been there and invisible: `test/app/print.h`
+had no include guard, and four `test/bench/*.cpp` each defined a `bench()` that only became
+ambiguous when two landed in the same chunk.
+
 Linters (`scripts/lint/lint-*.py`, all of them via `scripts/lint/all.py`) run in the `lint` job.
 Two of them pin their tool, because both tools gain checks or change their output between
 releases: `clang-tidy-18` and `clang-format` 21 (`pip install clang-format==21.1.8`).
@@ -164,4 +274,4 @@ with a different clang-format says so instead of reporting the tree as broken.
 
 ## Notes for sandboxed / offline environments
 
-If meson cannot download the wrap subprojects (e.g. GitHub release tarballs blocked), fetch the doctest and fmt sources manually into `subprojects/doctest-2.4.12/` and `subprojects/fmt-11.2.0/` (matching the `directory` field of the `.wrap` files) with a minimal `meson.build` in each that declares `doctest_dep` (header-only, include dir `doctest/`) and `fmt_dep` (include dir `include/`, sources `src/format.cc`, `src/os.cc`) and calls `meson.override_dependency()`. Meson skips the download when the subproject directory already exists. These directories are gitignored — do not commit them.
+If meson cannot download the wrap subprojects (e.g. GitHub release tarballs blocked), fetch the doctest and fmt sources manually into `subprojects/doctest-2.5.3/` and `subprojects/fmt-12.0.0/` (matching the `directory` field of the `.wrap` files, which is what these version numbers have to keep agreeing with) with a minimal `meson.build` in each that declares `doctest_dep` (header-only, include dir `doctest/`) and `fmt_dep` (include dir `include/`, sources `src/format.cc`, `src/os.cc`) and calls `meson.override_dependency()`. Meson skips the download when the subproject directory already exists. These directories are gitignored — do not commit them.

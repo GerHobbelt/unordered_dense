@@ -10,6 +10,7 @@ test_sources = [
     'bench/copy.cpp',
     'bench/find_random.cpp',
     'bench/game_of_life.cpp',
+    'bench/precomputed_hash.cpp',
     'bench/quick_overall_map.cpp',
     'bench/replace_key.cpp',
     'bench/show_allocations.cpp',
@@ -20,8 +21,11 @@ test_sources = [
     'unit/array_of_maps.cpp',
     'unit/assign_to_move.cpp',
     'unit/assignment_combinations.cpp',
+    'unit/assignment_exception_safety.cpp',
     'unit/at.cpp',
+    'unit/avalanching.cpp',
     'unit/bucket.cpp',
+    'unit/carried_state.cpp',
     'unit/contains.cpp',
     'unit/copy_and_assign_maps.cpp',
     'unit/copyassignment.cpp',
@@ -44,18 +48,21 @@ test_sources = [
     'unit/fuzz_insert_erase.cpp',
     'unit/fuzz_replace_map.cpp',
     'unit/fuzz_string.cpp',
-    'unit/hash_char_types.cpp',
+    'unit/growth_exception_safety.cpp',
+    'unit/hash_scalar_types.cpp',
     'unit/hash_smart_ptr.cpp',
     'unit/hash_string_view.cpp',
     'unit/hash.cpp',
+    'unit/hash_golden.cpp',
     'unit/include_only.cpp',
     'unit/initializer_list.cpp',
     'unit/insert_or_assign.cpp',
     'unit/insert.cpp',
-    'unit/lazy_bucket_allocation.cpp',
+    'unit/iterators_conversion.cpp',
     'unit/iterators_empty.cpp',
     'unit/iterators_erase.cpp',
     'unit/iterators_insert.cpp',
+    'unit/lazy_bucket_allocation.cpp',
     'unit/load_factor.cpp',
     'unit/maps_of_maps.cpp',
     'unit/max.cpp',
@@ -66,6 +73,7 @@ test_sources = [
     'unit/not_copyable.cpp',
     'unit/not_moveable.cpp',
     'unit/pmr_move_with_allocators.cpp',
+    'unit/precomputed_hash.cpp',
     'unit/pmr.cpp',
     'unit/reentrant.cpp',
     'unit/rehash.cpp',
@@ -109,13 +117,32 @@ foreach arg : [
             '-Wold-style-cast',
             '-Wno-unused-function',
             # '-Weffc++', doesn't work with fmt
-            
+
+            # clang 22 only, and only meaningful together with the DOCTEST_COUNTER define
+            # below -- see the comment there for why one without the other does not work.
+            '-Wno-c2y-extensions',
+
             # '-march=native',
         ]
     if compiler.has_argument(arg)
         cpp_args += [arg]
     endif
 endforeach
+
+# doctest names the function behind every TEST_CASE after a counter, and from 2.5.3 that counter
+# is __LINE__ rather than __COUNTER__ on clang 22+, because C2y standardises __COUNTER__ and clang
+# started warning about it as an extension. __LINE__ is only unique within one file, so two test
+# cases that happen to sit on the same line collide as soon as a unity build puts their files in
+# one translation unit -- which unit/insert.cpp and unit/insert_or_assign.cpp did, both opening
+# with TEST_CASE_MAP on line 9. That is not a hypothetical: the unity CI leg builds this way, and
+# so does every lane of scripts/mutate/mutate.py, where the failure would look like every mutant
+# being rejected by the compiler.
+#
+# DOCTEST_COUNTER is doctest's own customisation point (it only picks a default `#if !defined`),
+# so this takes __COUNTER__ back and the -Wno-c2y-extensions above silences what doctest was
+# avoiding. Both are needed: the flag alone leaves doctest choosing __LINE__, and the define alone
+# reintroduces the warning as an error. Neither has any effect on compilers that do not warn.
+cpp_args += ['-DDOCTEST_COUNTER=__COUNTER__']
 
 if compiler.get_id() == 'msvc'
     add_global_arguments(
@@ -130,7 +157,7 @@ endif
 
 fmt_method = 'auto'
 if get_option('cpp_args').contains('-m32')
-    # use builtin so we can compile it for 32bit. 
+    # use builtin so we can compile it for 32bit.
     # Can't use it as a default or sanitizer doesn't work...
     fmt_method = 'builtin'
 endif
@@ -152,6 +179,23 @@ endif
 #else
 #    add_global_arguments('-DANKERL_UNORDERED_DENSE_HAS_ABSL=0', language: 'cpp')
 #endif
+
+# One definition of the fmt dependency, because the fuzz targets need the same one and the two
+# used to be able to drift apart. It has to come after the add_global_arguments calls above:
+# resolving it declares the fmt subproject's target, and meson refuses a global argument once any
+# target exists.
+#
+# warning_level and werror are this project's, and a subproject inherits them unless it is told
+# otherwise -- so `werror=true` was being applied to fmt's own sources, and any warning a new fmt
+# release happens to emit becomes this project's build failure. fmt 11.2.0 was clean under MSVC's
+# /W4 /WX and 12.0.0 is not (format.h:2509, and only when targeting 32 bit), which is a fact about
+# fmt rather than about anything here. Same reasoning as the system include for doctest above:
+# -Werror is for code this project wrote. The commented-out absl line above already carried this.
+fmt_dependency = dependency(
+    'fmt',
+    method: fmt_method,
+    fallback: ['fmt', 'fmt_dep'],
+    default_options: ['warning_level=0', 'werror=false'])
 
 cpp_args += [
     #'-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION',
@@ -179,13 +223,12 @@ test_exe = executable(
 
         # see what's in the [provide] sections for the dependency names
         # As a system include, so that -Werror applies to this project's code and not to
-        # doctest's. Its DOCTEST_ANONYMOUS uses __COUNTER__, which C2y standardises and clang 22
-        # therefore warns about under -Wc2y-extensions, and the diagnostic is reported against
-        # whichever test file used INFO() or REQUIRE(). Warnings in code this project actually
-        # wrote are unaffected, including expressions handed to those macros: clang suppresses
-        # what a system macro expands to, not what is passed into it.
+        # doctest's. Note that this does not cover everything a header ships: a diagnostic about
+        # what a macro expands to is reported against the line that *used* the macro, so it
+        # counts as this project's code however the header was included. -Wc2y-extensions was
+        # exactly that case, and is handled where cpp_args is built instead.
         dependency('doctest', include_type: 'system'),
-        dependency('fmt', method: fmt_method, fallback: ['fmt', 'fmt_dep']),
+        fmt_dependency,
 
         # disable these two if you don't want them
         #dependency('boost'),
@@ -264,7 +307,7 @@ if compiler.get_id() == 'clang'
             dependencies: [
                 dependency('threads'),
                 dependency('doctest', include_type: 'system'), # see above
-                dependency('fmt', method: fmt_method, fallback: ['fmt', 'fmt_dep']),
+                fmt_dependency,
             ],
             build_by_default: false)
     endforeach
