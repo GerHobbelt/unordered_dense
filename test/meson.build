@@ -13,7 +13,6 @@ test_sources = [
     'bench/precomputed_hash.cpp',
     'bench/quick_overall_map.cpp',
     'bench/replace_key.cpp',
-    'bench/show_allocations.cpp',
     'bench/swap.cpp',
 
     'fuzz/run.cpp',
@@ -40,8 +39,10 @@ test_sources = [
     'unit/equal_range.cpp',
     'unit/erase_if.cpp',
     'unit/erase_churn.cpp',
+    'unit/move_home.cpp',
     'unit/erase_range.cpp',
     'unit/erase_throwing_move.cpp',
+    'unit/erase_uncounts.cpp',
     'unit/erase.cpp',
     'unit/explicit.cpp',
     'unit/extract.cpp',

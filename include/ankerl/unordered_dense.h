@@ -234,9 +234,10 @@ namespace detail {
 
 // hash ///////////////////////////////////////////////////////////////////////
 
-// This is a stripped-down implementation of wyhash: https://github.com/wangyi-fudan/wyhash
-// No big-endian support (because different values on different machines don't matter),
-// hardcodes seed and the secret, reformats the code, and clang-tidy fixes.
+// Descended from wyhash: https://github.com/wangyi-fudan/wyhash -- its reads, its multiply-and-xor
+// mix, its short path and its chained lanes for long keys -- with the middle lengths restructured
+// into independent blocks, which the comment on hash() explains. No big-endian support (because
+// different values on different machines don't matter), hardcodes seed and the secret.
 namespace detail::wyhash {
 
 inline void mum(std::uint64_t* a, std::uint64_t* b) {
@@ -292,14 +293,38 @@ inline void mum(std::uint64_t* a, std::uint64_t* b) {
     return (static_cast<std::uint64_t>(p[0]) << 16U) | (static_cast<std::uint64_t>(p[k >> 1U]) << 8U) | p[k - 1];
 }
 
+// The shape of this is wyhash's up to 16 bytes and for anything past 144, and in between it is
+// not: every 16 byte block is mixed on its own, with its own pair of secrets, and the results are
+// xor-folded into one finalizer. wyhash chains the blocks through `seed`, so a 48 byte key is
+// three multiplies one after another and then the finalizer, and a map lookup waits for all of
+// them before it can so much as form the group address. Here the block multiplies are independent,
+// so the latency of any key up to 144 bytes is one multiply plus the finalizer, and the block
+// loop's trip count -- a data-dependent branch that mispredicts whenever lengths vary -- is a
+// short chain of compares that the predictor learns from the top. The last sixteen bytes are
+// always a block of their own, wherever they fall, so every byte is read at least once and nothing
+// is read past the end.
+//
+// Measured on the scored benchmark's own keys (8 to 135 bytes, skewed short), one function per
+// binary, ns per hash: throughput 2.52 to 2.00 under clang and 2.18 to 2.05 under gcc, latency
+// 8.64 to 7.69 and 8.47 to 7.81, with fewer branch misses on both. Two shapes measured and
+// rejected on the way: making the block range branchless by always mixing three (17-48) or six
+// (49-96) overlapping blocks, which costs more in redundant multiplies than it saves in
+// mispredictions; and a one multiply short path, which fails an avalanche test outright at 8 bytes
+// (output bits that never flip for some input bits), as does dropping the finalizer in the block
+// range. Both multiplies stay.
+//
+// Independent blocks need distinct secrets: with a shared one, swapping two blocks gives the same
+// hash. Sixteen pairs cover 144 bytes, and past that the chained lanes take over, where reuse is
+// harmless because the chain carries the position. The secrets have wyhash's property, every
+// byte with four bits set, odd, and were drawn once from a fixed seed.
 [[maybe_unused]] [[nodiscard]] inline auto hash(void const* key, std::size_t len) -> std::uint64_t {
-    static constexpr auto secret = std::array{UINT64_C(0xa0761d6478bd642f),
-                                              UINT64_C(0xe7037ed1a0b428db),
-                                              UINT64_C(0x8ebc6af09c88c6e3),
-                                              UINT64_C(0x589965cc75374cc3),
-                                              UINT64_C(0x2d358dccaa6c78a5),
-                                              UINT64_C(0x8bb84b93962eacc9),
-                                              UINT64_C(0x4b33a62ed433d4a3)};
+    static constexpr auto secret = std::array{
+        UINT64_C(0xa0761d6478bd642f), UINT64_C(0xe7037ed1a0b428db), UINT64_C(0x8ebc6af09c88c6e3), UINT64_C(0x589965cc75374cc3),
+        UINT64_C(0x2d358dccaa6c78a5), UINT64_C(0x8bb84b93962eacc9), UINT64_C(0x4b33a62ed433d4a3), UINT64_C(0xa693c93927d87217),
+        UINT64_C(0x2b63728e53473c2b), UINT64_C(0x696cb2a95635a3c5), UINT64_C(0xa9ccd81ed1b29359), UINT64_C(0x5c2d66ace48db84d),
+        UINT64_C(0x69a99c5c53b4ca2d), UINT64_C(0x9a9c5a1b27d10f69), UINT64_C(0x2b27f02dc3d4360f), UINT64_C(0x2b39665c8d2d5553),
+        UINT64_C(0x966cd8878bb4b187), UINT64_C(0xc6351e99932b1ee1), UINT64_C(0xd1c5d24d63c959c9), UINT64_C(0x56c54d9c955aca2b),
+        UINT64_C(0xd136d27872563559)};
 
     auto const* p = static_cast<std::uint8_t const*>(key);
     std::uint64_t seed = secret[0];
@@ -333,64 +358,82 @@ inline void mum(std::uint64_t* a, std::uint64_t* b) {
             return mix(secret[1] ^ len, mix(a ^ secret[1], b ^ seed));
         }
 
-    // Anything longer, in blocks of 16 bytes, ending on the same expression as above.
+    if (ANKERL_UNORDERED_DENSE_LIKELY(len <= 144))
+        ANKERL_UNORDERED_DENSE_LIKELY_ATTR {
+            // The first block and the last sixteen bytes, then whole blocks from the front for as
+            // long as there are any: a key of 17 to 32 bytes is two multiplies, one of 129 to 144
+            // is nine, all of them independent.
+            auto x =
+                mix(r8(p) ^ secret[1], r8(p + 8) ^ secret[2]) ^ mix(r8(p + len - 16) ^ secret[3], r8(p + len - 8) ^ secret[4]);
+            if (len > 32) {
+                x ^= mix(r8(p + 16) ^ secret[5], r8(p + 24) ^ secret[6]);
+                if (len > 48) {
+                    x ^= mix(r8(p + 32) ^ secret[7], r8(p + 40) ^ secret[8]);
+                    if (len > 64) {
+                        x ^= mix(r8(p + 48) ^ secret[9], r8(p + 56) ^ secret[10]);
+                        if (len > 80) {
+                            x ^= mix(r8(p + 64) ^ secret[11], r8(p + 72) ^ secret[12]);
+                            if (len > 96) {
+                                x ^= mix(r8(p + 80) ^ secret[13], r8(p + 88) ^ secret[14]);
+                                if (len > 112) {
+                                    x ^= mix(r8(p + 96) ^ secret[15], r8(p + 104) ^ secret[16]);
+                                    if (len > 128) {
+                                        x ^= mix(r8(p + 112) ^ secret[17], r8(p + 120) ^ secret[18]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return mix(secret[1] ^ len, x);
+        }
+
+    // Anything longer, in chained lanes of 16 bytes, ending on the same expression as above.
     std::size_t i = len;
-    if (ANKERL_UNORDERED_DENSE_UNLIKELY(i > 48))
-        ANKERL_UNORDERED_DENSE_UNLIKELY_ATTR {
-            std::uint64_t see1 = seed;
-            std::uint64_t see2 = seed;
-            // Six lanes cost three more accumulators to set up and fold back in, so the block
-            // has to run more than once to pay for them. Entering it at 96 meant exactly one
-            // iteration for everything from 97 to 192 bytes, which never can: measured, 23.4
-            // cycles for a 100 byte key against 21.8 when it takes the 48 byte loop instead, and
-            // 29.3 against 28.2 at 150. Above 192 the block runs at least twice and wins again --
-            // 143.5 cycles against 147.1 at 1000 bytes -- so it keeps those.
-            if (i > 192) {
-                // 6 independent lanes: twice the instruction level parallelism of the 48 byte loop below
-                std::uint64_t see3 = seed;
-                std::uint64_t see4 = seed;
-                std::uint64_t see5 = seed;
-                do {
-                    seed = mix(r8(p) ^ secret[1], r8(p + 8) ^ seed);
-                    see1 = mix(r8(p + 16) ^ secret[2], r8(p + 24) ^ see1);
-                    see2 = mix(r8(p + 32) ^ secret[3], r8(p + 40) ^ see2);
-                    see3 = mix(r8(p + 48) ^ secret[4], r8(p + 56) ^ see3);
-                    see4 = mix(r8(p + 64) ^ secret[5], r8(p + 72) ^ see4);
-                    see5 = mix(r8(p + 80) ^ secret[6], r8(p + 88) ^ see5);
-                    p += 96;
-                    i -= 96;
-                } while (ANKERL_UNORDERED_DENSE_LIKELY(i > 96));
-                seed ^= see3 ^ see4 ^ see5;
-            }
-            while (i > 48) {
-                seed = mix(r8(p) ^ secret[1], r8(p + 8) ^ seed);
-                see1 = mix(r8(p + 16) ^ secret[2], r8(p + 24) ^ see1);
-                see2 = mix(r8(p + 32) ^ secret[3], r8(p + 40) ^ see2);
-                p += 48;
-                i -= 48;
-            }
-            seed ^= see1 ^ see2;
-            while (i > 16) {
-                seed = mix(r8(p) ^ secret[1], r8(p + 8) ^ seed);
-                i -= 16;
-                p += 16;
-            }
-
-            // the tail lane only depends on the input, not on seed, so it can execute in parallel
-            // with the lane loops above, and a single dependent mix finishes the hash
-            auto tail = mix(r8(p + i - 16) ^ secret[2], r8(p + i - 8) ^ secret[3]);
-            return mix(secret[1] ^ len, seed ^ tail);
-        }
-    while (ANKERL_UNORDERED_DENSE_UNLIKELY(i > 16))
-        ANKERL_UNORDERED_DENSE_UNLIKELY_ATTR {
+    std::uint64_t see1 = seed;
+    std::uint64_t see2 = seed;
+    // Six lanes cost three more accumulators to set up and fold back in, so the block has to
+    // run more than once to pay for them. Entering it at 96 meant exactly one iteration for
+    // everything from 97 to 192 bytes, which never can: measured, 23.4 cycles for a 100 byte key
+    // against 21.8 when it takes the 48 byte loop instead, and 29.3 against 28.2 at 150. Above
+    // 192 the block runs at least twice and wins again -- 143.5 cycles against 147.1 at 1000
+    // bytes -- so it keeps those.
+    if (i > 192) {
+        // 6 independent lanes: twice the instruction level parallelism of the 48 byte loop below
+        std::uint64_t see3 = seed;
+        std::uint64_t see4 = seed;
+        std::uint64_t see5 = seed;
+        do {
             seed = mix(r8(p) ^ secret[1], r8(p + 8) ^ seed);
-            i -= 16;
-            p += 16;
-        }
-    a = r8(p + i - 16);
-    b = r8(p + i - 8);
+            see1 = mix(r8(p + 16) ^ secret[2], r8(p + 24) ^ see1);
+            see2 = mix(r8(p + 32) ^ secret[3], r8(p + 40) ^ see2);
+            see3 = mix(r8(p + 48) ^ secret[4], r8(p + 56) ^ see3);
+            see4 = mix(r8(p + 64) ^ secret[5], r8(p + 72) ^ see4);
+            see5 = mix(r8(p + 80) ^ secret[6], r8(p + 88) ^ see5);
+            p += 96;
+            i -= 96;
+        } while (ANKERL_UNORDERED_DENSE_LIKELY(i > 96));
+        seed ^= see3 ^ see4 ^ see5;
+    }
+    while (i > 48) {
+        seed = mix(r8(p) ^ secret[1], r8(p + 8) ^ seed);
+        see1 = mix(r8(p + 16) ^ secret[2], r8(p + 24) ^ see1);
+        see2 = mix(r8(p + 32) ^ secret[3], r8(p + 40) ^ see2);
+        p += 48;
+        i -= 48;
+    }
+    seed ^= see1 ^ see2;
+    while (i > 16) {
+        seed = mix(r8(p) ^ secret[1], r8(p + 8) ^ seed);
+        i -= 16;
+        p += 16;
+    }
 
-    return mix(secret[1] ^ len, mix(a ^ secret[1], b ^ seed));
+    // the tail lane only depends on the input, not on seed, so it can execute in parallel
+    // with the lane loops above, and a single dependent mix finishes the hash
+    auto tail = mix(r8(p + i - 16) ^ secret[2], r8(p + i - 8) ^ secret[3]);
+    return mix(secret[1] ^ len, seed ^ tail);
 }
 
 [[nodiscard]] inline auto hash(std::uint64_t x) -> std::uint64_t {
@@ -1222,37 +1265,50 @@ public:
 
 namespace detail {
 
-// What holds the index: the groups, and beside them the value index of every slot. Two arrays
-// rather than one struct because the groups are what a probe reads -- a miss touches nothing else,
-// and a rehash writes them at random -- and 24 bytes per sixteen slots keeps far more of them in
-// cache than 88 would. Measured, the split is 10% faster on a build for the same lookups.
+// What holds the index: one array of blocks, each a group's metadata followed by that group's own
+// sixteen value indices. 88 bytes per sixteen slots, and no padding -- the same bytes the two arrays
+// took, in one allocation instead of two.
 //
-// Alloc is the table's value allocator; both arrays rebind it.
+// This was two arrays until 2026-09-06, on the argument that the groups are what a probe reads -- a
+// miss touches nothing else, and a rehash writes them at random -- so 24 bytes per sixteen slots
+// keeps far more of them in cache than 88 would, measured then as 10% faster on a build. Re-measured
+// against the merged form after the rehash's store-to-load fix, that build advantage is gone
+// (build64 100.0% and 101.2% in two runs) and the merged form wins the lookups: `find64` 5.8-8.1%,
+// `rhit64` 7.1-7.5%, `findbig` 6.2%, score 1.018 and 1.022. Three counters say why, at 200000,
+// 800000 and 4M entries: **7% fewer instructions**, because the index is now at a fixed offset from
+// the group rather than a second address to compute; 12-14% fewer L1 misses; and 28% fewer dTLB
+// misses at 4M, because a lookup touches two regions rather than three. The gain is largest where
+// the table is largest, which is the half of the size axis the scored benchmark cannot see.
+//
+// Alloc is the table's value allocator; the block array rebinds it.
 template <typename Group, typename Alloc>
 class group_storage {
-public:
-    using value_idx_type = typename Group::value_idx_type;
-    using allocator_type = typename std::allocator_traits<Alloc>::template rebind_alloc<Group>;
-
-    // How many arrays this allocates, for a test that counts what an empty table costs.
-    static constexpr std::size_t array_count = 2;
-
-private:
-    using index_allocator_type = typename std::allocator_traits<Alloc>::template rebind_alloc<value_idx_type>;
     static constexpr std::size_t slots = std::tuple_size_v<decltype(Group::m_fingerprints)>;
 
-    std::vector<Group, allocator_type> m_groups{};
-    std::vector<value_idx_type, index_allocator_type> m_index{}; // slots * m_groups.size()
+public:
+    using value_idx_type = typename Group::value_idx_type;
+
+    // Inherits so that every use of a group's fingerprints and counters reads unchanged, and so a
+    // block converts to the Group const& that match_fingerprint takes.
+    struct block : Group {
+        std::array<value_idx_type, slots> m_index;
+    };
+
+    using allocator_type = typename std::allocator_traits<Alloc>::template rebind_alloc<block>;
+
+    // How many arrays this allocates, for a test that counts what an empty table costs.
+    static constexpr std::size_t array_count = 1;
+
+private:
+    std::vector<block, allocator_type> m_blocks{};
 
 public:
     group_storage() = default;
     explicit group_storage(allocator_type const& alloc)
-        : m_groups(alloc)
-        , m_index(index_allocator_type(alloc)) {}
+        : m_blocks(alloc) {}
     // NOLINTNEXTLINE(cppcoreguidelines-rvalue-reference-param-not-moved) -- moved from member by member
     group_storage(group_storage&& other, allocator_type const& alloc)
-        : m_groups(std::move(other.m_groups), alloc)
-        , m_index(std::move(other.m_index), index_allocator_type(alloc)) {}
+        : m_blocks(std::move(other.m_blocks), alloc) {}
     group_storage(group_storage const&) = default;
     group_storage(group_storage&&) noexcept = default;
     auto operator=(group_storage const&) -> group_storage& = default;
@@ -1260,45 +1316,46 @@ public:
     ~group_storage() = default;
 
     [[nodiscard]] auto get_allocator() const -> allocator_type {
-        return m_groups.get_allocator();
+        return m_blocks.get_allocator();
     }
     [[nodiscard]] auto empty() const -> bool {
-        return m_groups.empty();
+        return m_blocks.empty();
     }
     [[nodiscard]] auto size() const -> std::size_t { // in groups
-        return m_groups.size();
+        return m_blocks.size();
     }
     void clear() {
-        m_groups.clear();
-        m_index.clear();
+        m_blocks.clear();
     }
     void shrink_to_fit() {
-        m_groups.shrink_to_fit();
-        m_index.shrink_to_fit();
+        m_blocks.shrink_to_fit();
     }
     void swap(group_storage& other) noexcept {
-        m_groups.swap(other.m_groups);
-        m_index.swap(other.m_index);
+        m_blocks.swap(other.m_blocks);
     }
     void resize(std::size_t num_groups) {
-        m_groups.resize(num_groups);
-        m_index.resize(num_groups * slots);
+        m_blocks.resize(num_groups);
     }
     void assign(group_storage const& other) {
-        m_groups.assign(other.m_groups.begin(), other.m_groups.end());
-        m_index.assign(other.m_index.begin(), other.m_index.end());
+        m_blocks.assign(other.m_blocks.begin(), other.m_blocks.end());
     }
-    [[nodiscard]] auto data() -> Group* {
-        return m_groups.data();
+    [[nodiscard]] auto data() -> block* {
+        return m_blocks.data();
     }
-    [[nodiscard]] auto data() const -> Group const* {
-        return m_groups.data();
+    [[nodiscard]] auto data() const -> block const* {
+        return m_blocks.data();
     }
-    [[nodiscard]] auto index() -> value_idx_type* {
-        return m_index.data();
+    // The few places that hold a flat slot number rather than a group and a lane. slots is a power
+    // of two, so this is a shift and a mask.
+    [[nodiscard]] auto index_at(std::size_t slot) -> value_idx_type& {
+        return m_blocks[slot / slots].m_index[slot % slots];
     }
-    [[nodiscard]] auto index() const -> value_idx_type const* {
-        return m_index.data();
+    // Zeroes the metadata of every block and leaves the indices alone, which is what the split
+    // version's single memset did: an empty slot's index is never read.
+    void clear_metadata() {
+        for (auto& b : m_blocks) {
+            static_cast<Group&>(b) = Group{};
+        }
     }
 };
 
@@ -1417,18 +1474,18 @@ private:
     // index of every slot, quadratic probing over groups, and eight overflow counters per group
     // that an insert increments in every full group it passes and an erase decrements again. A
     // probe stops at the first group whose counter for this hash is zero, since no entry with
-    // those bits ever went past it. Nothing moves after it is placed and there are no tombstones,
-    // so no rehash is ever needed to repair the index -- an erase undoes exactly what its insert
-    // did to the counters.
+    // those bits ever went past it. There are no tombstones, so no rehash is ever needed to
+    // repair the index -- an erase undoes exactly what its insert did to the counters.
     //
     // What an erase cannot undo is where the element went. One that arrived while its home group
     // was full sits in a later group and stays there even after the home group empties again, so a
     // table that has churned probes a little further than one built from the same contents: at
     // load 0.76, measured, 1.14 groups per hit against 1.03 and 1.27 per miss against 1.05. It
     // plateaus after about a dozen turnovers rather than growing, which is the difference from a
-    // design that leaves tombstones behind. `rehash(size())` rebuilds the index and takes the
-    // difference back; nothing else does, since an erase cannot know where the element it frees
-    // would have gone had the table been built from what is left.
+    // design that leaves tombstones behind. An erase cannot know where the element it frees would
+    // have gone had the table been built from what is left; what does take the drift back is the
+    // element itself, the next time a writing operation finds it: see move_home below.
+    // `rehash(size())` rebuilds the index and takes all of it back at once.
     //
     // A miss usually stops within a group or two, at the first counter that is zero: the counters
     // are exact, so zero means no live entry of this class ever overflowed past that group.
@@ -1538,13 +1595,26 @@ private:
     // The value indices of a group are the next thing a hit reads, and their address needs only
     // the group, so they are asked for before the fingerprints have arrived: the two latencies
     // overlap instead of adding. Measured 3 cycles off every hit, 0.2 onto every miss.
-    static void prefetch_index(value_idx_type const* index, value_idx_type group_idx) {
-        auto const* p = index + std::size_t{group_idx} * slots_per_group;
+    // MERGED VARIANT: the indices sit inside the block, so what has to be pulled in is the rest of
+    // the block rather than a second array. One block is 88 bytes and unaligned, so it covers two or
+    // three lines; the first is the one the fingerprints are already being read from.
+    template <typename Block>
+    static void prefetch_index(Block const* blocks, value_idx_type group_idx) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- byte arithmetic on the block
+        auto const* p = reinterpret_cast<char const*>(blocks + std::size_t{group_idx});
+        ANKERL_UNORDERED_DENSE_PREFETCH(p + 64);
+        ANKERL_UNORDERED_DENSE_PREFETCH(p + sizeof(Block) - 1);
+    }
+
+    // Every line of a block, for a caller that has not touched the group at all. prefetch_index
+    // skips the first line because the probe is about to read it anyway; a rehash is about to
+    // write a group it has never read, so it wants that line too.
+    template <typename Block>
+    static void prefetch_block(Block const* blocks, std::size_t group_idx) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- byte arithmetic on the block
+        auto const* p = reinterpret_cast<char const*>(blocks + group_idx);
         ANKERL_UNORDERED_DENSE_PREFETCH(p);
-        ANKERL_UNORDERED_DENSE_PREFETCH(p + slots_per_group - 1); // the array is not line aligned, so it may straddle
-        if constexpr (sizeof(value_idx_type) > 4) {
-            ANKERL_UNORDERED_DENSE_PREFETCH(p + 8);
-        }
+        ANKERL_UNORDERED_DENSE_PREFETCH(p + sizeof(Block) - 1);
     }
 
     // Forced inline because gcc does not do it on its own in a large translation unit, and the
@@ -1560,15 +1630,15 @@ private:
         auto const counter = word & 7U;
         auto group_idx = group_idx_from_hash(mh);
         auto const* groups = m_buckets.data();
-        auto const* index = m_buckets.index();
         value_idx_type delta = 0;
         while (true) {
-            prefetch_index(index, group_idx);
+            prefetch_index(groups, group_idx);
             auto const& group = groups[group_idx];
             auto lanes = match_fingerprint(group, word);
             while (lanes != 0) {
-                auto const slot = static_cast<value_idx_type>(std::size_t{group_idx} * slots_per_group + first_lane(lanes));
-                auto const value_idx = index[slot];
+                auto const lane = first_lane(lanes);
+                auto const slot = static_cast<value_idx_type>(std::size_t{group_idx} * slots_per_group + lane);
+                auto const value_idx = group.m_index[lane];
                 if (m_equal(key, get_key(m_values[value_idx]))) {
                     return {slot, value_idx, true};
                 }
@@ -1597,7 +1667,7 @@ private:
             if (empties != 0) {
                 auto const lane = first_lane(empties);
                 group.m_fingerprints[lane] = static_cast<std::uint8_t>(word);
-                m_buckets.index()[std::size_t{group_idx} * slots_per_group + lane] = value_idx;
+                group.m_index[lane] = value_idx;
                 return;
             }
             if (group.m_overflows[counter] != 255) {
@@ -1607,23 +1677,79 @@ private:
         }
     }
 
-    // Frees the slot and takes the entry out of every counter it was counted in: the same walk
-    // from home that placed it, up to the group it landed in.
+    // Takes an entry out of every counter it was counted in: the same walk from home that placed
+    // it, up to the group it landed in. Everything it reads through `this` comes in as an argument,
+    // loaded before the caller's fingerprint store: a std::uint8_t store may alias the group
+    // pointer and the mask, so reading them afterwards puts a reload on the address chain of every
+    // step of the walk. Measured as a 2% loss on a churn sweep when this was refactored the other
+    // way round.
+    template <typename Group>
+    static void
+    uncount(Group* groups, value_idx_type mask, value_idx_type home_idx, unsigned counter, value_idx_type found_in) {
+        auto group_idx = home_idx;
+        value_idx_type delta = 0;
+        while (group_idx != found_in) {
+            if (groups[group_idx].m_overflows[counter] != 255) {
+                --groups[group_idx].m_overflows[counter];
+            }
+            group_idx = static_cast<value_idx_type>((group_idx + (++delta)) & mask);
+        }
+    }
+
+    // Frees the slot and takes the entry out of the counters.
     void erase_group_slot(value_idx_type slot, std::uint64_t mh) {
         auto* groups = m_buckets.data();
+        auto const mask = m_group_mask;
+        auto const home_idx = group_idx_from_hash(mh);
+        auto const counter = fingerprint_word(mh) & 7U;
         auto const found_in = static_cast<value_idx_type>(slot / slots_per_group);
         groups[found_in].m_fingerprints[slot % slots_per_group] = 0;
-        auto group_idx = group_idx_from_hash(mh);
-        if (group_idx != found_in) {
-            auto const counter = fingerprint_word(mh) & 7U;
-            value_idx_type delta = 0;
-            do {
-                if (groups[group_idx].m_overflows[counter] != 255) {
-                    --groups[group_idx].m_overflows[counter];
-                }
-                group_idx = next_group(group_idx, delta);
-            } while (group_idx != found_in);
+        uncount(groups, mask, home_idx, counter, found_in);
+    }
+
+    // A hit found past its home group moves home if there is room there now, and comes out of
+    // the counters it was counted in on the way out. This is what takes back the drift of a
+    // churned table: an entry placed while its home was full stays where it landed after the
+    // home empties again, and nothing else ever moves it, so at load 0.76 after 200 turnovers a
+    // hit visits 1.14 groups against 1.03 fresh and a miss 1.26 against 1.05; with one writing
+    // hit per erase this brings that to 1.09 and 1.16, with four to 1.05 and 1.09. Doing it on
+    // erase instead -- pulling a sibling back into the freed slot -- was measured and lost: the
+    // counter cannot tell a sibling from an entry that passed through, so it fires on 46% of
+    // erases and hashes two or three candidates each time, 1.5x the cost of a churn round. Here
+    // the entry is the one just found, its home was just computed, and the home group is a
+    // compare away from being known full or not, so a hit at home costs one compare and a hit
+    // away from home costs a load, two stores and the counter walk.
+    //
+    // What it is worth, one map per binary so that nothing shares a translation unit, on a
+    // 50000 entry table churned forty times through with a writing hit per round: misses 5.16
+    // to 4.64 ns, hits 5.9 to 5.7, the churn round itself 42.7 against 42.5, branch misses down
+    // 18%; at 2M entries everything within 1-2%, since one step of displacement is the adjacent
+    // block and the prefetcher already has it. A paired run of the two headers in one binary had
+    // read 1.49x on the misses, which was code layout, not the map.
+    //
+    // Only from paths that already write. A const find cannot do this, and a non-const find()
+    // is treated as read-only by callers who share a map between threads, so it does not either.
+    void move_home(value_idx_type slot, std::uint64_t mh) {
+        auto const found_in = static_cast<value_idx_type>(slot / slots_per_group);
+        auto const home_idx = group_idx_from_hash(mh);
+        if (ANKERL_UNORDERED_DENSE_LIKELY(found_in == home_idx)) {
+            return;
         }
+        auto* groups = m_buckets.data();
+        auto& home = groups[home_idx];
+        auto const empties = match_empty(home);
+        if (empties == 0) {
+            return;
+        }
+        auto const lane = first_lane(empties);
+        auto const mask = m_group_mask;
+        auto const counter = fingerprint_word(mh) & 7U;
+        auto& from = groups[found_in];
+        auto const from_lane = slot % slots_per_group;
+        home.m_fingerprints[lane] = from.m_fingerprints[from_lane];
+        home.m_index[lane] = from.m_index[from_lane];
+        from.m_fingerprints[from_lane] = 0;
+        uncount(groups, mask, home_idx, counter, found_in);
     }
 
     // The slot that points at a value, searched from the value's home group. Every value has one,
@@ -1632,14 +1758,15 @@ private:
         auto const word = fingerprint_word(mh);
         auto group_idx = group_idx_from_hash(mh);
         auto const* groups = m_buckets.data();
-        auto const* index = m_buckets.index();
         value_idx_type delta = 0;
         while (true) {
-            prefetch_index(index, group_idx);
-            auto lanes = match_fingerprint(groups[group_idx], word);
+            prefetch_index(groups, group_idx);
+            auto const& group = groups[group_idx];
+            auto lanes = match_fingerprint(group, word);
             while (lanes != 0) {
-                auto const slot = static_cast<value_idx_type>(std::size_t{group_idx} * slots_per_group + first_lane(lanes));
-                if (index[slot] == value_idx) {
+                auto const lane = first_lane(lanes);
+                auto const slot = static_cast<value_idx_type>(std::size_t{group_idx} * slots_per_group + lane);
+                if (group.m_index[lane] == value_idx) {
                     return slot;
                 }
                 lanes &= lanes - 1;
@@ -1865,7 +1992,7 @@ private:
         }
         // Clearing the groups empties every slot and zeroes every counter; the value indices
         // beside them are never read for an empty slot.
-        std::memset(m_buckets.data(), 0, sizeof(Bucket) * m_buckets.size());
+        m_buckets.clear_metadata();
     }
 
     // Into an index just allocated, so already empty.
@@ -1883,14 +2010,68 @@ private:
         // not move (2.15 to 2.48, noise); this is what made the same build 1.7x slower under clang
         // than under gcc, and it is now faster.
         //
+        // The same reasoning is why the group pointer, the mask and the shift are held in locals
+        // and the placement is written out here rather than calling place_group: every one of
+        // them is read through `this`, which the fingerprint store may alias too.
+        //
+        // The loop hashes sixteen elements ahead of the one it places and prefetches the group
+        // each will land in. Below cache that is worth 1.26x on the loop (2.05 to 1.63 ns per
+        // element at 200000 entries) for the pipelining alone: the hash, which is a chain, is
+        // decoupled from the placement, which is a random access, so neither waits for the other.
+        // Above cache the prefetch is what matters for a key whose hash has work to hide a miss
+        // behind -- a string rehash at four million entries goes 30.6 to 12.4 ns per element -- and
+        // does nothing for an integer key at 176 MB (12.6 to 12.5), because that loop is bound by
+        // the TLB rather than by latency: 1.15 dTLB misses per placement on 4 KB pages. Partitioning
+        // the elements by group first, database style, does cut that to 0.24 and halves the loop
+        // in isolation (10.3 to 5.4 at 44 MB), but inside a build it is worth 0-7% of an integer
+        // build above 32 MB and nothing below, because the rehash is a minority of a large build
+        // and the scratch it needs is faulted in fresh every time at about a microsecond a page. Not
+        // kept; the measurement is in CLAUDE.md.
+        //
         // The index is counted in value_idx_type and never in the container's size, for the reason
         // spelled out in replace(): max_size() is exactly what value_idx_type can hold, so a
         // container of precisely that many has a size that is not representable in it.
-        auto value_idx = value_idx_type{};
-        for (auto const& value : m_values) {
+        constexpr auto ahead = std::size_t{16};
+        auto* const groups = m_buckets.data();
+        auto const mask = m_group_mask;
+        auto const shifts = m_shifts;
+        auto ring = std::array<std::uint64_t, ahead>{};
+        auto it = m_values.begin();
+        auto const end = m_values.end();
+        auto const fetch = [&](std::size_t i) -> void {
+            auto const mh = mixed_hash(get_key(*it));
+            ++it;
+            ring[i] = mh;
+            prefetch_block(groups, static_cast<std::size_t>(mh >> shifts));
+        };
+        for (auto i = std::size_t{}; i < ahead && it != end; ++i) {
+            fetch(i);
+        }
+        auto const n = m_values.size();
+        for (auto value_idx = std::size_t{}; value_idx < n; ++value_idx) {
+            auto const mh = ring[value_idx % ahead];
+            if (it != end) {
+                fetch(value_idx % ahead);
+            }
             // we know for certain that key has not yet been inserted, so no need to check it.
-            place_group(mixed_hash(get_key(value)), value_idx);
-            ++value_idx;
+            auto const word = fingerprint_word(mh);
+            auto const counter = word & 7U;
+            auto group_idx = static_cast<value_idx_type>(mh >> shifts);
+            value_idx_type delta = 0;
+            while (true) {
+                auto& group = groups[group_idx];
+                auto const empties = match_empty(group);
+                if (empties != 0) {
+                    auto const lane = first_lane(empties);
+                    group.m_fingerprints[lane] = static_cast<std::uint8_t>(word);
+                    group.m_index[lane] = static_cast<value_idx_type>(value_idx);
+                    break;
+                }
+                if (group.m_overflows[counter] != 255) {
+                    ++group.m_overflows[counter];
+                }
+                group_idx = static_cast<value_idx_type>((group_idx + (++delta)) & mask);
+            }
         }
     }
 
@@ -1932,7 +2113,7 @@ private:
             // update the value index of the moved entry
             auto const values_idx_back = static_cast<value_idx_type>(m_values.size() - 1);
             auto const mh = mixed_hash(get_key(val));
-            m_buckets.index()[slot_of_value(mh, values_idx_back)] = value_idx_to_remove;
+            m_buckets.index_at(slot_of_value(mh, values_idx_back)) = value_idx_to_remove;
         }
         m_values.pop_back();
     }
@@ -2025,6 +2206,7 @@ private:
         auto const mh = mixed_hash(key);
         auto r = probe(key, mh);
         if (r.found) {
+            move_home(r.slot, mh);
             return {begin() + static_cast<difference_type>(r.value_idx), false};
         }
         return do_place_element(mh,
@@ -2494,6 +2676,7 @@ public:
         auto r = probe(key, mh);
         if (r.found) {
             m_values.pop_back(); // value was already there, so get rid of it
+            move_home(r.slot, mh);
             return {begin() + static_cast<difference_type>(r.value_idx), false};
         }
 
