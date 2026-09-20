@@ -8,7 +8,7 @@
 
 # 🚀 ankerl::unordered_dense::{map, set} <!-- omit in toc -->
 
-A fast & densely stored hashmap and hashset based on robin-hood backward shift deletion for C++17 and later.
+A fast & densely stored hashmap and hashset for C++17 and later.
 
 The classes `ankerl::unordered_dense::map` and `ankerl::unordered_dense::set` are (almost) drop-in replacements of `std::unordered_map` and `std::unordered_set`. While they don't have as strong iterator / reference stability guarantees, they are typically *much* faster.
 
@@ -37,8 +37,9 @@ Additionally, there are `ankerl::unordered_dense::segmented_map` and `ankerl::un
     - [3.3.6. `auto hash_for(K const& key) const -> precomputed_hash`](#336-auto-hash_fork-const-key-const---precomputed_hash)
   - [3.4. Custom Container Types](#34-custom-container-types)
   - [3.5. Custom Bucket Types](#35-custom-bucket-types)
-    - [3.5.1. `ankerl::unordered_dense::bucket_type::standard`](#351-ankerlunordered_densebucket_typestandard)
-    - [3.5.2. `ankerl::unordered_dense::bucket_type::big`](#352-ankerlunordered_densebucket_typebig)
+    - [3.5.1. `ankerl::unordered_dense::bucket_type::group`](#351-ankerlunordered_densebucket_typegroup)
+    - [3.5.2. `ankerl::unordered_dense::bucket_type::group_big`](#352-ankerlunordered_densebucket_typegroup_big)
+  - [3.6. Disabling the SSE2 Probe](#36-disabling-the-sse2-probe)
 - [4. `segmented_map` and `segmented_set`](#4-segmented_map-and-segmented_set)
 - [5. Design](#5-design)
   - [5.1. Inserts](#51-inserts)
@@ -127,6 +128,9 @@ clang++ -std=c++20 -fprebuilt-module-path=. ankerl.unordered_dense.o module_test
 ```
 
 A simple demo script can be found in `test/modules`.
+
+The module is built with the scalar probe, see [3.6. Disabling the SSE2 Probe](#36-disabling-the-sse2-probe). If you
+wrap the header in a module of your own and build it with gcc, you need to do the same.
 
 ### 3.2. Hash
 
@@ -392,17 +396,36 @@ Only lookups take a precomputed hash, and insertion never will: a lookup given t
 
 ### 3.5. Custom Bucket Types
 
-The map/set supports two different bucket types. The default should be good for pretty much everyone.
+The index is groups of sixteen slots; the bucket type chooses how wide a value index is. The
+default should be good for pretty much everyone. See [5. Design](#5-design) for how the index
+works.
 
-#### 3.5.1. `ankerl::unordered_dense::bucket_type::standard`
+#### 3.5.1. `ankerl::unordered_dense::bucket_type::group`
 
 * Up to 2^32 = 4.29 billion elements.
-* 8 bytes overhead per bucket.
+* 5.5 bytes overhead per slot: 24 bytes per group of sixteen, and a 4 byte value index per slot.
 
-#### 3.5.2. `ankerl::unordered_dense::bucket_type::big`
+#### 3.5.2. `ankerl::unordered_dense::bucket_type::group_big`
 
 * Up to 2^63 = 9,223,372,036,854,775,808 elements.
-* 12 bytes overhead per bucket.
+* 9.5 bytes overhead per slot: an 8 byte value index instead of a 4 byte one.
+
+### 3.6. Disabling the SSE2 Probe
+
+On x86-64 a probe compares a group's sixteen fingerprints with one SSE2 instruction. That needs no
+compiler flag, because SSE2 is part of the x86-64 baseline. Defining
+`ANKERL_UNORDERED_DENSE_HAS_SSE2` to 0 before the header is included switches to the portable
+fallback, which compares eight fingerprints per machine word with ordinary arithmetic, e.g. with
+cmake:
+
+```cmake
+target_compile_definitions(your_target PRIVATE ANKERL_UNORDERED_DENSE_HAS_SSE2=0)
+```
+
+The module in `src/` sets it already, because the intrinsics are declared by a header included in
+the global module fragment and those declarations do not reach a translation unit that imports the
+module. Wrapping the header in a module of your own means doing the same. The fallback is within a
+few percent of the SSE2 path on the benchmark's workloads, so this costs little.
 
 ## 4. `segmented_map` and `segmented_set`
 
@@ -418,7 +441,9 @@ Here is a comparison against `absl::flat_hash_map` and `ankerl::unordered_dense:
 
 Abseil is fastest for this simple insertion test, taking a bit over 0.8 seconds. Its peak memory usage is about 430 MB. Note how the memory usage goes down after the last peak; when it goes down to ~290MB it has finished rehashing and could free the previously used memory block.
 
-`ankerl::unordered_dense::segmented_map` doesn't have these peaks, and instead has a smooth increase in memory usage. Note there are still sudden drops & increases in memory because the indexing data structure still needs to increase by a fixed factor. But due to holding the data in a separate container, we are able to first free the old data structure, and then allocate a new, bigger indexing structure; thus we do not have peaks.
+`ankerl::unordered_dense::segmented_map` doesn't have these peaks, and instead has a smooth increase in memory usage. Note there are still sudden drops & increases in memory because the indexing data structure still needs to increase by a fixed factor.
+
+The segmenting is about the values, which are the larger part and the ones whose references stay valid. The index is two plain arrays either way, so growing it does allocate the new one beside the old; at 5.5 bytes per slot that peak is small next to the values.
 
 ## 5. Design
 
@@ -428,36 +453,48 @@ The map/set has two data structures:
 
 ### 5.1. Inserts
 
-Whenever an element is added, it is `emplace_back`ed to the vector. The key is hashed, and an entry (bucket) is added at the corresponding location in the bucket array. The bucket has this structure:
+Whenever an element is added, it is `emplace_back`ed to the vector. The key is hashed, and the index
+records where the value went. The index is groups of sixteen slots:
 
 ```cpp
-struct Bucket {
-    uint32_t dist_and_fingerprint;
-    uint32_t value_idx;
+struct group {
+    uint8_t m_fingerprints[16]; // the low byte of the hash, 0 means empty
+    uint8_t m_overflows[8];     // how many entries with (fingerprint & 7) == i probed past this group
 };
+uint32_t value_index[16 * groups]; // one per slot, beside the groups
 ```
 
-Each bucket stores 3 things:
-* The distance of that value from the original hashed location (3 most significant bytes in `dist_and_fingerprint`)
-* A fingerprint; 1 byte of the hash (lowest significant byte in `dist_and_fingerprint`)
-* An index where in the vector the actual data is stored.
-
-This structure is especially designed for the collision resolution strategy robin-hood hashing with backward shift
-deletion.
+The top bits of the hash pick the group, the low byte is the fingerprint, with 0 mapped to 8 so
+that 0 can mean "empty" and the low three bits, which select one of the eight counters, are
+unchanged. An insert takes the first free slot from the home group onwards, in a quadratic
+sequence over groups, and increments its counter in every full group it passed.
 
 ### 5.2. Lookups
 
-The key is hashed and the bucket array is searched to see if it has an entry at that location with that fingerprint. When found, the key in the data vector is compared, and when equal, the value is returned.
+The key is hashed, the group's sixteen fingerprints are loaded at once and compared against the
+key's fingerprint in one instruction, and the result is a 16 bit mask of candidate slots. For each
+candidate the value index is read and the key in the data vector is compared; when equal, the value
+is returned. If no candidate matched, the one overflow counter that the fingerprint selects decides:
+zero means no entry with those bits ever left this group, so the key is absent, and otherwise the
+probe moves to the next group.
+
+The value indices of a group have an address that depends only on the group, so they are prefetched
+while the fingerprints are still on their way.
+
+Without SSE2 the same sixteen bytes are compared eight at a time with ordinary arithmetic, see
+[3.6. Disabling the SSE2 Probe](#36-disabling-the-sse2-probe).
 
 ### 5.3. Removals
 
 Since all data is stored in a vector, removals are a bit more complicated:
 
-1. First, look up the element to delete in the index array.
-2. When found, replace that element in the vector with the last element in the vector. 
-3. Update *two* locations in the bucket array: First, remove the bucket for the removed element.
-4. Then, update the `value_idx` of the moved element. This requires another lookup.
-
+1. First, look up the element to delete in the index.
+2. Clear its fingerprint, and decrement the overflow counter in every group between its home group
+   and the one it landed in. That leaves the index exactly as it would have been had the element
+   never been inserted, so a table that has churned for a long time is as good as a fresh one, and
+   there are no tombstones and no rehash to repair them. Nothing else moves.
+3. Replace that element in the vector with the last element in the vector.
+4. Update the slot of the moved element, which requires another lookup.
 
 ## 6. Real World Usage
 

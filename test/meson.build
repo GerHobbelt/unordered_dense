@@ -39,6 +39,7 @@ test_sources = [
     'unit/empty.cpp',
     'unit/equal_range.cpp',
     'unit/erase_if.cpp',
+    'unit/erase_churn.cpp',
     'unit/erase_range.cpp',
     'unit/erase_throwing_move.cpp',
     'unit/erase.cpp',
@@ -48,6 +49,7 @@ test_sources = [
     'unit/fuzz_insert_erase.cpp',
     'unit/fuzz_replace_map.cpp',
     'unit/fuzz_string.cpp',
+    'unit/group_bucket.cpp',
     'unit/growth_exception_safety.cpp',
     'unit/hash_scalar_types.cpp',
     'unit/hash_smart_ptr.cpp',
@@ -74,6 +76,7 @@ test_sources = [
     'unit/not_moveable.cpp',
     'unit/pmr_move_with_allocators.cpp',
     'unit/precomputed_hash.cpp',
+    'unit/probe_wrap.cpp',
     'unit/pmr.cpp',
     'unit/reentrant.cpp',
     'unit/rehash.cpp',
@@ -243,9 +246,14 @@ benchmark(
     args: ['-ns', '-ts=bench'],
     verbose: true)
 
+# Meson's default is 30 seconds, which a sanitizer build of this suite no longer fits into: address
+# and undefined together, with detect_stack_use_after_return, cost it well over an order of
+# magnitude, and a Valgrind run costs more again. The timeout is here to catch a hang, so it only
+# has to be shorter than a CI job.
 test(
     'unit',
     test_exe,
+    timeout: 600,
     verbose: true)
 
 # libFuzzer targets. The unit suite replays data/fuzz/<name> on every build, which by construction

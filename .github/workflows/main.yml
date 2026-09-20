@@ -59,12 +59,20 @@ jobs:
       # network), so they belong here rather than in the nightly fuzz workflow.
       - run: ./scripts/test_fuzz_afl.py
 
-      # Same reasoning for scripts/mutate/mutate.py, and one more: what that tool decides is
+      # Same reasoning for scripts/mutate/mutate_core.py, and two more. What that tool decides is
       # whether a test noticed a bug, so every way it can be wrong is silent -- a bug block that
       # substitutes nothing, a filter that matches no case, a lane still holding yesterday's
-      # binary all come back "survived" and read as a hole in the suite. Hermetic too: no
+      # binary all come back "survived" and read as a hole in the suite. And the core is vendored:
+      # nanobench runs a byte-identical copy through an adapter of its own, so this job is also
+      # what covers the cmake backend that this repository never executes. Hermetic either way: no
       # compiler, no meson, no lanes, no cgroups.
       - run: ./scripts/test_mutate.py
+
+      # sync-core.py is what carries that file to the repositories vendoring it, and this covers
+      # the only part of it that can be wrong quietly: whether a sibling is in sync, stale, or
+      # must be refused. The refusal exists because a changed core at an unchanged CORE_VERSION
+      # would leave two different files claiming one version -- worse than no version at all.
+      - run: ./scripts/mutate/test_sync_core.py
 
   # Linux, macOS, Windows, the sanitizers and the hardened build used to be four jobs repeating
   # the same ten lines of checkout, python, cache and artifact setup. They differ only in the
@@ -130,6 +138,18 @@ jobs:
             cxx: g++
             apt: libboost-dev
             setup_args: --unity=on --unity-size=16
+
+          # ANKERL_UNORDERED_DENSE_HAS_SSE2=0 is the documented way to get the scalar probe and
+          # shifts on x86-64, which a gcc module interface needs (gcc bug 127193 turns the vector
+          # shifts' unaligned stores into aligned ones). The 32 bit legs below reach the scalar
+          # code too, but only because their target has no SSE2; nothing else builds an x86-64
+          # binary through the switch itself, so a typo in its name would be invisible.
+          - name: Linux (gcc, C++17, no SSE2)
+            id: linux-gcc-cpp17-nosse2
+            os: ubuntu-latest
+            cxx: g++
+            apt: libboost-dev
+            setup_args: -Dcpp_args=-DANKERL_UNORDERED_DENSE_HAS_SSE2=0
 
           # A hash map that packs a bucket into 8 bytes and indexes with size_t is exactly the
           # design a different word size breaks, so 32 bit is real coverage, not a formality.
@@ -272,6 +292,39 @@ jobs:
               -fstack-protector-strong -fstack-clash-protection -fcf-protection=full
               -Wformat -Wformat-security -Werror=format-security"
               -Dcpp_link_args="-Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack"
+
+          # The one class of bug the sanitizer legs cannot see: a read of memory that was never
+          # written. ASan reports out-of-bounds and use-after-free, UBSan reports the language-level
+          # UB, and neither says a word about an uninitialised read -- that is MemorySanitizer,
+          # which needs the whole standard library rebuilt instrumented to be usable at all, which
+          # is why nobody runs it. Valgrind gets it for free.
+          #
+          # Worth having for this container in particular: the buckets are memset rather than
+          # constructed, and m_shifts, m_bucket_mask and m_max_bucket_capacity are written by hand
+          # in a deliberate order -- see allocate_buckets_from_shift -- so "has that field been
+          # written yet" is a real question to be able to ask.
+          #
+          # debugoptimized is what makes it affordable: the suite takes 20 seconds under valgrind
+          # optimised against just over two minutes at -O0. The timeout multiplier is because
+          # meson's default is 30 seconds per test and this project has one test() containing all
+          # 599 cases.
+          #
+          # Deliberately not sharded, and worth writing down because the job's total time invites
+          # it. `meson test` builds before it tests, so the single step below is compile plus run,
+          # and on the cold ccache any new leg starts with, the compile is the large majority of
+          # it. Measured by actually splitting it: the shard running one test case took 127s and
+          # the shard running the other 598 took 128s. Sharding a job whose cost is the build buys
+          # nothing and pays for a second cold cache.
+          - name: Linux Valgrind (gcc, C++17, 64bit)
+            id: linux-valgrind
+            os: ubuntu-latest
+            cxx: g++
+            apt: libboost-dev valgrind
+            setup_args: --buildtype=debugoptimized
+            test_args: >-
+              --timeout-multiplier 20
+              --wrap='valgrind --error-exitcode=1 --leak-check=full
+              --errors-for-leak-kinds=definite -q'
     steps:
       - uses: actions/checkout@v7
       - uses: hendrikmuhs/ccache-action@v1.2
@@ -302,7 +355,7 @@ jobs:
       - run: meson setup builddir --force-fallback-for=fmt -Dcpp_std=c++${{ matrix.cpp_std || '17' }} ${{ matrix.setup_args }}
         env:
           CXX: ${{ matrix.ccache_variant || 'ccache' }} ${{ matrix.cxx }}
-      - run: meson test -C builddir --print-errorlogs
+      - run: meson test -C builddir --print-errorlogs ${{ matrix.test_args }}
         env:
           ASAN_OPTIONS: ${{ matrix.asan_options }}
           UBSAN_OPTIONS: ${{ matrix.ubsan_options }}
