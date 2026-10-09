@@ -216,6 +216,11 @@ place rather than being deleted, because the retraction is usually the more usef
 - udb3's `++h[key]` ran 70% slower under clang on 5.2.0 than on 5.1.0, and it was a loop variable stored and reloaded across a store with a late address: on Zen 4 that, with a division on the way to the next key, stops the loop overlapping its misses, 5x in a loop with no map at all; the part of the insert after a miss is called again under clang
 - The caller corpus: nine loops the way programs write them, one binary each, both compilers, in cache and past it, judged by each header's worst loop and not by a geomean; 5.2.0's worst was 3.3x under clang and 3.6x under gcc, the clang miss call of #310 brings clang's to 1.10, and under gcc nothing that removes the cliff is worth its price
 - The shape search: sixteen combinations of what the insert inlines, each judged by its worst ratio to the best combination anywhere measured, with the rule fixed before the results; it picks one shape for every compiler -- the home-group lookup inlined, the miss path and the walk past home called -- worst 1.11 under clang and 1.58 under gcc, where 5.2.0's everything-inlined reads 3.32 and 3.54
+- `hash_bytes` reads a key of compile-time length 8, 12 or 16 as 4 byte words under gcc and clang: a lookup right after writing a 12 byte key field by field goes 146 -> 40 cycles on both compilers, the hash value unchanged, strings untouched, a key already in memory 1.4 cycles more
+- ClickHouse's aggregation benchmark on real Yandex.Metrica columns, where 4.1.2 was published behind absl on every large column: main is within 1-5% of absl on the large columns except WatchID under clang (1.16), uses less memory than absl on two of the three, and is 12-13% behind 4.1.2 under clang on the columns with few distinct keys
+- #326's op-cache footprint was taken away by #328: MySQL's `EXCEPT` went from 26-45x 4.4.0's op-cache misses on 5.2.0 to 1.9x and 1.1x in two layouts of main, and the query is level with 4.4.0 or faster in both
+- #331, counting into a small table under clang 11-12% behind 4.1.2: about one cycle per row of latency in the 16-slot group's compare, on a table whose first slot almost always hits; #329's sentinel takes 0.1-0.3 cycles of it under clang and all of it under gcc, and nothing tried closes the rest
+- An empty table reads a shared, never written sentinel index, so `find` and the insert's inlined lookup drop their `empty()` test: `find` 3-5% fewer instructions on both compilers, gcc's small-table counting now ahead of 4.1.2, clang's 0.1-0.3 cycles closer, the score level; the index became a pointer and a count, so the map is 64 bytes, 8 fewer than 5.2.0
 
 **The robin hood index this replaced, and its dead ends**
 
@@ -5961,6 +5966,233 @@ program's benchmark, on purpose -- the rule is the smallest worst case, which is
 brittle" means -- and a different rule (e.g. weighting real programs) would pick 5.2.0's shape for
 gcc again. One CPU. The search is the tool for the next such question: `run.sh gen`, the stages,
 `run.sh rank`, about three hours unattended.
+
+**`hash_bytes` reads a key of compile-time length 8, 12 or 16 as 4 byte words under gcc and clang:
+a lookup right after writing a 12 byte key field by field goes 146 -> 40 cycles on both compilers,
+the hash value unchanged, strings untouched, a key already in memory 1.4 cycles more** (2026-09-27,
+issue #311, Ryzen 9 7950X, clang 22 and gcc 16, one variant per binary; the caller corpus). The 8-16
+byte path read `r8(p)` and `r8(p + len - 8)`. For a key the caller has just written, a load that
+spans two of the caller's stores cannot be forwarded from them and waits until both are written to
+the cache, and stores are written in order, so it holds up the lookups' misses. gcc writes three
+`int32_t` fields as three 4 byte stores, which the first read already spans; clang writes 8 + 4,
+which the second read spans. A 4 byte read lies inside one store in both cases. clang fuses
+`r4(p) | r4(p + 4) << 32` back into one 8 byte read (that is why the issue's "four 4 byte loads"
+row helped gcc only), so each word goes through an empty asm that makes its value opaque. The new
+path is taken only when `__builtin_constant_p(len) && len % 4 == 0`, only under gcc and clang, and
+only on little-endian: whether it runs depends on inlining, so both paths must give the same value,
+and `r4 | r4 << 32 == r8` holds on little-endian only. A unit test compares the two paths for 8, 12
+and 16 bytes; swapping the two words of `a` fails it.
+
+A `segmented_map<coord, uint64_t>` of three `int32_t`, the key written field by field and looked
+up at once, cycles per lookup:
+
+| | clang 64k | clang 1M | gcc 64k | gcc 1M |
+|---|---|---|---|---|
+| two 8 byte reads (before) | 144.1 | 368.7 | 146.2 | 380.0 |
+| 4 byte words (this) | 39.4 | 117.5 | 40.1 | 118.5 |
+| the fields hashed as values (`hash_int`) | 35.5 | 104.4 | 35.6 | 107.7 |
+
+Hashing 12 byte keys already in memory, cycles per hash: clang 4.60 -> 6.01, gcc 4.09 -> 5.53 (3
+loads, 2 shifts and 2 ors against 2 loads). Strings of 8-16 bytes of run-time length: identical
+instructions (clang 25.00, gcc 22.00), identical cycles. Reading each word once instead of the
+middle word twice changed nothing: the asm is not volatile, so the compiler merges the two reads
+already. The caller corpus, main against this: `struct_key` (#311's loop) 150.3 -> 46.5 and 840.7
+-> 242.6 under clang, 150.3 -> 41.6 and 836.3 -> 242.6 under gcc; every other cell within 1.02
+(clang) and 1.06 (gcc, the build at 4M, identical instructions). gcc's string loops lost
+instructions (`string_hit` 119.5 -> 110.5, the MySQL pattern 136.8 -> 131.8) although strings never
+take the new path: gcc's inliner decides differently about the larger `hash_bytes`, which is a
+gain here and not a property of the change.
+
+What this says and does not say: keys of other sizes, keys with fields narrower than 4 bytes (a
+2 byte field stored on its own is still spanned) and MSVC keep the 8 byte reads; for those the
+usage note in `doc/usage.md` recommends hashing the fields as values. One CPU: store forwarding
+rules differ between microarchitectures, and that a 4 byte load inside an 8 byte store is
+forwarded was measured on Zen 4 only.
+
+**ClickHouse's aggregation benchmark on real Yandex.Metrica columns, where 4.1.2 was published
+behind absl on every large column: main is within 1-5% of absl on the large columns except WatchID
+under clang (1.16), uses less memory than absl on two of the three, and is 12-13% behind 4.1.2 under
+clang on the columns with few distinct keys** (2026-09-27, issue #315, Ryzen 9 7950X, clang 22 and
+gcc 16, `kitaisreal/hash-table-aggregation-benchmark` with its own `CMakeLists.txt`, 4.1.2 from its
+`contrib`, 5.1.0 and main (5.2.0 + #323 + #328 + #330) beside it, `absl::Hash` for every map as in
+the published results; `perf stat` cycles per row, median of three rounds with the maps interleaved,
+pinned to core 2). Published on AWS c6a.4xlarge, time, 4.1.2 / absl: WatchID 12.93 / 10.01 s = 1.29,
+UserID 3.17 / 2.65 s = 1.20. Here, 4.1.2 / absl in cycles: 1.52 and 1.14 under clang, 1.24 and 1.13
+under gcc; the machine and compilers differ, so compare ratios, not seconds.
+
+Cycles per row (ratio to absl), clang:
+
+| column | ClickHouse HashMap | absl::flat_hash_map | google::dense_hash_map | 4.1.2 | 5.1.0 | main |
+|---|---|---|---|---|---|---|
+| WatchID | 311.6 (1.00) | 313.1 (1.00) | 427.9 (1.37) | 476.9 (1.52) | 373.9 (1.19) | 362.3 (1.16) |
+| URLHash | 123.9 (1.01) | 122.7 (1.00) | 155.3 (1.27) | 158.3 (1.29) | 143.1 (1.17) | 129.3 (1.05) |
+| UserID | 110.2 (0.93) | 118.0 (1.00) | 139.0 (1.18) | 135.0 (1.14) | 130.7 (1.11) | 120.1 (1.02) |
+| RegionID | 14.8 (0.75) | 19.6 (1.00) | 19.3 (0.98) | 23.4 (1.19) | 24.8 (1.26) | 21.0 (1.07) |
+| CounterID | 14.3 (0.75) | 19.1 (1.00) | 19.4 (1.02) | 18.2 (0.96) | 24.7 (1.29) | 20.6 (1.08) |
+| TraficSourceID | 12.7 (0.89) | 14.3 (1.00) | 15.0 (1.05) | 15.8 (1.10) | 19.6 (1.37) | 15.5 (1.08) |
+| AdvEngineID | 8.0 (0.59) | 13.7 (1.00) | 15.0 (1.09) | 13.4 (0.98) | 19.1 (1.40) | 15.0 (1.09) |
+
+gcc:
+
+| column | ClickHouse HashMap | absl::flat_hash_map | google::dense_hash_map | 4.1.2 | 5.1.0 | main |
+|---|---|---|---|---|---|---|
+| WatchID | 300.1 (0.82) | 366.8 (1.00) | 399.5 (1.09) | 454.0 (1.24) | 323.6 (0.88) | 383.0 (1.04) |
+| URLHash | 125.1 (0.97) | 129.0 (1.00) | 143.5 (1.11) | 157.0 (1.22) | 129.2 (1.00) | 129.2 (1.00) |
+| UserID | 112.4 (0.95) | 118.6 (1.00) | 129.6 (1.09) | 133.5 (1.13) | 120.4 (1.02) | 119.7 (1.01) |
+| RegionID | 16.2 (0.88) | 18.3 (1.00) | 15.8 (0.86) | 25.5 (1.39) | 26.0 (1.42) | 20.1 (1.10) |
+| CounterID | 16.3 (0.87) | 18.7 (1.00) | 15.4 (0.82) | 21.9 (1.17) | 21.6 (1.15) | 21.1 (1.13) |
+| TraficSourceID | 16.1 (1.25) | 12.9 (1.00) | 10.9 (0.85) | 25.8 (2.01) | 16.2 (1.26) | 14.8 (1.15) |
+| AdvEngineID | 10.1 (0.81) | 12.5 (1.00) | 10.2 (0.82) | 16.2 (1.30) | 15.7 (1.26) | 14.2 (1.14) |
+
+Memory as reported by the benchmark, MiB (the same under both compilers):
+
+| column | ClickHouse HashMap | absl | google dense | 4.1.2 | 5.1.0 | main |
+|---|---|---|---|---|---|---|
+| WatchID | 4096 | 2176 | 4096 | 2550 | 2230 | 2230 |
+| URLHash | 1024 | 544 | 1024 | 572 | 492 | 492 |
+| UserID | 1024 | 544 | 1024 | 525 | 445 | 445 |
+
+What moved: 5.x's index (5.5 bytes per slot against 4.x's 8) is what takes main below absl's memory
+on URLHash and UserID. The large columns went 1.52 / 1.29 / 1.14 (4.1.2) to 1.16 / 1.05 / 1.02
+(main) under clang, and 1.24 / 1.22 / 1.13 to 1.04 / 1.00 / 1.01 under gcc. Under gcc, WatchID
+(almost all new keys) is 18% slower on main than on 5.1.0, 383.0 against 323.6: that is #328's
+call after a home-group miss, which the shape search had put at 1.24x the best shape on this very
+column ("shape search"). ClickHouse's own map is the fastest on the small columns under both
+compilers (0.59-0.93 of absl) at 1.9x absl's memory on the large ones.
+
+Unexpected, and filed on its own (#331): under clang the columns with few distinct keys (CounterID,
+AdvEngineID: counting into a table that stays in cache) are 12-13% slower on main than on 4.1.2,
+20.6 against 18.2 and 15.0 against 13.4 cycles per row; under gcc 4.1.2 is the slower one there.
+
+What this says and does not say: one machine, 100M rows per column, in the benchmark's own
+harness; the published numbers are one run on AWS and are quoted as ratios only.
+
+**#326's op-cache footprint was taken away by #328: MySQL's `EXCEPT` went from 26-45x 4.4.0's
+op-cache misses on 5.2.0 to 1.9x and 1.1x in two layouts of main, and the query is level with
+4.4.0 or faster in both** (2026-09-27, issue #326, MySQL 9.7.2, gcc 16 `-O2`, Ryzen 9 7950X,
+`perf stat` over five queries on the pinned mysqld, two rounds). 5.2.0 inlined the whole insert,
+growth path included (`flatten`), into `MaterializeIterator::check_unique_fields_hash`; main
+inlines only the home-group lookup and calls the rest (#328), which is the change #326 asked for
+from another direction. The second layout is the same source with the inactive
+`scripts/ab/mysql_except_dump.patch` applied, which moved 5.2.0's `EXCEPT` by 7-11% before.
+Per query:
+
+| | op cache misses | L1 icache misses | cycles | instructions |
+|---|---|---|---|---|
+| 4.4.0 | 1.56 M | 0.45-0.46 M | 1137.7-1149.5 M | 4528.8 M |
+| 5.2.0 (the issue) | 34.1-59.0 M | 0.56-4.54 M | 1126.5-1209.6 M | 4469.7 M |
+| main, layout 1 | 2.97-3.03 M | 0.84-0.86 M | 1098.7-1115.1 M | 4481.1 M |
+| main, layout 2 | 1.74-1.75 M | 0.54-0.55 M | 1096.3-1125.7 M | 4497.0 M |
+
+The issue's bar, within 2x of 4.4.0's op cache misses in every measured layout, is met without a
+change of its own. What this says and does not say: two layouts of one build configuration; the
+experiment #326 proposed (keeping the growth path out of an inlined insert) was not run, since the
+insert is no longer inlined past the home group.
+
+**#331, counting into a small table under clang 11-12% behind 4.1.2: about one cycle per row of
+latency in the 16-slot group's compare, on a table whose first slot almost always hits; #329's
+sentinel takes 0.1-0.3 cycles of it under clang and all of it under gcc, and nothing tried closes
+the rest** (2026-09-27, issue #331, Ryzen 9 7950X, clang 22 and gcc 16; ClickHouse's counting loop,
+`++map[*current]` over the real AdvEngineID and CounterID columns, 100M rows, `absl::Hash` linked
+from the benchmark's own abseil build, the loop alone timed, best of five, one variant per binary).
+The #315 numbers include the benchmark's file loading; timing the loop alone makes the gap larger
+in relative terms. A stand-in hash (a multiply fold, not marked avalanching) did not reproduce it
+-- main came out 1.46x ahead on AdvEngineID -- so the hash is part of the picture and `absl::Hash`
+had to be linked for real.
+
+Cycles (instructions) per row:
+
+| | 4.1.2 | main | main, no `empty()` test (#329) | main, fingerprint by arithmetic | main, pre-broadcast 16 byte table |
+|---|---|---|---|---|---|
+| clang AdvEngineID (19 keys) | **9.08** (36.1) | 10.08 (39.0) | 10.00 (38.0) | 10.94 (42.0) | 10.73 (40.0) |
+| clang CounterID (6506 keys) | **9.67** (43.4) | 10.88 (44.3) | 10.55 (42.2) | 11.99 (48.7) | 12.06 (48.5) |
+| gcc AdvEngineID | 10.57 (50.9) | 9.52 (40.0) | **8.95** (36.0) | | |
+| gcc CounterID | 9.27 (47.6) | 9.72 (41.7) | **9.20** (37.8) | | |
+
+The profile of the loop under clang puts main's cycles on the key compare's branch after the group
+compare, the vector broadcast (`pshufd`) and the index load; main executes 1-3 more instructions
+per row than 4.1.2 and takes about 1 cycle more, so it is latency and not work. 4.x compared one
+8 byte bucket (fingerprint and distance, with the value index beside it) and went to the key; 5.x
+broadcasts the fingerprint, compares sixteen lanes, extracts a mask, finds its first bit and loads
+the index, which is the group design's price on a table that fits in L1 and hits its first slot.
+That is an inference from these numbers, not a measured latency chain. The two ways around the
+broadcast both lost: computing the fingerprint instead of the table lookup (the table was measured
+right in the first place, "The gcc string-lookup gap, explained and mostly closed": integer misses
+1.05-1.06x), and a 4 KB table of fingerprints already broadcast
+to 16 bytes, which keeps the scalar table load for the counter and the stored fingerprint as well
+and ends with more instructions.
+
+What this says and does not say: two columns of one benchmark, in cache; the gap is clang's and
+under gcc main is level or ahead once #329 lands. No change of its own; #329 carries the part that
+can be had.
+
+**An empty table reads a shared, never written sentinel index, so `find` and the insert's inlined
+lookup drop their `empty()` test: `find` 3-5% fewer instructions on both compilers, gcc's
+small-table counting now ahead of 4.1.2, clang's 0.1-0.3 cycles closer, the score level; the
+index became a pointer and a count, so the map is 64 bytes, 8 fewer than 5.2.0**
+(2026-09-27, issue #329, Ryzen 9 7950X, clang 22 and gcc 16; the caller corpus, `solo.sh` +
+`perwl.sh`, #331's counting loop). The sentinel lives in `group_storage`, which the library owns:
+a static array of as many groups as the smallest table has (4), all slots empty and all counters
+zero, and a pointer `m_data` that is `m_blocks.data()` or the sentinel, set by `sync()` after every
+operation that can change the vector, so `data()` returns it without a test. A test inside `data()`
+would have put the check back on every lookup's address, which is why the pointer is stored. A
+`static_assert` in the table ties the sentinel's size to `initial_shifts`; every path that leaves a
+table without an array sets `m_shifts` back to it (the moves, `copy_buckets` for an empty source,
+`reset_to_empty`), so `hash >> m_shifts` stays inside the sentinel. After the review the sentinel
+moved out of `group_storage` to one per group type (`detail::sentinel_blocks<Group>()`, 352 bytes of
+BSS), rather than one per group type and allocator, and the `empty()` tests left in the
+precomputed-hash `find` and in `erase(key)` went too; `visit` keeps its test, which saves hashing a
+whole range.
+
+What keeps it unwritten: the miss path allocates before it places. An attempt to rely on the other
+guard alone -- a table without an array has a capacity of zero, so a placement grows first -- was
+measured and taken back: the first insert then grows into the array and rehashes, which the suite
+caught twice, as the first array coming out 8 groups instead of 4 (`bucket_count() == 64`) and as
+the first key hashed twice (`transparent.cpp`'s hash counts). With the allocation back, the
+mutation "deallocate_buckets keeps the capacity" is equivalent and was not added to the bug files;
+`the_sentinel_index_is_never_written` in `test/unit/lazy_bucket_allocation.cpp` checks every way to
+arrive at a table without an array (default, moved from, move assigned from, copy assigned from an
+empty table), lookups, erases and a first insert in it, and that a fresh table afterwards still
+finds nothing. It kills the mutation that drops both guards (no allocation in the miss path, no
+growth for the first element): the first insert writes the sentinel and the test crashes. Dropping
+either guard alone survives it, because the other one still allocates first.
+
+Score, one header per binary, against main: 1.0032 under clang and under gcc (inside the band);
+instructions per workload, clang: `find` 0.964 / 0.970 / 1.009 (u64 / string / big value), churn
+0.975 / 0.988 / 0.953, build 0.987 / 0.997 / 0.989; gcc: `find` 0.952 / 0.981 / 0.952, insert-erase
+0.997 / 1.003 / 0.962, build 1.006 / 0.998 / 1.000. The caller corpus: worst ratio 1.09 under
+clang on both headers, 1.09 -> 1.03 under gcc; nearly every cell 1-3 instructions fewer. One cell
+went the other way: clang's `struct_key` at 64k, 88.2 -> 94.2 instructions, 46.1 -> 50.1 cycles
+(2% at 4M), with the `empty()` test gone from its loop and clang now reloading a variable from the
+stack inside it -- a register allocation of this one loop, not a property of the change. #331's
+counting loop, cycles per row, main -> this (4.1.2): clang AdvEngineID 10.08 -> 10.00 (9.02),
+CounterID 10.88 -> 10.55 (9.35); gcc 9.52 -> 9.05 (10.57), 9.73 -> 9.27 (9.28).
+
+What this says and does not say: an empty table now hashes the key of a lookup that finds nothing,
+where it returned before hashing; the insert path and every other lookup save the test.
+
+The size of the map: the stored pointer first cost every table 8 bytes, `sizeof(map<uint64_t,
+uint64_t>)` 72 -> 80. `group_storage` then became a pointer and a group count instead of a
+`std::vector` plus that pointer: the table never grows the array in place, so the vector's capacity
+was a word nobody read, and its data pointer was a second copy of `m_data`. The map is now 64 bytes
+on a 64 bit target, 8 fewer than 5.2.0, for both bucket types and every key type; `pmr::map` 88 ->
+80, `segmented_map` 80 -> 72. The allocator sits in an empty base when it is empty. Propagation on
+copy, move and swap follows `std::vector`'s rules, because the table's assignments rely on them, and
+`clear()` now frees the array, which is what every caller did next anyway. A fancy pointer
+(`boost::interprocess`'s `offset_ptr`) stores null rather than the sentinel and `data()` tests for it:
+a raw pointer to a static, stored in a map that lives in shared memory, means nothing to the next
+process. The first version of this entry stored a raw `m_data` for every allocator and had exactly
+that flaw, which no test covers. MSVC's debug build allocates a proxy per `std::vector`, so the index
+no longer adds one to an empty table's allocation count there (`vector_count`, 1 -> 0). The storage
+offers only what the table does with it: it is neither copied nor moved as a whole, `take()` moves an
+array between two equal allocators (the table checks, or built the source itself), and
+`set_allocator()` is copy assignment's pocca. A mutation run over the first version, 90 mutants,
+found the general copy and move assignment branches unreachable, and found that no test would notice
+a destructor that leaks or a swap that forgets the allocator;
+`the_index_frees_through_the_allocator_that_allocated_it` now kills both. Score, one header per
+binary, against the sentinel with the vector: 1.0033 clang, 1.0066 gcc, three rounds each. The
+equivalent survivor in the mutation run over the diff: the `static_assert`'s comparison, since both
+sizes are 4.
 
 ## The robin hood index this replaced, and its dead ends
 
