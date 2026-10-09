@@ -221,6 +221,15 @@ place rather than being deleted, because the retraction is usually the more usef
 - #326's op-cache footprint was taken away by #328: MySQL's `EXCEPT` went from 26-45x 4.4.0's op-cache misses on 5.2.0 to 1.9x and 1.1x in two layouts of main, and the query is level with 4.4.0 or faster in both
 - #331, counting into a small table under clang 11-12% behind 4.1.2: about one cycle per row of latency in the 16-slot group's compare, on a table whose first slot almost always hits; #329's sentinel takes 0.1-0.3 cycles of it under clang and all of it under gcc, and nothing tried closes the rest
 - An empty table reads a shared, never written sentinel index, so `find` and the insert's inlined lookup drop their `empty()` test: `find` 3-5% fewer instructions on both compilers, gcc's small-table counting now ahead of 4.1.2, clang's 0.1-0.3 cycles closer, the score level; the index became a pointer and a count, so the map is 64 bytes, 8 fewer than 5.2.0
+- `segmented_map` lookups against `map`, one cell per binary: a hit costs 7-15 instructions more and a miss 0.4-2.4, and of that only about 5 instructions of clang's `find` hit are avoidable -- clang splits the value index a second time for `it->second`, where gcc reuses the probe's split -- so nothing was changed
+- Small maps, two variants from #304 prototyped and measured against `main` over 20000 maps of 1 to 32 entries: no index below eight entries makes a map of up to four entries 1.06-2.3x faster to build, 1.2-2.2x faster to destroy and its lookups 1.5-3.7x faster, but puts back the empty-table test #329 took out of every lookup; a two-group minimum index helps a one- or two-entry integer map 2-28% and builds 32 entries 1.17-1.61x slower; neither was kept
+- The teardown harness ran its sides in a fixed order, and the side that runs first in a pass reads 2-4% slower on the string first build; the 5-18% first-build gap at 50000 that #309 could not explain does not reproduce with the same two headers (0.4-3.0%), so the harness now rotates its sides
+- STP's parser with 4.5.0 against 5.1.0 and main, the two instances from stp#560: 5.1.0 parses 4-5% faster on both instances under both compilers, with the same instructions within 1.3%, and 8% less peak memory on the larger instance; main reads within 3.1 points of 5.1.0
+- stp#567's constant bit propagator tables re-checked on STP master: against the same four tables as std::unordered_*, 4.5.0 takes propagation to 0.912 and this repository's main to 0.859, nearly all of it on one instance (testcase15 0.74 and 0.69), and total solve time is level within 1% where #567 read -22% propagation and -4.9% total
+- Redpanda's leader balancer benchmark (redpanda#17182) re-run standalone against main: main's `map` is 3-10% slower than 4.5.0 on the benchmark as written, whose map holds 80 keys, and 15-20% slower with one entry per raft group as in a real cluster, where it executes 20-27 more instructions per lookup; the `segmented_map` Redpanda ships is level (clang 0.917, gcc 1.042)
+||||||| parent of bd0aaaa (notes: #341, main's find hit in Redpanda's loop is half probe and half caller; three candidates lost, nothing changed)
+- #341, main's `find` hit against 4.5.0's in Redpanda's loop: half of the +20-27 instructions per call is the group probe itself (+11-14 in a bare loop) and half the caller around it; boost's `unordered_flat_map` runs as many instructions and 9-16% fewer cycles in that loop, and three candidates -- the walk past home out of line, no index prefetch, a speculative value prefetch from a preferred lane -- each cost cycles or did not move them, so nothing changed
+- Why boost's `unordered_flat_map` finds faster (#341): it needs no value index, so the first thing a lookup touches is 1 byte of metadata per slot against this map's 5.5, which leaves L2 at a far smaller table; from 46080 entries to 460800 this map takes 1.7-2.1x boost's L3 fills per find and 14-35% more cycles under clang (0.93-1.04 under gcc), while in L2 it is compiler codegen alone (this map's cycles 0.83-0.88 of boost's under gcc, 1.22-1.25 under clang)
 
 **The robin hood index this replaced, and its dead ends**
 
@@ -5421,7 +5430,11 @@ back 20-131 MB per round. Reversing the elements is nearly all of it; reversing 
 what moves a small integer map (0.81 to 0.67 at 50000 under clang, 0.67 to 0.53 under gcc) and costs
 nothing anywhere, so C ships. The first build runs before any teardown, so the order cannot touch it,
 and at 200000 and a million it agrees within 2%; at 50000, where it is a millisecond, C reads 5-18%
-faster in every cell under both compilers, which this measurement does not explain. `resize()` to a
+faster in every cell under both compilers, which this measurement does not explain. [2026-09-28,
+#313: it does not reproduce. The same two headers re-measured read 0.4-3.0% apart at 50000, inside
+the harness's own band, and main's side is the one that moved (clang u64 0.96, not 1.16). The first
+build column of the table above is not evidence either way; see "The teardown harness ran its
+sides in a fixed order".] `resize()` to a
 smaller size and `clear()` go through the same backward loop as the destructor. Bonxai's harness
 with the change: 46k roots 342 to 230 ms against `std::unordered_map`'s 248, 787k roots 297 to 246
 against 452, reads unchanged.
@@ -6193,6 +6206,339 @@ a destructor that leaks or a swap that forgets the allocator;
 binary, against the sentinel with the vector: 1.0033 clang, 1.0066 gcc, three rounds each. The
 equivalent survivor in the mutation run over the diff: the `static_assert`'s comparison, since both
 sizes are 4.
+
+**`segmented_map` lookups against `map`, one cell per binary: a hit costs 7-15 instructions more and a miss 0.4-2.4, and of that only about 5 instructions of clang's `find` hit are avoidable -- clang splits the value index a second time for `it->second`, where gcc reuses the probe's split -- so nothing was changed** (2026-09-28, issue #312, Ryzen 9 7950X, clang 22 and gcc 16;
+`scripts/ab/find_segmented.sh`, which builds `scripts/ab/find_segmented.cpp` once per map,
+operation, mode, key type and size and counts user-space instructions and cycles around the loop
+with `perf_event_open`, 2^23 lookups in random order, `find` followed by `it->second` or
+`contains`).
+
+Instructions per lookup, `segmented_map` minus `map` (the absolute counts are in the table after):
+
+| | clang `find` | clang `contains` | gcc `find` | gcc `contains` |
+|---|---|---|---|---|
+| hit, `uint64_t` | +11.1 | +2.1 | +7.1 | +9.1 |
+| hit, `std::string` | +9.2 | +2.2 | +15.1 | +5.1 |
+| miss, either key | +1.2 | +1.2 | +1.3 | +0.4 to +2.4 |
+
+| 50000 entries, instr/op | `map` | `segmented_map` |
+|---|---|---|
+| clang `find` hit u64 / string | 43.84 / 127.85 | 54.93 / 137.05 |
+| clang `contains` hit u64 / string | 44.87 / 127.85 | 46.96 / 130.05 |
+| gcc `find` hit u64 / string | 38.92 / 103.80 | 45.97 / 118.87 |
+| gcc `contains` hit u64 / string | 37.92 / 103.80 | 46.97 / 108.94 |
+
+The counts at 1M entries differ from these by at most 3.8 instructions and the gaps by at most 2.0.
+Cycles follow the instructions in cache (clang `find` hit u64 27.9 against 31.1). At 1M,
+`segmented_map` over `map` in cycles reads 0.95 (clang `contains` string hit) to 1.25 (gcc
+`contains` u64 hit), one run each, so read no ranking from the 1M cycles.
+
+Where clang's 11 go, read from the disassembly of the `uint64_t` `find` hit (53 instructions
+against 42 per hit):
+- about 4 in the key comparison: the probe reaches the stored key through the block pointer (shift, load, mask, scale) where `map` scales once. This is what segmenting is.
+- about 5 in `it->second`: the iterator is a block-array pointer and an index, so dereferencing it splits the index again. The probe did the same split two instructions earlier, and clang does not reuse it. gcc does: its found path loads the value from the address it compared the key at.
+- about 3 in register pressure: a spilled pointer reloaded every iteration and two extra moves.
+- not the `end()` comparison, which is one `cmp` in both, and not the element multiply, a shift for the 16 byte pair.
+
+What this says and does not say: the avoidable part is clang only, `find` hits only, about 5
+instructions of 55 on an in-cache integer table, and nothing for `contains`, misses or gcc. Removing
+it needs the iterator to carry the element pointer: 16 -> 24 bytes, a block-boundary test in `++`,
+and `it + n` or `end()` must never read a block that is not allocated -- a change to what every
+iteration over a `segmented_map` runs, for a gain one compiler's `find` hit sees. Declined on that
+trade without building it; the harness is there if the Bonxai read or another caller makes the
+clang hit matter. The Bonxai read was not re-run, since nothing changed.
+
+**Small maps, two variants from #304 prototyped and measured against `main` over 20000 maps of 1 to 32 entries: no index below eight entries makes a map of up to four entries 1.06-2.3x faster to build, 1.2-2.2x faster to destroy and its lookups 1.5-3.7x faster, but puts back the empty-table test #329 took out of every lookup; a two-group minimum index helps a one- or two-entry integer map 2-28% and builds 32 entries 1.17-1.61x slower; neither was kept** (2026-09-28, issue #304, Ryzen 9 7950X, clang 22 and gcc 16; `scripts/ab/small_maps.cpp`,
+`small_maps.sh` and `small_maps_variants.py`, which writes the five headers compared; five rounds
+alternated between the variants, medians).
+
+The harness builds 20000 maps of one size, runs `count` on each map's own keys and as many it does
+not hold (50% hits, and it checks the hits), then destroys them, each phase timed and reported in ns
+per map, after an untimed pass over every size that faults the heap in. The variants:
+- `two`: the smallest index two groups (176 bytes) instead of four (352). One group needs `hash >> 64`, which is undefined, or a mask on every lookup.
+- `A8`, `A16`: no index for the first 8 or 16 values. An insert scans them with `KeyEqual` and appends; value N+1 allocates the index and places all of them. `find` tests for "no index" before hashing and scans.
+- `B8`: the same insert, and a `find` that hashes, probes the sentinel and scans only on a miss, so a hit in a large map pays nothing.
+
+They are prototypes of build, `count` and destroy only; the switch to an index hashes the inserted
+key twice, which is what the 12- to 32-entry cells of A and B pay for, and a real version would not.
+
+Ratios to `main`, build / lookup / destroy, below 1 is faster:
+
+| clang++, entries | `main` ns build / lookup / destroy | two groups | A8 | A16 | B8 |
+|---|---|---|---|---|---|
+| u64 1 | 27.5 / 9.2 / 23.1 | 0.88 / 0.79 / 0.93 | 0.44 / 0.67 / 0.48 | 0.43 / 0.55 / 0.47 | 0.45 / 0.70 / 0.48 |
+| u64 2 | 45.2 / 11.9 / 22.4 | 0.91 / 0.76 / 0.96 | 0.62 / 0.61 / 0.50 | 0.59 / 0.55 / 0.50 | 0.62 / 1.01 / 0.50 |
+| u64 4 | 70.1 / 23.7 / 22.0 | 0.96 / 0.93 / 0.97 | 0.70 / 0.68 / 0.50 | 0.69 / 0.65 / 0.50 | 0.73 / 1.14 / 0.50 |
+| u64 8 | 108.9 / 42.6 / 23.0 | 0.98 / 0.92 / 0.93 | 0.78 / 1.35 / 0.49 | 0.77 / 1.31 / 0.48 | 0.82 / 1.48 / 0.49 |
+| u64 12 | 158.1 / 56.3 / 37.4 | 1.02 / 0.96 / 1.02 | 1.99 / 1.22 / 1.87 | 0.86 / 1.94 / 0.63 | 2.00 / 1.04 / 1.75 |
+| u64 16 | 211.5 / 59.4 / 36.4 | 1.05 / 1.06 / 0.96 | 1.73 / 1.16 / 1.68 | 0.93 / 3.09 / 0.62 | 1.74 / 1.09 / 1.66 |
+| u64 32 | 404.5 / 125.5 / 59.6 | 1.61 / 1.03 / 1.19 | 1.39 / 1.16 / 1.39 | 1.52 / 1.16 / 1.53 | 1.40 / 1.09 / 1.43 |
+| string 1 | 99.8 / 60.7 / 34.5 | 0.96 / 0.90 / 0.97 | 0.79 / 0.44 / 0.64 | 0.76 / 0.43 / 0.63 | 0.79 / 0.97 / 0.64 |
+| string 2 | 226.2 / 168.1 / 43.1 | 0.96 / 0.98 / 1.02 | 0.86 / 0.29 / 0.73 | 0.84 / 0.28 / 0.74 | 0.86 / 1.00 / 0.74 |
+| string 4 | 288.3 / 224.8 / 82.5 | 1.03 / 1.00 / 1.02 | 0.92 / 0.62 / 0.84 | 0.92 / 0.61 / 0.84 | 0.92 / 1.18 / 0.85 |
+| string 8 | 535.0 / 326.0 / 143.7 | 0.99 / 0.97 / 1.00 | 0.93 / 0.82 / 0.90 | 0.93 / 0.81 / 0.90 | 0.93 / 1.48 / 0.93 |
+| string 12 | 841.8 / 399.8 / 214.5 | 0.97 / 0.97 / 1.00 | 1.27 / 1.04 / 1.14 | 0.98 / 1.11 / 0.92 | 1.29 / 1.05 / 1.14 |
+| string 16 | 1017.8 / 515.2 / 259.9 | 1.00 / 0.96 / 1.01 | 1.23 / 0.98 / 1.09 | 1.03 / 1.25 / 0.94 | 1.23 / 1.12 / 1.12 |
+| string 32 | 1811.4 / 660.0 / 590.7 | 1.18 / 1.11 / 1.24 | 1.12 / 1.03 / 0.88 | 1.23 / 1.04 / 1.10 | 1.13 / 1.08 / 0.91 |
+
+| g++, entries | `main` ns build / lookup / destroy | two groups | A8 | A16 | B8 |
+|---|---|---|---|---|---|
+| u64 1 | 25.8 / 8.9 / 23.5 | 0.88 / 0.78 / 0.91 | 0.47 / 0.57 / 0.46 | 0.47 / 0.48 / 0.47 | 0.48 / 0.75 / 0.46 |
+| u64 2 | 43.9 / 12.7 / 22.4 | 0.91 / 0.72 / 0.98 | 0.65 / 0.45 / 0.48 | 0.64 / 0.43 / 0.50 | 0.66 / 1.05 / 0.48 |
+| u64 4 | 68.8 / 22.1 / 21.6 | 0.93 / 0.94 / 1.00 | 0.74 / 0.57 / 0.50 | 0.74 / 0.57 / 0.53 | 0.75 / 1.19 / 0.50 |
+| u64 8 | 108.8 / 40.0 / 23.0 | 0.97 / 0.93 / 0.93 | 0.81 / 1.00 / 0.49 | 0.81 / 0.93 / 0.50 | 0.82 / 1.60 / 0.47 |
+| u64 12 | 158.3 / 54.8 / 39.6 | 1.01 / 0.94 / 0.98 | 1.98 / 0.93 / 1.64 | 0.90 / 1.46 / 0.60 | 2.01 / 0.97 / 1.65 |
+| u64 16 | 210.5 / 55.0 / 36.4 | 1.05 / 1.06 / 0.98 | 1.74 / 0.99 / 1.64 | 0.97 / 2.81 / 0.63 | 1.76 / 1.04 / 1.74 |
+| u64 32 | 405.7 / 117.5 / 63.0 | 1.60 / 1.03 / 1.13 | 1.38 / 0.99 / 1.32 | 1.58 / 0.99 / 1.34 | 1.39 / 1.03 / 1.38 |
+| string 1 | 97.6 / 56.8 / 35.7 | 0.95 / 0.92 / 0.95 | 0.83 / 0.46 / 0.63 | 0.85 / 0.49 / 0.62 | 0.82 / 0.91 / 0.62 |
+| string 2 | 221.8 / 156.9 / 44.7 | 0.98 / 0.98 / 0.99 | 0.87 / 0.27 / 0.71 | 0.89 / 0.29 / 0.73 | 0.89 / 1.02 / 0.72 |
+| string 4 | 281.6 / 213.4 / 83.5 | 0.94 / 0.96 / 1.00 | 0.94 / 0.56 / 0.83 | 0.93 / 0.55 / 0.82 | 0.93 / 1.03 / 0.85 |
+| string 8 | 526.1 / 297.1 / 143.0 | 0.96 / 1.00 / 1.00 | 0.93 / 0.83 / 0.91 | 0.93 / 0.86 / 0.91 | 0.94 / 1.25 / 0.93 |
+| string 12 | 810.4 / 365.5 / 212.9 | 1.01 / 1.00 / 0.99 | 1.31 / 1.01 / 1.16 | 1.03 / 1.07 / 0.93 | 1.30 / 1.00 / 1.18 |
+| string 16 | 986.6 / 450.7 / 261.4 | 1.00 / 1.01 / 1.00 | 1.24 / 1.01 / 1.09 | 1.04 / 1.31 / 0.95 | 1.29 / 1.02 / 1.11 |
+| string 32 | 1789.2 / 593.2 / 581.3 | 1.17 / 1.11 / 1.26 | 1.12 / 1.02 / 0.91 | 1.22 / 1.01 / 1.11 | 1.12 / 1.02 / 0.92 |
+
+Index bytes per map: `main` 352 from the first entry; `two` 176 up to 25 entries, then 352; A8 0 up
+to 8 entries.
+
+What this says and does not say:
+- `two` is 2-28% faster for one or two integer entries (less to allocate and zero), within 8% of `main` from 4 to 16 entries, and 1.17 (string) to 1.61 (integer) times slower to build 32 entries: every size from 26 to 51 now grows once more. Not a win.
+- B is out: a small map hashes and then scans, so its lookups are slower than `main`'s from two entries on.
+- A is the one with a real gain: up to four entries, build 0.44-0.94, destroy 0.46-0.84, lookups 0.27-0.68 (a string key is never hashed). At eight integer entries its lookups are 1.35x under clang, because a miss scans all eight, so N would be about 4.
+- Its price is on every other map: `find` has to test for "no index" before it hashes, which is the test #329 removed, measured there at 3-5% of `find`'s instructions (0.964 / 0.970 clang, 0.952 / 0.981 gcc for u64 / string). That price was not re-measured on the prototype. The score, which has no small maps, can only show the cost.
+- A full version touches every path the issue lists (about fifteen), each needing tests across the transition both ways.
+
+Declined for the default map on that trade: the large-map lookup keeps #329's gain. An opt-in small
+mode (a template option or its own alias) would not have the price, and is worth building only for a
+caller with many tiny maps and a measured need.
+
+**The teardown harness ran its sides in a fixed order, and the side that runs first in a pass reads 2-4% slower on the string first build; the 5-18% first-build gap at 50000 that #309 could not explain does not reproduce with the same two headers (0.4-3.0%), so the harness now rotates its sides** (2026-09-28, issue #313, Ryzen 9 7950X, clang 22 and gcc 16;
+`scripts/ab/teardown_order.sh ... 5 7 50000`, first builds, medians of five passes).
+
+| first build, ms | same header, fixed order: base / cand / blocksfwd | #309's pair, `7ac1e3a~1` / `7ac1e3a` | same header, rotated: base / cand / blocksfwd |
+|---|---|---|---|
+| clang u64 | 0.901 / 0.896 / 0.894 | 0.962 / 0.953 | 0.915 / 0.901 / 0.900 |
+| clang str | **3.174** / 3.117 / 3.066 | 3.138 / 3.062 | 3.074 / 3.067 / 3.076 |
+| clang owned | 3.023 / 3.008 / 3.013 | 3.043 / 3.032 | 3.010 / 3.015 / 3.006 |
+| gcc u64 | 0.866 / 0.855 / 0.857 | 0.831 / 0.817 | 0.867 / 0.855 / 0.851 |
+| gcc str | **3.170** / 3.068 / 3.060 | 3.117 / 3.027 | 3.070 / 3.074 / 3.067 |
+| gcc owned | 2.955 / 2.974 / 2.964 | 2.943 / 2.924 | 2.958 / 2.966 / 2.966 |
+
+With the same header on all three sides, the first side of every pass (`base`) read the string build
+2-4% slower under both compilers and took the outliers (3.388, 3.447). #309's two headers, measured
+the same way, read 0.4-3.0% apart, where #309 read 5-18%; and the side that moved is main's (clang
+u64 0.96 today against 1.16 then, owned 3.04 against 3.39), not #309's, which reads what it read.
+The machine state of that run is not recoverable, so what slowed main's side then is not known; a
+process left on the pinned core, which contaminated another run the same week, would do it. Rotating
+the side order per pass brings the three identical headers within 0.3% for strings and owned values
+and 1.9% for integers.
+
+What this says and does not say: nothing in #309's conclusion rested on the first build, and the
+warm-build and teardown columns are unaffected (they are 1.5-3.2x, far outside either effect). The
+first-position effect is 2-4% and shows only on the string first build here; other harnesses that
+run their variants in a fixed order within a pass may carry it too, which was not checked.
+
+**STP's parser with 4.5.0 against 5.1.0 and main, the two instances from stp#560: 5.1.0 parses 4-5% faster on both instances under both compilers, with the same instructions within 1.3%, and 8% less peak memory on the larger instance; main reads within 3.1 points of 5.1.0** (2026-09-28, issue #316, Ryzen 9 7950X, clang 22 and gcc 16; STP master 51fdb95b,
+Release, `stp --parse-only`, seven rounds with the variant order rotated per round, pinned to one
+core, `perf stat -e instructions:u,cycles:u`, medians; ranges are min-max of the seven).
+
+STP pins 4.5.0 by SHA-256 and patches it at configure time (`cmake/PrepareUnorderedDense.cmake`: a
+non-allocating same-allocator `swap`, and `stp_insertion_may_rehash()`). The 5.1.0 and main builds
+replace that generated header after configuring with the version's own header plus the same
+`stp_insertion_may_rehash()` (`bucket_count() == 0 || size() >= m_max_bucket_capacity`, the same
+growth rule in both); 5.x's own `swap` does not allocate, so the other patch has no counterpart. The
+instances come from the SMT-LIB 2025 release on Zenodo (record 16740866, `QF_BV.tar.zst`):
+`20230221-oisc-gurtner/AND-NESTED-32-32.smt2` (89 MB) and `asp/Labyrinth/laby_17_17_02.lp.smt2`
+(32 MB). stp#560's third number, ponylink's preprocessing, has no public instance and was not run.
+
+| | wall, s | ratio | instructions | ratio | cycles | ratio | peak RSS, MB |
+|---|---|---|---|---|---|---|---|
+| clang AND-NESTED, 4.5.0 | 3.86 (3.84-3.92) | 1 | 40.10 G | 1 | 16.82 G | 1 | 584 |
+| clang AND-NESTED, 5.1.0 | 3.70 (3.68-3.76) | 0.959 | 39.76 G | 0.991 | 16.14 G | 0.959 | 538 |
+| clang AND-NESTED, main | 3.75 (3.72-3.79) | 0.972 | 40.08 G | 0.999 | 16.36 G | 0.973 | 538 |
+| clang laby, 4.5.0 | 0.99 (0.98-0.99) | 1 | 8.64 G | 1 | 4.20 G | 1 | 336 |
+| clang laby, 5.1.0 | 0.95 (0.94-0.96) | 0.960 | 8.62 G | 0.997 | 4.03 G | 0.957 | 348 |
+| clang laby, main | 0.92 (0.92-0.95) | 0.929 | 8.71 G | 1.008 | 3.92 G | 0.933 | 348 |
+| gcc AND-NESTED, 4.5.0 | 3.57 (3.53-3.62) | 1 | 42.20 G | 1 | 15.52 G | 1 | 584 |
+| gcc AND-NESTED, 5.1.0 | 3.39 (3.38-3.44) | 0.950 | 42.26 G | 1.001 | 14.77 G | 0.952 | 538 |
+| gcc AND-NESTED, main | 3.42 (3.40-3.51) | 0.958 | 42.35 G | 1.003 | 14.87 G | 0.958 | 538 |
+| gcc laby, 4.5.0 | 0.97 (0.97-0.99) | 1 | 8.11 G | 1 | 4.15 G | 1 | 336 |
+| gcc laby, 5.1.0 | 0.93 (0.93-0.94) | 0.959 | 8.21 G | 1.013 | 3.96 G | 0.953 | 348 |
+| gcc laby, main | 0.94 (0.93-0.95) | 0.969 | 8.25 G | 1.017 | 3.98 G | 0.958 | 348 |
+
+Where the map is in a parse: `perf record` of the clang AND-NESTED run puts 5.5% of the self time in
+out-of-line `ankerl::` symbols with 4.5.0 and 2.9% with 5.1.0 (`std::_Hashtable` 3.8% in both;
+STP keeps some std tables). Map code inlined into STP's functions is not in those figures, so they
+are a lower bound on the map's share. The top of the profile is STP's own `isRealTerm()` and
+`GetChildren()`, 23%.
+
+What this says and does not say: in this program the gain from 5.x is cycles, not instructions --
+the same work with fewer stalls -- and it is 4-5% of a parse in which the map's visible share is a
+few percent, so most of what the map's code can give here, it gives. It does not separate the
+container from the hash-caching stp#560 did at the same time; both builds carry that. It says
+nothing about solving, only parsing (`--parse-only`, as stp#560 measured). main against 5.1.0 is
+within the rounds' spread except clang's laby (0.929 against 0.960). The larger instance's 8% less
+memory fits the index's 5.5 bytes per slot against 4.5.0's 8, which was not checked, and the
+smaller one's +3.6% was not examined.
+
+**stp#567's constant bit propagator tables re-checked on STP master: against the same four tables as std::unordered_*, 4.5.0 takes propagation to 0.912 and this repository's main to 0.859, nearly all of it on one instance (testcase15 0.74 and 0.69), and total solve time is level within 1% where #567 read -22% propagation and -4.9% total** (2026-09-28, asked alongside issue #316, Ryzen 9 7950X, clang 22; STP master
+51fdb95b, Release, `stp -s`, three rounds with the build order rotated per round, pinned to one
+core, medians; propagation time is the sum of the "After Constant Bit Propagation" phase times that
+`-s` prints).
+
+stp#567 (merged 2026-07-21 as 6b7390ff) moved the constant bit propagator's node-to-bits map, its
+worklist set and its dependents index from `std::unordered_*` to 4.5.0, reporting propagation 15.1 to
+11.8 s summed (-22%) and total solve time -4.9% on the fifteen most propagation-heavy QF_BV files of
+six families (not named individually). Master has since rewritten two of those files (#738's flat
+parent lists, #879's cost-ordered worklist), so the change no longer reverts; the `std` build here
+switches master's four tables (`NodeToFixedBitsMap`, `WorkList`'s set, `Dependencies`' index map and
+seen set) back to `std::unordered_map`/`set` with the same hashers and changes nothing else. The
+`main` build is master with this repository's header plus STP's `stp_insertion_may_rehash()`.
+
+Files: the fifteen that finish within 60 s with the most propagation time, screened with the 4.5.0
+build from `stp/testcase15`, the 66 `bmc-bv-svcomp14` files, `vlsat3`, `picorv32`, and 80 random files
+each of Sydr and catchconv (SMT-LIB 2025, Zenodo 16740866). Fourteen of the fifteen are `vlsat3`;
+the heavier `vlsat3` files do not finish in 60 s.
+
+| file | propagation ms, std / 4.5.0 / main | ratio to std | wall s, std / 4.5.0 / main |
+|---|---|---|---|
+| testcase15 | 1995 / 1471 / 1374 | 0.74 / 0.69 | 5.27 / 4.60 / 4.28 |
+| 14 vlsat3 files, each | | 0.99-1.08 / 0.94-1.02 | |
+| sum of all 15 | 5117 / 4667 / 4393 | 0.912 / 0.859 | 162.5 / 162.9 / 161.1 |
+
+Answers (sat/unsat) agree across all 135 runs. Reading master for the hazard #567 fixed -- an
+iterator or reference into the table held across an insert, which a dense map invalidates and
+`std::unordered_map` does not: `simplify_during_bb` holds `FixedBits*` since #567, the two loops over
+the whole map insert only into other maps, and every other access takes the pointer out of the
+iterator before anything inserts. Nothing found.
+
+What this says and does not say: on today's STP the tables #567 changed are a small part of solving
+on these files, and a dense map's gain there is one instance's propagation, not the solve. The file
+set is not #567's (fourteen `vlsat3` against six families), so this does not contradict #567's
+numbers on its own files at its own commit; it says the effect has not survived into master on the
+files this screen found. main is 0.941 of 4.5.0's propagation over the fifteen, consistent with the
+parser's 4-5% on #316. Not measured: gcc, and #567's own commit.
+
+**Redpanda's leader balancer benchmark (redpanda#17182) re-run standalone against main: main's `map` is 3-10% slower than 4.5.0 on the benchmark as written, whose map holds 80 keys, and 15-20% slower with one entry per raft group as in a real cluster, where it executes 20-27 more instructions per lookup; the `segmented_map` Redpanda ships is level (clang 0.917, gcc 1.042)** (2026-09-28, issue #317, Ryzen 9 7950X, clang 22 and gcc 16, abseil master;
+`scripts/ab/redpanda_lb.sh 4 30` over `redpanda_lb.cpp`, v4.5.0 against main (272e1f1), one binary per header and compiler, the
+six containers as template parameters in each, 30 rounds with the order rotated, 4 alternations of
+the binaries, medians of the alternations' medians, pinned to one core).
+
+`redpanda_lb.cpp` is `lb.random_generator` from Redpanda's `leader_balancer_bench.cc` without
+Seastar: constructing `random_reassignments` (as of redpanda#17182) from a cluster index of 72 nodes x
+16 shards x 80 groups x 3 replicas, then 184320 `generate_reassignment()` calls, each a random index
+(`uniform_int_distribution`, a 64-bit division), a swap in a 4.4 MB replica vector, and one lookup
+that hits. What differs from Redpanda's: a flat index instead of `node_hash_map<shard,
+btree_map<group, replicas>>`, `std::vector` instead of `fragmented_vector`, `std::mt19937_64`, and
+`segmented_map` on its own `segmented_vector` rather than Redpanda's `chunked_vector`. Redpanda
+pinned a fork labelled 4.4.0 that differs from v4.5.0 in 23 lines; v4.5.0 stands for it here.
+
+Redpanda's test helper numbers the groups 0..79 on every shard, so the benchmark's `_current_leaders`
+holds **80 keys** after 92160 assignments. A real cluster gives every raft group its own id, which
+`-DUNIQUE_GROUPS` does: 92160 entries.
+
+| ms, v4.5.0 / main | 80 keys, clang | 80 keys, gcc | 92160 keys, clang | 92160 keys, gcc |
+|---|---|---|---|---|
+| `std::map` | 8.861 / 8.863 | 10.256 / 10.256 | 35.25 / 35.49 | 45.72 / 46.03 |
+| `absl::flat_hash_map` | 5.828 / 5.835 | 6.712 / 6.723 | 6.562 / 6.447 | 7.494 / 7.343 |
+| `absl::node_hash_map` | 5.948 / 5.953 | 6.779 / 6.768 | 10.67 / 10.64 | 11.66 / 11.59 |
+| `absl::btree_map` | 9.950 / 9.938 | 10.120 / 10.113 | 24.20 / 24.16 | 23.39 / 23.34 |
+| `map` | **5.484** / 6.053 | **6.514** / 6.736 | **5.728** / 6.604 | **5.938** / 7.093 |
+| `segmented_map` | 6.007 / 6.283 | 6.656 / 6.760 | 7.604 / 6.973 | 7.107 / 7.408 |
+
+The four other containers are the control: they are the same code in every binary and read within
+0.2% (80 keys) and 2.0% (92160 keys) between the two.
+
+Where `map`'s time goes, `main` against 4.5.0 (`perf stat`, one container per run, instructions and
+cycles per operation; a copy that skips the loop separates the two phases):
+- 80 keys: +8 instructions per `operator[]` in construction, +19 per `generate_reassignment()`; +25% cycles and 2.3x branch misses overall.
+- 92160 keys: construction +51 (clang) / +72 (gcc) instructions and +10 / +24 cycles per fresh insert, growth included; the loop +27 / +20 instructions and +16 / +14 cycles per call. Branch misses equal.
+- The loop's hit, read in clang's disassembly: the group probe (fingerprint-word table load, broadcast, 16-byte compare, movemask, tzcnt, index load, key compare, lane loop) against 4.x's scalar compare on its first bucket, and around it the #310 spill pattern: the `end()` comparison and six of the loop's values reloaded from the stack every call, and `mt19937_64`'s tempering constants moved between registers and rematerialized. The hash is not it: the 80 keys spread 9-11 per group.
+
+What this says and does not say:
+- 4.5.0's `map` beats every container here, and the ranking Redpanda measured holds for 4.5.0 (`map` ahead of absl's two, `segmented_map` level with them). main's `map` falls to level with `absl::flat_hash_map` (ahead under gcc at 92160, behind under clang).
+- It is instructions, not memory: at 92160 entries the whole working set is about 7 MB (4.4 of it the replica vector), inside the L3, and the extra cycles are fewer than the extra instructions.
+- The caller is the one #310's corpus was built to catch -- a loop holding an RNG's state with a division and a store to a random address on the way to the next key -- and the shape search's fix (the placement out of line) does not reach a lookup: `find` has no placement, and its whole hit path is inline.
+- For Redpanda, which ships `segmented_map`, main is level at the size a cluster has (0.917 clang, 1.042 gcc).
+- Not established: which part of the +20-27 instructions is the group probe itself and which the spills. The scored benchmark, where main's hits are 1.33x faster than 4.11.0's, runs its lookups in a loop that holds little else, so the caller's shape is the likely difference, not a measured one. Not run: Redpanda's own build, and the `_frag` variants on `fragmented_vector`.
+||||||| parent of bd0aaaa (notes: #341, main's find hit in Redpanda's loop is half probe and half caller; three candidates lost, nothing changed)
+**#341, main's `find` hit against 4.5.0's in Redpanda's loop: half of the +20-27 instructions per call is the group probe itself (+11-14 in a bare loop) and half the caller around it; boost's `unordered_flat_map` runs as many instructions and 9-16% fewer cycles in that loop, and three candidates -- the walk past home out of line, no index prefetch, a speculative value prefetch from a preferred lane -- each cost cycles or did not move them, so nothing changed** (2026-09-28, issue #341, Ryzen 9 7950X, clang 22 and gcc 16, boost 1.90, abseil
+master; Redpanda's loop is `redpanda_lb.cpp` with `-DUNIQUE_GROUPS` from #317, the loop's share taken
+as a whole run minus a construction-only run, `perf stat`, 20 rounds; the bare loop is the same
+92160-entry `map<int64_t, 8 byte value>` looked up with keys drawn beforehand, 2^23 finds counted
+in-process).
+
+Per `generate_reassignment()` call (one `find` that hits, plus Redpanda's RNG and swap), and per
+bare `find`:
+
+| | Redpanda loop, clang instr / cycles | gcc | bare loop, clang | gcc |
+|---|---|---|---|---|
+| 4.5.0 | 146.3 / 108-110 | 152.3 / 121-122 | 23.3 / 12.3 | 25.3 / 13.6-13.7 |
+| main | 173.6 / 125-128 | 172.5 / 136-137 | 37.0 / 15.6-15.8 | 36.0 / 14.8-14.9 |
+| `boost::unordered_flat_map` | 178.9 / 114.4 | 159.5 / 115.3 | 36.0 / 11.7 | 39.0 / 14.3 |
+| `absl::flat_hash_map` | 177.5 / 105.7 | 192.8 / 125.1 | | |
+| A: walk past home out of line for every key | 163.6 / 128.4 | 169.0 / 134.8 | | |
+| P: no `prefetch_index` (diagnostic) | 171.1 / 126.3 | 166.5 / 133.0 | | |
+| S: speculative value prefetch | 185.6 / 126.9 | 183.0 / 139.7 | 45.0 / 17.4 | 43.0 / 17.1 |
+
+(Ranges are the same binary measured in two sessions.)
+
+The split: the bare loop puts main's own hit at +13.7 (clang) / +10.7 (gcc) instructions over 4.5.0,
+so the rest of the +27 / +20 in Redpanda's loop is the caller: the `end()` comparison and six of the
+loop's values reloaded from the stack every call, and the RNG's constants moved and rematerialized.
+main's hit is 36 instructions: the hash, the fingerprint word's table load, broadcast, `imul` by the
+88 byte block, two prefetches, the 16 byte compare, movemask, tzcnt, the index load and the key
+compare, with the counter and the walk's delta computed before the hit test although only a miss
+uses them. 4.5.0's is one scalar compare of the bucket's distance-and-fingerprint, then the key.
+
+The candidates:
+- A (`probe_past_home` for every key, not only one whose compare is a call): 10 fewer instructions under clang and 2.5 more cycles; gcc -3.5 instructions, -1 cycle.
+- P (no index prefetch): clang -2.5 instructions, cycles level; gcc -6 and -2.8 cycles. It is #250/#252's measured win on larger tables, so it is a diagnostic here, not a proposal.
+- S (each key prefers the lane its fingerprint's low four bits name, placed there when that lane is free; `probe()` reads that lane's value index and prefetches the value before the match): engaged -- 89% of hits in their preferred lane at 80 entries, 67% at 92160, 64% at 200000 -- and +8 instructions and +1.7-2.2 cycles in the bare loop, +2 (clang) and +4 (gcc) cycles in Redpanda's. The dependent load it was meant to hide is not what these loops wait on: consecutive lookups are independent, and the core already overlaps them.
+
+What this says and does not say: main's hit is more instructions than 4.5.0's, and boost's is as
+many, so the instruction count is not what separates main from boost; boost's fewer cycles at the
+same count (9-11% clang, 15-16% gcc in Redpanda's loop; 25% and 3% in the bare one) are not
+explained here. The two loops are throughput loops (their lookups do not
+depend on each other), so a latency argument does not apply to them, which is what S showed.
+Nothing in the header changed. #341 stays open for whatever explains the cycles.
+
+**Why boost's `unordered_flat_map` finds faster (#341): it needs no value index, so the first thing a lookup touches is 1 byte of metadata per slot against this map's 5.5, which leaves L2 at a far smaller table; from 46080 entries to 460800 this map takes 1.7-2.1x boost's L3 fills per find and 14-35% more cycles under clang (0.93-1.04 under gcc), while in L2 it is compiler codegen alone (this map's cycles 0.83-0.88 of boost's under gcc, 1.22-1.25 under clang)** (2026-09-28, issue #341, Ryzen 9 7950X, clang 22 and gcc 16, boost 1.90;
+`scripts/ab/lookup_fills.cpp`, `map<int64_t, 8 byte value>`, 2^23 finds of keys drawn beforehand,
+all hits, pinned to one core, `perf stat -e ls_dmnd_fills_from_sys.local_ccx,cycles:u` around the
+process, one run per cell).
+
+Top-down at 92160 entries (`perf stat -M PipelineL1,PipelineL2`, clang): this map 55.5% backend
+bound, 53.6% of it memory, against boost's 43.0% and 41.8%; bad speculation about 1% for both; L1
+misses per find 3.4 against 3.0, dTLB misses negligible for both. Demand fills per find from L2:
+1.05 against 1.13; from L3: **0.91 against 0.44**. Over the size axis:
+
+| entries | this map, clang: cycles, L3 fills | boost, clang | this map, gcc | boost, gcc |
+|---|---|---|---|---|
+| 10000 | 12.0, 0.00 | 9.8, 0.00 | 10.8, 0.00 | 13.0, 0.00 |
+| 23040 | 12.8, 0.02 | 10.2, 0.01 | 12.1, 0.02 | 13.7, 0.02 |
+| 46080 | 15.0, 0.28 | 11.7, 0.15 | 13.9, 0.32 | 14.5, 0.16 |
+| 92160 | 18.1, 0.91 | 13.4, 0.44 | 16.5, 0.90 | 16.0, 0.44 |
+| 200000 | 19.4, 1.39 | 16.1, 0.79 | 19.7, 1.39 | 19.0, 0.81 |
+| 460800 | 24.5, 1.81 | 21.5, 1.02 | 23.5, 1.81 | 25.3, 1.00 |
+| 1000000 | 50.3, 1.74 | 36.8, 1.34 | 50.0, 1.82 | 44.4, 1.30 |
+| 2000000 | 91.2, 1.38 | 72.3, 1.49 | 97.5, 1.40 | 79.8, 1.46 |
+
+Why: every lookup first reads its group's metadata. boost keeps its elements in its slot array and
+needs nothing but 16 bytes of metadata per 15 slots, so that array is about 1 byte per slot and stays
+in L2 (1 MB here) to far larger tables. This map keeps its values in one dense vector, so a group has
+to say where each of its entries lives: sixteen 4-byte indices beside the 24 bytes of fingerprints and
+counters, 88 bytes per 16 slots, 5.5 bytes per slot. The first access leaves L2 at a table about five
+times smaller, and the value access comes on top of it. Where the index goes does not remove it:
+beside the fingerprints (today) bloats the first access; in its own array (until 2026-09-06, "merged
+block") adds a third access; narrower (16-bit indices 0.986) and tiny pointers (#229, ~9% memory, no
+speed) were measured before. It is the cost of dense values: the price of fast iteration.
+
+What this says and does not say:
+- In L2 (10000 and 23040 entries) neither map takes L3 fills, and the difference is code generation: this map's cycles are 0.83-0.88 of boost's under gcc (10.8 against 13.0, 12.1 against 13.7) and 1.22-1.25 under clang (12.0 against 9.8, 12.8 against 10.2), at about the same instruction counts. Not investigated further.
+- From 46080 to 460800 entries this map takes 1.7-2.1x boost's L3 fills; in cycles it is 1.14-1.35 of boost's under clang and 0.93-1.04 under gcc, where gcc's codegen advantage offsets it. Redpanda's loop (#317) sits at 92160.
+- Past the L3 (2000000), the fills even out and both pay DRAM; this map is 1.26 (clang) and 1.22 (gcc) of boost's cycles there, not examined.
+- The scored benchmark's tables are up to 200000 entries with 50% misses; a miss reads only the metadata, which is why the group layout wins there. This is the all-hits case, one fill source per run and one run per cell.
 
 ## The robin hood index this replaced, and its dead ends
 
