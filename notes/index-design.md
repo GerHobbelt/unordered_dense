@@ -206,6 +206,10 @@ place rather than being deleted, because the retraction is usually the more usef
 - lookups are behind main
 - `ie64` ties boost while executing 58% more instructions, and the counts say why
 - The rehash pipeline below 200000 entries, where it had never been measured: it costs a gcc integer build up to 3.6% in a band, and it stays
+- `try_emplace` on a present key, attacked from the hit side: three source shapes and `flatten` on the caller, and clang's count does not come down
+- The default maximum load factor swept from 0.75 to 0.9: every step above 0.8 costs both compilers the same, and the one step below buys 0.8% for 6.7% more index
+- Tearing a segmented_map down in reverse: glibc keeps the memory for the next build instead of handing it to the kernel, warm builds 1.8-3.2x when values own heap memory
+- `try_emplace` split at the home group: the hit and the common placement inlined into the caller, the walk past home behind a call for clang only, and every scored workload at or under main's instruction count on both compilers
 
 **The robin hood index this replaced, and its dead ends**
 
@@ -5220,6 +5224,345 @@ not say what a table that churns pays, where the rehash runs over values that ar
 The `rehash(0)` column includes `clear_buckets()`'s memset in both variants, which makes the loop's
 own ratio slightly better than the column shows, not worse. Nothing here was measured above 512000
 entries; the entry above covers 2M and 4M and says the pipeline wins there by more.
+
+**`try_emplace` on a present key, attacked from the hit side: three source shapes and `flatten` on
+the caller, and clang's count does not come down** (2026-09-22, issue #305, Ryzen 9 7950X, clang 22
+and gcc 16, `scripts/ab/try_emplace_hit.{cpp,sh}`). #305 was filed on the 73.2 against 48.4
+instructions quoted in "The insert path is split in two by clang" and in `do_place_element`'s
+comment, as an untried lever. It was not untried: "And the one candidate the list suggested is dead
+too" above already moved the `always_inline` outward (variant D, identical to shipped) and put the
+placement out of line (variant C, 61% onto a gcc build), and "The one fact left standing" names the
+register allocator. The issue should have been checked against those two first. What is new here is
+a harness that counts in-process around the loop only, the shrink-wrapping question that neither
+entry asked, and `flatten`.
+
+The harness: one map and one mode per binary, `map<uint64_t, uint64_t>` and `map<std::string,
+uint64_t>` (8-40 bytes) at 50000 entries, `try_emplace` on a present key in random order (`hit`), and
+`try_emplace` of fresh keys into tables reserved for them (`miss`), 4M operations, instructions and
+cycles from `perf_event_open` around the loop, user space only. Main against itself reads identical
+instruction counts in every cell, so any difference is the header. Instructions per operation:
+
+| | clang hit u64 | clang hit str | clang miss u64 | clang miss str | gcc hit u64 | gcc hit str | gcc miss u64 | gcc miss str |
+|---|---|---|---|---|---|---|---|---|
+| main (`ad06cce`) | **72.04** | 147.11 | **95.97** | **312.89** | **45.12** | 109.10 | 77.90 | 291.67 |
+| 1: placement out of line, given only the hash | 74.04 | **140.14** | 108.03 | 334.91 | 50.15 | 113.16 | 119.91 | 327.32 |
+| 2: `always_inline` on `do_try_emplace` | 72.04 | 147.11 | 95.97 | 312.89 | 47.15 | **109.07** | **76.87** | **288.67** |
+| 3: only the hash held across the probe | 72.04 | 144.11 | 95.97 | 319.38 | 45.12 | 109.10 | 77.90 | 291.67 |
+| main, caller's loop `flatten` | 77.04 | 152.11 | | | 55.10 | 111.08 | | |
+
+**Why the prologue cannot be shrink-wrapped, from the disassembly of clang's out-of-line
+`do_try_emplace`.** A hit pays six pushes, a stack adjustment and a spill on entry and the same
+back on return, 16 of its 72 instructions. The obvious fix is to let clang's shrink-wrapping put
+those saves on the placement path only, which needs the hit path to touch no callee-saved register.
+It touches six: the hit path uses fifteen general purpose registers, all nine that x86-64 lets a
+function use without saving and six more, for the key, the hash, the home group, the group, delta,
+the mask, the group and value base pointers, the block, the lanes, the lane, the counter, `this` and
+the argument pointer. Candidate 1 takes the placement's state out of the hit path entirely and the prologue stays,
+because the probe alone is over nine. Candidate 3 hands the placement the hash instead of its three
+pieces and clang's integer counts do not move by one instruction: it had already folded the two
+shapes into one. Getting the probe under nine means reloading the mask, the bases or `this` on
+every step of every lookup, including `find`, which shares the loop.
+
+**`flatten` says the prologue is not even the cost.** With the whole chain inlined into the caller's
+loop, which is gcc's shape and the one PGO produced in the entry above, clang reads 77.04: five
+*more* than with the boundary. The pressure that the out-of-line function pays as a prologue it pays
+inside the loop once inlined. gcc inlines `try_emplace` into the loop on its own and reads 45.12 on
+identical source, and forcing it with `flatten` makes gcc worse too (55.10), because `flatten` also
+inlines the vector's growth path. So of the 27 instructions between the compilers on a hit, the call
+boundary is at most the 16 of the prologue, and what is left is the allocation of the same inlined
+body.
+
+Candidate 3's string cells are the only non-null difference and they cancel: a string hit 3.0
+instructions fewer (2.0%), a string insert 6.5 more (2.1%), gcc unmoved. Nothing kept; no header
+change.
+
+What this says and does not say: one machine, one value type, 50000 entries, all in cache, so the
+counts are the decisive number and the cycles (one run, not tabled) moved with them. It does not
+cover `operator[]` separately; it is the same `do_try_emplace`. It says nothing about MSVC. The
+standing sentence in `CLAUDE.md` is unchanged: nothing in the source has been found to steer
+clang's allocation here, and now four more shapes have been tried.
+
+**The default maximum load factor swept from 0.75 to 0.9: every step above 0.8 costs both compilers
+the same, and the one step below buys 0.8% for 6.7% more index** (2026-09-22, issue #306, Ryzen 9
+7950X, clang 22 and gcc 16, THP `madvise`, `scripts/ab/load_factor.sh`). `default_max_load_factor`
+had been 0.8 since the group index landed and nothing in this file measured another value; boost
+ships 0.875. Each value became the candidate header's default and ran against main's 0.8 with
+`run.sh -p 50 all 12`, pinned to one core. Fifty points, not five, because every maximum doubles the
+table at a different size (0.875 grows at 1793, 3585, ... where 0.8 grows at 1639, 3277, ...), so
+the two sawtooths are out of phase: "Fifty points draw the load-factor sawtooth". The first column
+of each compiler is main against itself. baseline/candidate, above 1 means the candidate is faster:
+
+| workload | clang 0.8 | clang 0.75 | clang 0.85 | clang 0.875 | clang 0.9 | gcc 0.8 | gcc 0.75 | gcc 0.85 | gcc 0.875 | gcc 0.9 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `it64` | 0.997 | 0.998 | 0.998 | 0.998 | 0.998 | 1.001 | 1.001 | 1.000 | 0.999 | 0.999 |
+| `ie64` | 0.993 | 1.012 | 0.968 | 0.945 | 0.922 | 1.000 | 1.023 | 0.977 | 0.948 | 0.922 |
+| `build64` | 0.999 | 1.012 | 0.968 | 0.937 | 0.904 | 1.001 | 1.030 | 0.944 | 0.907 | 0.859 |
+| `churn64` | 1.001 | 1.016 | 0.979 | 0.952 | 0.924 | 1.001 | 1.018 | 0.972 | 0.956 | 0.927 |
+| `find64` | 1.003 | 1.012 | 0.989 | 0.978 | 0.964 | 1.000 | 1.008 | 0.986 | 0.971 | 0.960 |
+| `itstr` | 1.000 | 1.000 | 1.000 | 1.000 | 0.999 | 1.001 | 1.001 | 0.999 | 0.999 | 0.999 |
+| `iestr` | 1.014 | 1.016 | 0.996 | 0.984 | 0.975 | 1.002 | 1.012 | 0.988 | 0.977 | 0.962 |
+| `buildstr` | 1.014 | 1.006 | 0.987 | 0.982 | 0.968 | 1.013 | 1.013 | 0.998 | 0.987 | 0.978 |
+| `churnstr` | 1.008 | 1.009 | 0.993 | 0.982 | 0.971 | 1.000 | 1.008 | 0.985 | 0.975 | 0.962 |
+| `findstr` | 1.000 | 1.002 | 0.999 | 0.994 | 0.988 | 0.999 | 1.001 | 0.998 | 0.992 | 0.987 |
+| `itbig` | 1.000 | 0.999 | 1.000 | 0.999 | 1.000 | 0.999 | 0.999 | 1.000 | 1.000 | 0.999 |
+| `iebig` | 0.994 | 1.012 | 0.971 | 0.948 | 0.925 | 1.000 | 1.019 | 0.976 | 0.952 | 0.930 |
+| `buildbig` | 0.999 | 0.998 | 0.996 | 0.989 | 0.981 | 1.000 | 0.991 | 0.996 | 1.002 | 0.998 |
+| `churnbig` | 0.997 | 1.013 | 0.973 | 0.954 | 0.930 | 1.002 | 1.005 | 0.986 | 0.975 | 0.959 |
+| `findbig` | 1.002 | 1.006 | 0.987 | 0.979 | 0.965 | 1.003 | 1.009 | 0.983 | 0.973 | 0.962 |
+| `rhit64` | 1.002 | 1.002 | 0.998 | 1.005 | 1.000 | 1.034 | 1.030 | 1.034 | 1.025 | 1.011 |
+| `rmiss64` | 0.953 | 1.019 | 0.928 | 0.908 | 0.867 | 1.004 | 1.024 | 0.970 | 0.942 | 0.929 |
+| `rhitstr` | 1.011 | 1.004 | 1.001 | 0.998 | 0.998 | 1.000 | 1.007 | 1.005 | 1.002 | 0.996 |
+| `rmissstr` | 1.010 | 1.006 | 0.989 | 0.980 | 0.973 | 1.000 | 1.006 | 0.988 | 0.978 | 0.967 |
+| `hashstr` | 0.918 | 0.924 | 1.022 | 1.020 | 1.030 | 1.001 | 1.000 | 1.000 | 1.004 | 1.001 |
+| geomean, 19 without `hashstr` | **0.9998** | **1.0074** | **0.9850** | **0.9740** | **0.9599** | **1.0031** | **1.0108** | **0.9886** | **0.9765** | **0.9628** |
+| geomean over the control | 1.0000 | 1.0076 | 0.9852 | 0.9742 | 0.9601 | 1.0000 | 1.0077 | 0.9855 | 0.9735 | 0.9598 |
+
+**Monotone, and the two compilers agree to 0.1% at every value**: over the control, 0.85 reads
+0.985 under both, 0.875 reads 0.974 and 0.974, 0.9 reads 0.960 and 0.960. About 1.3% of the geomean
+per 0.025 of maximum load, all of it on the workloads that place or miss: `build64`, `ie*`, `churn*`
+and `rmiss64` lose 5-14% at 0.9, the 50% `find*` 1-4%, all-hit `rhit*` and iteration nothing. That
+is the superlinear miss cost the fifty-point entry found at the top of each cycle, now paid over a
+longer stretch of it.
+
+**What the index saves, computed rather than measured, because it is arithmetic**: the table grows
+when `size() > floor(16 * groups * max_load_factor)` and the index is 88 bytes a group, so its bytes
+per entry over an octave follow from the maximum alone. Geometric mean over 2000 sizes across the
+octave from 2^20:
+
+| maximum load | 0.75 | 0.8 | 0.85 | 0.875 | 0.9 |
+|---|---|---|---|---|---|
+| index bytes per entry, mean | 10.37 | 9.72 | 9.15 | 8.89 | 8.64 |
+| range across the octave | 7.34-14.67 | 6.88-13.75 | 6.47-12.94 | 6.29-12.57 | 6.11-12.22 |
+| against 0.8 | 1.067 | 1 | 0.941 | 0.914 | 0.889 |
+
+For `map<uint64_t, uint64_t>` the values are 16 bytes an entry before the vector's own slack, so
+0.875's 8.6% of the index is under 3% of the map; for a 64 byte value it is under 1.5%. boost's
+0.875 would cost this map 2.6% of the score to save that.
+
+**Kept at 0.8.** 0.75 is the only value ahead, by 0.76% under clang and 0.77% under gcc, and pays
+6.7% more index for it, which is the trade #306 said not to take. Nothing changes in the header; the
+knob is `max_load_factor(float)` for a caller who weighs the two differently.
+
+What this says and does not say: the paired harness at fifty points per octave, sizes 50000 to
+200000, all in cache. Past the cache a smaller index misses less, which would move the answer
+towards a higher maximum; that is the size axis and it was not swept. The control's `rmiss64` reads
+0.953 under clang, the harness's per-build band on the miss workloads ("The paired harness has a
+systematic bias on `rmissstr`"), so a single miss cell is good to about 5%; the geomeans, and the
+agreement between compilers, are what to quote. `hashstr` is the hash alone and is left out of the
+geomean.
+
+**Tearing a segmented_map down in reverse: glibc keeps the memory for the next build instead of
+handing it to the kernel, warm builds 1.8-3.2x when values own heap memory** (2026-09-26, no issue,
+found through [facontidavide/Bonxai#69](https://github.com/facontidavide/Bonxai/pull/69); Ryzen 9 7950X, clang 22 and gcc 16, glibc 2.43, THP `madvise`,
+`scripts/ab/teardown_order.sh`, `scripts/ab/teardown_blocks_forward.patch`). `segmented_vector`
+destroyed its elements first to last and freed its blocks first to last. It now does both last to
+first, the order a built-in array uses, in one loop (`destroy_tail`) that the destructor, `clear()`
+and a shrinking `resize()` share. `map` and `set` keep `std::vector`, which libstdc++ and MSVC
+destroy front to back, and are untouched.
+
+**How it was found.** Bonxai's root map (`facontidavide/Bonxai`, `doc/root_map_benchmark.md`)
+measured `segmented_map` 1.8x slower than `std::unordered_map` to build a 46k-root voxel grid. The
+reconstruction (1M random voxels, best of 5, `std::unordered_map` swapped for the map through a
+`RootMap` alias) reproduced 1.48x, and it was entirely in the rounds after the first: in a fresh
+process `segmented_map` built in 854 ms against 884, the same 62k instructions and 10.2 page faults
+per root. In the warm rounds it took 1.8 page faults and 8800 instructions per root more. With
+`glibc.malloc.trim_threshold` and `glibc.malloc.mmap_threshold` pinned the two warm builds read 203
+and 207 ms, so it was the allocator. A `free` wrapper that logged every drop of the program break
+found one trim per teardown, set off by the free of a 104 byte Bonxai `LeafGrid`, handing back 400 MB
+under `segmented_map` and 138 MB under `std::unordered_map`, whose teardown runs in bucket order.
+Emptying the map from the back before destroying it cut the trim to 90 MB and the warm build to 229
+ms, ahead of `std::unordered_map`'s 250. Separately, Bonxai's own `std::hash<CoordT>` (OpenVDB's
+three-product XOR) gives 29226 distinct values for 46656 root keys and puts every key in one bucket
+by the top bits, which costs both maps 0.5 extra key compares a hit; that is Bonxai's to fix, and a
+murmur3-finalised pack of the three coordinates has no collisions on any lattice tried.
+
+**The measurement in this repository**: one binary per header and key kind, one process per size,
+`segmented_map` built from empty, destroyed and built again seven times, the median of three passes
+alternated with main's header. Keys are the workloads' (`workloads::key_source`). `owned` is a
+`uint64_t` key whose value owns a 96 byte allocation, Bonxai's shape reduced to the map. Times in ms;
+"released" is what the main arena shrank by at teardown (`mallinfo2().arena`). C is the change
+(elements and blocks last first), B has only the elements reversed:
+
+| compiler | kind | n | first build main / C | warm build main / C / B | teardown main / C / B | released MB main / C |
+|---|---|---|---|---|---|---|
+| clang | u64 | 50000 | 1.16 / 0.95 | 0.81 / **0.67** / 0.81 | 0.05 / **0.03** / 0.05 | 1.0 / 0.6 |
+| clang | u64 | 200000 | 4.65 / 4.36 | 3.31 / **3.32** / 3.35 | 0.15 / **0.15** / 0.15 | 2.9 / 2.9 |
+| clang | u64 | 1000000 | 31.14 / 30.98 | 24.68 / **24.37** / 24.59 | 1.43 / **1.35** / 1.41 | 23.2 / 21.9 |
+| clang | str | 50000 | 3.23 / 3.05 | 2.75 / **1.26** / 1.25 | 0.68 / **0.44** / 0.44 | 4.6 / 0.0 |
+| clang | str | 200000 | 13.67 / 13.79 | 12.45 / **5.60** / 5.58 | 3.10 / **1.92** / 1.96 | 20.0 / 0.0 |
+| clang | str | 1000000 | 85.87 / 84.59 | 79.74 / **43.70** / 43.36 | 20.45 / **13.13** / 13.14 | 105.8 / 0.0 |
+| clang | owned | 50000 | 3.39 / 3.04 | 2.27 / **0.88** / 0.87 | 0.74 / **0.51** / 0.52 | 4.4 / 0.0 |
+| clang | owned | 200000 | 13.62 / 13.79 | 12.16 / **4.22** / 4.15 | 3.59 / **2.19** / 2.18 | 23.7 / 0.0 |
+| clang | owned | 1000000 | 78.66 / 78.13 | 73.94 / **28.17** / 28.12 | 21.54 / **12.22** / 12.24 | 131.2 / 0.0 |
+| gcc | u64 | 50000 | 0.87 / 0.82 | 0.67 / **0.53** / 0.67 | 0.05 / **0.03** / 0.05 | 1.0 / 0.6 |
+| gcc | u64 | 200000 | 3.90 / 3.69 | 2.64 / **2.64** / 2.62 | 0.15 / **0.15** / 0.15 | 2.9 / 2.9 |
+| gcc | u64 | 1000000 | 26.93 / 26.38 | 20.28 / **19.81** / 20.25 | 1.44 / **1.36** / 1.41 | 23.2 / 21.9 |
+| gcc | str | 50000 | 3.21 / 3.00 | 2.73 / **1.24** / 1.24 | 0.68 / **0.46** / 0.44 | 4.6 / 0.0 |
+| gcc | str | 200000 | 13.54 / 13.62 | 12.33 / **5.46** / 5.46 | 3.06 / **1.90** / 1.94 | 20.0 / 0.0 |
+| gcc | str | 1000000 | 85.30 / 84.64 | 79.13 / **42.56** / 43.05 | 20.73 / **13.25** / 13.25 | 105.8 / 0.0 |
+| gcc | owned | 50000 | 3.29 / 2.94 | 2.19 / **0.78** / 0.80 | 0.76 / **0.51** / 0.51 | 4.4 / 0.0 |
+| gcc | owned | 200000 | 13.43 / 13.21 | 11.73 / **3.62** / 3.62 | 3.54 / **2.19** / 2.10 | 23.7 / 0.0 |
+| gcc | owned | 1000000 | 76.53 / 76.01 | 71.55 / **24.66** / 25.13 | 21.53 / **11.91** / 11.82 | 131.2 / 0.0 |
+
+Warm builds 1.8-2.3x faster for string keys and 2.6-3.2x for owning values, teardown 1.5-1.8x for
+both, integers level from 200000 up. The teardown is faster because main's included the kernel taking
+back 20-131 MB per round. Reversing the elements is nearly all of it; reversing the blocks as well is
+what moves a small integer map (0.81 to 0.67 at 50000 under clang, 0.67 to 0.53 under gcc) and costs
+nothing anywhere, so C ships. The first build runs before any teardown, so the order cannot touch it,
+and at 200000 and a million it agrees within 2%; at 50000, where it is a millisecond, C reads 5-18%
+faster in every cell under both compilers, which this measurement does not explain. `resize()` to a
+smaller size and `clear()` go through the same backward loop as the destructor. Bonxai's harness
+with the change: 46k roots 342 to 230 ms against `std::unordered_map`'s 248, 787k roots 297 to 246
+against 452, reads unchanged.
+
+**The price, measured**: resident memory after destroying a million-entry `segmented_map<std::string,
+uint64_t>`, above the keys it was built from: main 114 MB built, 0 after the teardown; C 114 built,
+**114 after the teardown**, 0 after `malloc_trim(0)`. The memory is in malloc's free lists and the
+next allocation of the process reuses it, which is the whole speedup, but a caller watching RSS after
+a teardown sees it stay. `std::unordered_map` does the same (137 MB built, 137 after, 0 after
+`malloc_trim(0)`); `map` returns it all, since its values are one `std::vector` block.
+
+What this says and does not say: glibc 2.43 only; jemalloc, tcmalloc and mimalloc were not run, and
+their trim policies differ. The mechanism is the order of frees against glibc's heap trim, which
+fires on a free whose coalesced chunk reaches 64 KB and returns whatever lies above the last live
+chunk: freed last first, small chunks near the top of the heap go to tcache and the fastbins first
+and are not coalesced into the top, so the later large frees find no top to trim. That explanation is
+read from the counters and the trim log, not from glibc's source. Nothing here touches the score,
+which has no segmented workload.
+
+**`try_emplace` split at the home group: the hit and the common placement inlined into the caller,
+the walk past home behind a call for clang only, and every scored workload at or under main's
+instruction count on both compilers** (2026-09-26, issue #321, Ryzen 9 7950X, clang 22 and gcc 16,
+`scripts/ab/try_emplace_hit.{cpp,sh}`, `scripts/ab/solo.sh`, `scripts/ab/perwl.sh`). #321 was
+filed on 5.1.0 being slower than 4.4.0 in MySQL's `EXCEPT` and on the 72 instructions a clang hit
+takes against gcc's 45, which the entry on the hit side above had put down to the register
+allocator. That entry was right that no source shape moves the out-of-line function; what it did
+not try was making the hit stop being in that function. `do_try_emplace` is now forced inline and
+does three things before anything else is called: the home group's fingerprint match (a hit returns
+there), `allocate_buckets_if_none()`, and a look at the home group's overflow counter for the key's
+class, which when zero proves the key is nowhere else and places it in home. Only a key whose class
+has overflowed home reaches `try_emplace_far`, which walks with `probe_after_home` and `move_home`s
+a hit, as before.
+
+Three supporting changes, each found by a variant that lost without it:
+
+- `append_value()`, the value container's `emplace_back` under `always_inline` + `flatten`. With the
+  insert inlined into a large caller, gcc runs out of inlining budget at `emplace_back`, calls it,
+  and a map held as a local of the caller (scalar-replaced into nine fields) is stored to the
+  stack and reloaded around every call. That was a 45% slower u64 build in the score binary (V10).
+- `increase_size()` and `fill_buckets_from_values()` `noinline`: both run once per doubling, and
+  inlined into every insert site they cost gcc's loop. Each taken back out of V16 on its own (V17a,
+  V17b), gcc's u64 build goes from 0.992 of main's instructions to 1.025 and 1.050, and without the
+  first the big-value `random insert erase` goes 0.827 -> 0.859. clang's counts do not move.
+- the walk past home, `try_emplace_far`: `noinline` under clang, `always_inline` under gcc
+  (`ANKERL_UNORDERED_DENSE_TRY_EMPLACE_FAR`). Out of line, gcc takes 11% more cycles on every insert
+  of a fresh key, not only the ones that walk (V11 against V12). Inlined, clang retires 8% more
+  instructions building a `map<uint64_t, big_value>` (V15 against V14).
+
+**One map per binary, instructions per operation** (cycles in parentheses, one run each; V1-V13 in
+one pass, V14-V16 in a second, which instruction counts do not care about). Hit = `try_emplace` on a
+present key, miss = fresh keys into a reserved table, 50000 entries.
+
+| | clang hit u64 | clang hit str | clang miss u64 | clang miss str | gcc hit u64 | gcc hit str | gcc miss u64 | gcc miss str |
+|---|---|---|---|---|---|---|---|---|
+| main | 72.0 (31.9) | 147.1 (107.2) | 96.0 (38.8) | 312.9 (130.2) | 45.1 (24.0) | 109.1 (90.7) | 77.9 (30.5) | 291.7 (121.2) |
+| V1: home hit inline, rest `noinline` | 44.0 (23.3) | 125.3 (89.3) | 108.0 (43.1) | 323.9 (132.9) | 42.4 (22.2) | 106.2 (83.2) | 115.8 (42.7) | 332.7 (136.9) |
+| V2: rest left to the compiler | 44.0 (22.6) | 125.3 (89.2) | 108.0 (42.5) | 323.9 (132.7) | 42.5 (23.7) | 108.3 (87.8) | 85.0 (33.4) | 302.2 (119.0) |
+| V3: V2 + hash pieces passed on | 46.1 (23.0) | 126.4 (91.9) | 106.0 (41.6) | 324.9 (134.8) | 42.3 (24.1) | 107.2 (87.3) | 80.0 (33.5) | 304.7 (120.4) |
+| V4: `try_emplace`/`operator[]` `always_inline`, rest `noinline` | 45.1 (22.9) | 104.6 (86.9) | 106.0 (41.2) | 324.8 (135.8) | 43.4 (22.9) | 112.2 (86.3) | 113.9 (42.6) | 332.3 (136.3) |
+| V5: V4 + `increase_size` `noinline` | 45.1 (23.0) | 104.6 (86.6) | 106.0 (42.4) | 324.8 (134.8) | 43.4 (23.1) | 112.2 (86.4) | 104.9 (39.4) | 331.1 (134.6) |
+| V7: V5, rest `always_inline` under gcc | 45.1 (23.1) | 104.6 (87.0) | 106.0 (41.6) | 324.8 (134.9) | 44.4 (23.3) | 110.2 (85.5) | 76.0 (29.9) | 295.3 (113.6) |
+| V8: V7 without `increase_size` `noinline` | 45.1 (22.8) | 104.6 (87.4) | 106.0 (41.6) | 324.8 (133.5) | 42.3 (24.0) | 109.2 (88.4) | 78.0 (31.9) | 300.8 (116.8) |
+| V9: V7 + `fill_buckets_from_values` `noinline` | 45.1 (23.3) | 104.6 (86.7) | 106.0 (40.9) | 324.8 (133.0) | 44.4 (23.6) | 110.2 (84.6) | 76.0 (30.4) | 295.3 (119.8) |
+| V10: V9, counter-zero placement inline, walk `noinline` | 45.8 (23.2) | 105.2 (86.6) | 101.1 (38.0) | 319.9 (133.4) | 45.7 (24.2) | 116.4 (87.1) | 79.2 (34.6) | 295.9 (121.4) |
+| V11: V10 + `append_value` `flatten` | 45.8 (23.8) | 105.2 (86.5) | 101.1 (39.7) | 319.9 (134.4) | 46.6 (23.8) | 118.3 (87.2) | 82.0 (33.2) | 296.0 (120.2) |
+| V12: V11, walk `always_inline` under gcc | 45.8 (23.5) | 105.2 (86.9) | 101.1 (39.2) | 319.9 (134.0) | 44.4 (24.2) | 111.2 (85.6) | 74.0 (29.8) | 293.8 (113.5) |
+| V13: V12, `flatten` only when size != capacity | 45.8 (23.4) | 105.2 (86.8) | 117.1 (40.2) | 323.4 (133.4) | 45.4 (24.0) | 112.2 (84.3) | 81.0 (35.4) | 295.7 (122.3) |
+| V14: V12, placement inline under clang too | 49.5 (24.8) | 111.7 (88.6) | 85.2 (36.9) | 303.7 (134.2) | = V12 | | | |
+| V15: V14, walk inline under clang too | 50.8 (25.4) | 109.9 (86.6) | 82.1 (35.0) | 301.6 (124.6) | = V12 | | | |
+| **V16 = V14 folded, shipped** | **49.5 (24.9)** | **111.7 (87.1)** | **84.2 (35.1)** | **303.7 (124.4)** | **44.4 (23.7)** | **111.2 (85.7)** | **74.0 (29.7)** | **293.8 (113.9)** |
+
+V1-V9 fix the clang hit and pay for it in gcc's miss (V1 and V4: +40% cycles) or in clang's miss
+(+10-13% instructions): a call to the placement costs both compilers more than the prologue it saves.
+Every variant up to V12 left clang's miss above main. V14 is the first that is under main in seven of
+the eight cells on instructions, because the placement no longer sits behind a call either; the
+eighth, gcc's string hit, is +1.9% on instructions and -5.5% on cycles.
+V18a, from `/simplify`: the hit branch already relies on a table with values having buckets, so
+the miss's `allocate_buckets_if_none()` moves into the `else` and a miss tests emptiness once. One
+map: gcc miss 73.96 -> 68.96 / 293.8 -> 287.3, clang miss 84.2 -> 81.2 / 303.7 -> 294.0, clang u64
+hit 49.5 -> 51.3; score against V16 inside the band on time and 0.984-1.003 on instructions per
+workload (builds -1.2 to -1.6% on both compilers). Kept. V18b, the same review's other find --
+clang's out-of-line walk calling `probe_from` directly instead of `probe_after_home`, which re-tests
+the counter its caller just tested and, for a string key, makes a second call -- saved at most one
+instruction a hit and would copy the walk's termination test under a compiler `#if`; dropped.
+V13 tried to stop `flatten` pulling the vector's growth path into every insert site by testing
+`size() != capacity()` first: the extra compare costs gcc 19% cycles on the u64 miss and the code
+was no smaller, so dropped.
+
+**The score, one header per binary** (`solo.sh`, five alternated rounds, then `perwl.sh`):
+
+| | clang | gcc |
+|---|---|---|
+| V7 | 0.9948 | 0.9841 |
+| V9 | | 0.9898 |
+| V10 | | 1.0159 (u64 build +45% time) |
+| V11 | 1.0023 | 1.0693 |
+| V12 | = V11 | 1.0820 |
+| V14 | 1.0219 | = V12 |
+| V15 | 1.0185 | = V12 |
+| V16 | = V14 | 1.0767 (per-workload counts identical to V12) |
+| V17a: V16, `increase_size` inlinable | not run (one-map counts identical to V16) | 1.0726 |
+| V17b: V16, `fill_buckets_from_values` inlinable | not run (one-map counts identical to V16) | 1.0728 |
+| V18a: V16, `allocate_buckets_if_none()` only on the empty branch, against V16 | 0.9967 | 1.0004 |
+
+V14's per-workload instruction ratios under clang are all at or under 1.000: `random insert erase`
+0.873 / 0.942 / 0.880 (u64 / string / big value), `build` 0.928 / 0.974 / 0.921, `churn` 0.979 /
+0.987 / 0.988, `iterate` and `find` 0.999-1.000. gcc's (V12) likewise: `random insert erase` 0.956
+/ 0.942 / 0.827, `build` 0.992 / 0.893 / 0.792, `churn` 0.879 / 0.900 / 0.826, `find` 0.999 / 0.974
+/ 0.999. V11 had clang's u64 build at 1.051 and churn at 1.060 / 1.010 / 1.073 over main.
+
+**Scenario matrix** (one map per binary, the same harness with `segmented_map`, a 64-byte value, a
+transparent string hash, and `-O2`): V14 is under main in every clang cell on both instructions and
+cycles, `segmented_map` u64 hit 91.2 -> 61.8, `-O2` u64 miss 127.0 -> 85.2. Under gcc (V12) three
+cells are above main on instructions, none by more than 1.3% (big-value miss 81.9 -> 83.0,
+`segmented_map` string miss 301.5 -> 303.0, transparent hit 106.2 -> 106.4), and one on cycles: the
+big-value hit, 24.5 -> 25.4 (+3.7%) on 1.5% fewer instructions, which V11 read at +5.8%.
+
+**ClickHouse's aggregation benchmark** (`hash-table-aggregation-benchmark`, 100M rows per column,
+`perf stat` cycles per row median of 3-5, 5.1.0 -> V14/V16):
+
+| column | clang | gcc |
+|---|---|---|
+| CounterID | -15.6% | -6.6% |
+| AdvEngineID | -19.4% | -7.5% |
+| RegionID | -13.5% | -9.9% |
+| TraficSourceID | -18.4% | -6.8% |
+| UserID | -9.0% | -2.8% |
+| WatchID | -11.1% | -3.9% |
+
+The four small columns are almost all hits; V12 (the placement still behind a call under clang)
+read them 1-3 points better and WatchID, mostly misses, 8 points worse (-3.2%).
+
+**MySQL 9.7.2** (gcc, `hash join` / `INTERSECT` / `EXCEPT` on a million rows, median of three rotated
+rounds, seconds, 4.4.0 / 5.1.0 / V12): string join 0.637 / 0.590 / 0.606, int join 8.097 / 7.826 /
+7.911, INTERSECT 1.593 / 1.550 / 1.550, EXCEPT 0.252 / 0.269 / 0.260. V11 in the same harness, an
+earlier run: 0.593, 7.849, 1.535, 0.262 against 5.1.0's 0.595, 7.868, 1.542, 0.272. MySQL's hash join
+calls only `emplace` and `find`, and `hash_join_buffer.cc` compiles to byte-identical code under V11
+and V12, so the joins' 0.593 against 0.606 is this harness's run-to-run spread (about 2%), not the
+change. `EXCEPT` recovers half of #321's gap to 4.4.0 in both runs.
+
+**Code size.** `flatten` inlines the vector's growth path (`_M_realloc_append`) into every insert
+site. In the score binary, which holds more insert sites than any caller will, gcc's `.text` goes
+8.73 -> 12.72 MB (+46%; `flatten` +1.95 MB, the inlined walk +0.96 MB) and clang's 6.09 -> 6.93 MB
+(+14%). A caller's binary with one map moves by less than two kilobytes: the one-map harness's
+`.text` is 5531 -> 7244 / 10946 -> 11618 / 14597 -> 15480 bytes under clang (u64 hit, u64 miss,
+string miss) and 7731 -> 7573 / 9411 -> 8789 / 13953 -> 14465 under gcc.
+
+What this says and does not say: one machine, in cache (50000 entries one-map, the score's sizes);
+the counts are the decisive numbers. MSVC takes the gcc branch of the macro and gets no `flatten`,
+and has not been measured. The compiler split is a measured choice per compiler, not a principle:
+a third compiler, or a future clang or gcc, may want the other shape, and the one-map harness and
+`solo.sh` are what would tell.
 
 ## The robin hood index this replaced, and its dead ends
 

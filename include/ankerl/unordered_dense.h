@@ -1,7 +1,7 @@
 ///////////////////////// ankerl::unordered_dense::{map, set} /////////////////////////
 
 // A fast & densely stored hashmap and hashset.
-// Version 5.0.1
+// Version 5.1.0
 // https://github.com/martinus/unordered_dense
 //
 // Licensed under the MIT License <http://opensource.org/licenses/MIT>.
@@ -31,8 +31,8 @@
 
 // see https://semver.org/spec/v2.0.0.html
 #define ANKERL_UNORDERED_DENSE_VERSION_MAJOR 5 // NOLINT(cppcoreguidelines-macro-usage) incompatible API changes
-#define ANKERL_UNORDERED_DENSE_VERSION_MINOR 0 // NOLINT(cppcoreguidelines-macro-usage) backwards compatible functionality
-#define ANKERL_UNORDERED_DENSE_VERSION_PATCH 1 // NOLINT(cppcoreguidelines-macro-usage) backwards compatible bug fixes
+#define ANKERL_UNORDERED_DENSE_VERSION_MINOR 1 // NOLINT(cppcoreguidelines-macro-usage) backwards compatible functionality
+#define ANKERL_UNORDERED_DENSE_VERSION_PATCH 0 // NOLINT(cppcoreguidelines-macro-usage) backwards compatible bug fixes
 
 // API versioning with inline namespace, see https://www.foonathan.net/2018/11/inline-namespaces/
 
@@ -67,9 +67,21 @@
 #ifdef _MSC_VER
 #    define ANKERL_UNORDERED_DENSE_NOINLINE __declspec(noinline)
 #    define ANKERL_UNORDERED_DENSE_FORCEINLINE __forceinline
+#    define ANKERL_UNORDERED_DENSE_FLATTEN
 #else
 #    define ANKERL_UNORDERED_DENSE_NOINLINE __attribute__((noinline))
 #    define ANKERL_UNORDERED_DENSE_FORCEINLINE inline __attribute__((always_inline))
+#    define ANKERL_UNORDERED_DENSE_FLATTEN __attribute__((flatten))
+#endif
+
+// try_emplace's walk past the home group (#321), which only a key whose fingerprint class has
+// overflowed home takes. Each compiler gets the shape the other one loses with: inlined, clang
+// retires 8% more instructions building a map of large values; called, gcc takes 11% more cycles
+// per insert of a fresh key, whether or not the insert walks.
+#if defined(__clang__)
+#    define ANKERL_UNORDERED_DENSE_TRY_EMPLACE_FAR ANKERL_UNORDERED_DENSE_NOINLINE
+#else
+#    define ANKERL_UNORDERED_DENSE_TRY_EMPLACE_FAR ANKERL_UNORDERED_DENSE_FORCEINLINE
 #endif
 
 // Data prefetch hint, a no-op where there is nothing to spell it with. MSVC has no
@@ -1117,10 +1129,11 @@ private:
         }
     }
 
+    // Last block first, like destroy_tail() below.
     void dealloc() {
         auto ba = Allocator(m_blocks.get_allocator());
-        for (auto ptr : m_blocks) {
-            std::allocator_traits<Allocator>::deallocate(ba, ptr, num_elements_in_block);
+        for (auto it = m_blocks.rbegin(); it != m_blocks.rend(); ++it) {
+            std::allocator_traits<Allocator>::deallocate(ba, *it, num_elements_in_block);
         }
     }
 
@@ -1128,10 +1141,18 @@ private:
         return (capacity + num_elements_in_block - 1U) / num_elements_in_block;
     }
 
-    void resize_shrink(std::size_t new_size) {
+    // Destroys the elements from new_size on, last first, and dealloc() frees the last block first:
+    // everything goes in the reverse of the order it was made, as a built-in array does. The order is
+    // the allocator's to benefit from. With glibc, a map whose values own heap memory and is freed
+    // front first hands that memory back to the kernel as it goes, and the next build in the same
+    // process faults all of it in again; freed last first, it stays in malloc's free lists for that
+    // build to reuse. The price is that a destroyed container's memory stays resident until it is
+    // reused or malloc_trim() is called, which std::unordered_map shares. notes/index-design.md,
+    // "Tearing a segmented_map down in reverse".
+    void destroy_tail(std::size_t new_size) {
         if constexpr (!std::is_trivially_destructible_v<T>) {
-            for (std::size_t ix = new_size; ix < m_size; ++ix) {
-                operator[](ix).~T();
+            for (auto i = m_size; i != new_size; --i) {
+                operator[](i - 1).~T();
             }
         }
         m_size = new_size;
@@ -1285,7 +1306,7 @@ public:
 
     void resize(std::size_t const count) {
         if (count < m_size) {
-            resize_shrink(count);
+            destroy_tail(count);
         } else if (count > m_size) {
             std::size_t const new_elems = count - m_size;
             reserve(count);
@@ -1297,7 +1318,7 @@ public:
 
     void resize(std::size_t const count, value_type const& value) {
         if (count < m_size) {
-            resize_shrink(count);
+            destroy_tail(count);
         } else if (count > m_size) {
             std::size_t const new_elems = count - m_size;
             reserve(count);
@@ -1339,12 +1360,7 @@ public:
     }
 
     void clear() {
-        if constexpr (!std::is_trivially_destructible_v<T>) {
-            for (std::size_t i = 0, s = size(); i < s; ++i) {
-                operator[](i).~T();
-            }
-        }
-        m_size = 0;
+        destroy_tail(0);
     }
 
     void shrink_to_fit() {
@@ -1894,8 +1910,8 @@ private:
     }
 
     // What happens once the home group has been looked at and did not hold the key: whether it is
-    // worth walking on at all, and the walk. Shared by probe() and by the bulk visit, so that the
-    // probe's termination invariant is written once -- it was copied into the second of those, and
+    // worth walking on at all, and the walk. Shared by probe(), try_emplace_far and the bulk visit, so
+    // that the probe's termination invariant is written once -- it was copied into the bulk visit, and
     // a copy of an invariant is silent when it drifts, because the result is a wrong answer and not
     // a crash.
     //
@@ -1920,12 +1936,6 @@ private:
             // one.
             return probe_from(key, word, counter, next, delta);
         }
-    }
-
-    template <typename K>
-    ANKERL_UNORDERED_DENSE_FORCEINLINE auto probe(K const& key, std::uint64_t mh) const -> probe_result {
-        auto const word = fingerprint_word(mh);
-        return probe(key, word, word & 7U, group_idx_from_hash(mh));
     }
 
     // The probe for a caller that is holding the home group already -- a pipelined insert formed it
@@ -1954,12 +1964,11 @@ private:
         return probe_after_home(key, word, counter, home, home_idx);
     }
 
-    // The same probe for a caller that has already taken the hash apart. A pipelined insert has all
-    // three in hand -- it derived the group to prefetch it -- and re-deriving them per element is a
-    // table load, an and and a shift on the hot path of a loop that is doing nothing else.
     template <typename K>
-    ANKERL_UNORDERED_DENSE_FORCEINLINE auto
-    probe(K const& key, std::uint32_t word, unsigned counter, value_idx_type home_idx) const -> probe_result {
+    ANKERL_UNORDERED_DENSE_FORCEINLINE auto probe(K const& key, std::uint64_t mh) const -> probe_result {
+        auto const word = fingerprint_word(mh);
+        auto const counter = word & 7U;
+        auto const home_idx = group_idx_from_hash(mh);
         if constexpr (!detail::key_compare_is_call_v<Key>) {
             return probe_from(key, word, counter, home_idx, 0);
         } else {
@@ -2385,9 +2394,9 @@ private:
     // constructed table does not allocate. Every path that probes the buckets either returns early
     // while the table is empty (do_find and do_find_hashed's callers, do_erase_key), or needs an
     // iterator into m_values and so
-    // cannot be reached in this state (erase, extract, replace_key), or calls this first -- which
-    // is the four insert entry points, the only ones that reach the buckets without a prior
-    // emptiness check.
+    // cannot be reached in this state (erase, extract, replace_key), or calls this before it
+    // reaches them -- which is the insert entry points; do_try_emplace looks at the home group
+    // first, behind its own emptiness check.
     void allocate_buckets_if_none() {
         if (ANKERL_UNORDERED_DENSE_UNLIKELY(m_buckets.empty()))
             ANKERL_UNORDERED_DENSE_UNLIKELY_ATTR {
@@ -2409,7 +2418,7 @@ private:
     }
 
     // Into an index just allocated, so already empty.
-    void fill_buckets_from_values() {
+    ANKERL_UNORDERED_DENSE_NOINLINE void fill_buckets_from_values() {
         // Walked with an iterator rather than indexed with m_values[i], which is not a style
         // choice: placing an entry stores a fingerprint, a std::uint8_t store may alias any object
         // at all, and the container's own data pointer is such an object -- so after every
@@ -2494,7 +2503,7 @@ private:
         }
     }
 
-    void increase_size() {
+    ANKERL_UNORDERED_DENSE_NOINLINE void increase_size() {
         if (m_max_bucket_capacity == max_bucket_count()) {
             // remove the value again, we can't add it!
             m_values.pop_back();
@@ -2589,7 +2598,7 @@ private:
     }
 
     // Appends the value and points a slot at it. What it needs to know is where the key belongs;
-    // place_element below takes that from the probe that just missed, rather than deriving it
+    // place_element_at below takes that from the probe that just missed, rather than deriving it
     // again.
     //
     // Forced inline, and the reason is a trade worth knowing. clang prices this function at 480
@@ -2615,13 +2624,22 @@ private:
     // So the rule this leaves is narrower than "one header per binary": the *size* of the
     // translation unit decides what an always_inline is worth, a benchmark binary is the largest
     // unit anyone compiles this into, and an instruction count is the only number in the argument
-    // that none of that moves. What the attribute costs is real and stays true -- operator[] on a
-    // key already present pays for the placement code's register pressure on a path that never
-    // places (clang 73.2 instructions against 48.4) -- it is simply smaller than 17% of a build.
+    // that none of that moves. What the attribute cost was real -- operator[] on a key already
+    // present paid for the placement code's register pressure on a path that never places (clang
+    // 73.2 instructions against 48.4) -- and was smaller than 17% of a build. do_try_emplace now
+    // returns a hit in the home group before any of it (#321).
     template <typename... Args>
     ANKERL_UNORDERED_DENSE_FORCEINLINE auto do_place_element(std::uint64_t mh, Args&&... args) -> std::pair<iterator, bool> {
         auto const word = fingerprint_word(mh);
         return place_element_at(word, word & 7U, group_idx_from_hash(mh), std::forward<Args>(args)...);
+    }
+
+    // The value container's emplace_back, inlined whatever the caller's inlining budget: gcc runs
+    // out of it in a large insert loop and calls emplace_back out of line, and a map that is a local
+    // of the caller is then written to the stack and read back around every call (#321).
+    template <typename... Args>
+    ANKERL_UNORDERED_DENSE_FORCEINLINE ANKERL_UNORDERED_DENSE_FLATTEN void append_value(Args&&... args) {
+        m_values.emplace_back(std::forward<Args>(args)...);
     }
 
     // As above for a caller holding the hash in pieces. The home group is only used on the branch
@@ -2632,7 +2650,7 @@ private:
     place_element_at(std::uint32_t word, unsigned counter, value_idx_type home_idx, Args&&... args)
         -> std::pair<iterator, bool> {
         // emplace the new value. If that throws an exception, no harm done; index is still in a valid state
-        m_values.emplace_back(std::forward<Args>(args)...);
+        append_value(std::forward<Args>(args)...);
 
         auto value_idx = static_cast<value_idx_type>(m_values.size() - 1);
         if (ANKERL_UNORDERED_DENSE_UNLIKELY(is_full()))
@@ -3001,20 +3019,62 @@ private:
         source.drop_tail_and_reindex(static_cast<std::size_t>(write - first));
     }
 
+    // Forced inline into the caller with its common cases: a hit in the home group, and a miss whose
+    // fingerprint class never overflowed home, placed there. Everything else is try_emplace_far's.
+    // Without the attribute clang called the whole of it, and a hit paid the placement's six
+    // register prologue (#305, #321).
     template <typename K, typename... Args>
-    auto do_try_emplace(K&& key, Args&&... args) -> std::pair<iterator, bool> {
-        allocate_buckets_if_none();
+    ANKERL_UNORDERED_DENSE_FORCEINLINE auto do_try_emplace(K&& key, Args&&... args) -> std::pair<iterator, bool> {
         auto const mh = mixed_hash(key);
         // Taken apart once for both halves: a probe that misses is followed by a placement starting
         // from the same group with the same fingerprint.
         auto const word = fingerprint_word(mh);
-        auto const counter = word & 7U;
         auto const home_idx = group_idx_from_hash(mh);
-        auto r = probe(key, word, counter, home_idx);
+        if (ANKERL_UNORDERED_DENSE_LIKELY(!empty())) {
+            // probe()'s home group, without the probe_result: returning one cost gcc a quarter of an
+            // integer hit (see probe_from).
+            auto const* groups = m_buckets.data();
+            prefetch_index(groups, home_idx);
+            auto const& home = groups[home_idx];
+            auto lanes = match_fingerprint(home, word);
+            while (lanes != 0) {
+                auto const value_idx = home.m_index[first_lane(lanes)];
+                if (m_equal(key, get_key(m_values[value_idx]))) {
+                    return {begin() + static_cast<difference_type>(value_idx), false};
+                }
+                lanes &= lanes - 1;
+            }
+        } else {
+            // A table with values has buckets; one without may not (never grown) or may (cleared). The
+            // home group of an empty table holds nothing, and m_shifts does not change when the first
+            // bucket array is allocated, so home_idx stays right across this.
+            allocate_buckets_if_none();
+        }
+        auto const counter = word & 7U;
+        if (ANKERL_UNORDERED_DENSE_LIKELY(m_buckets.data()[home_idx].m_overflows[counter] == 0)) {
+            return place_new_key(word, counter, home_idx, std::forward<K>(key), std::forward<Args>(args)...);
+        }
+        return try_emplace_far(mh, word, home_idx, std::forward<K>(key), std::forward<Args>(args)...);
+    }
+
+    // The key may have been placed past its home group: walk on, and place it if it is not there.
+    template <typename K, typename... Args>
+    ANKERL_UNORDERED_DENSE_TRY_EMPLACE_FAR auto
+    try_emplace_far(std::uint64_t mh, std::uint32_t word, value_idx_type home_idx, K&& key, Args&&... args)
+        -> std::pair<iterator, bool> {
+        auto const counter = word & 7U;
+        auto r = probe_after_home(key, word, counter, m_buckets.data()[home_idx], home_idx);
         if (r.found) {
             move_home(r.group_idx, r.lane, mh);
             return {begin() + static_cast<difference_type>(r.value_idx), false};
         }
+        return place_new_key(word, counter, home_idx, std::forward<K>(key), std::forward<Args>(args)...);
+    }
+
+    template <typename K, typename... Args>
+    ANKERL_UNORDERED_DENSE_FORCEINLINE auto
+    place_new_key(std::uint32_t word, unsigned counter, value_idx_type home_idx, K&& key, Args&&... args)
+        -> std::pair<iterator, bool> {
         return place_element_at(word,
                                 counter,
                                 home_idx,
@@ -3636,22 +3696,22 @@ public:
     }
 
     template <class... Args, typename Q = T, std::enable_if_t<is_map_v<Q>, bool> = true>
-    auto try_emplace(Key const& key, Args&&... args) -> std::pair<iterator, bool> {
+    ANKERL_UNORDERED_DENSE_FORCEINLINE auto try_emplace(Key const& key, Args&&... args) -> std::pair<iterator, bool> {
         return do_try_emplace(key, std::forward<Args>(args)...);
     }
 
     template <class... Args, typename Q = T, std::enable_if_t<is_map_v<Q>, bool> = true>
-    auto try_emplace(Key&& key, Args&&... args) -> std::pair<iterator, bool> {
+    ANKERL_UNORDERED_DENSE_FORCEINLINE auto try_emplace(Key&& key, Args&&... args) -> std::pair<iterator, bool> {
         return do_try_emplace(std::move(key), std::forward<Args>(args)...);
     }
 
     template <class... Args, typename Q = T, std::enable_if_t<is_map_v<Q>, bool> = true>
-    auto try_emplace(const_iterator /*hint*/, Key const& key, Args&&... args) -> iterator {
+    ANKERL_UNORDERED_DENSE_FORCEINLINE auto try_emplace(const_iterator /*hint*/, Key const& key, Args&&... args) -> iterator {
         return do_try_emplace(key, std::forward<Args>(args)...).first;
     }
 
     template <class... Args, typename Q = T, std::enable_if_t<is_map_v<Q>, bool> = true>
-    auto try_emplace(const_iterator /*hint*/, Key&& key, Args&&... args) -> iterator {
+    ANKERL_UNORDERED_DENSE_FORCEINLINE auto try_emplace(const_iterator /*hint*/, Key&& key, Args&&... args) -> iterator {
         return do_try_emplace(std::move(key), std::forward<Args>(args)...).first;
     }
 
@@ -3663,7 +3723,7 @@ public:
         typename KE = KeyEqual,
         std::enable_if_t<is_map_v<Q> && is_transparent_v<H, KE> && is_neither_convertible_v<K&&, iterator, const_iterator>,
                          bool> = true>
-    auto try_emplace(K&& key, Args&&... args) -> std::pair<iterator, bool> {
+    ANKERL_UNORDERED_DENSE_FORCEINLINE auto try_emplace(K&& key, Args&&... args) -> std::pair<iterator, bool> {
         return do_try_emplace(std::forward<K>(key), std::forward<Args>(args)...);
     }
 
@@ -3675,7 +3735,7 @@ public:
         typename KE = KeyEqual,
         std::enable_if_t<is_map_v<Q> && is_transparent_v<H, KE> && is_neither_convertible_v<K&&, iterator, const_iterator>,
                          bool> = true>
-    auto try_emplace(const_iterator /*hint*/, K&& key, Args&&... args) -> iterator {
+    ANKERL_UNORDERED_DENSE_FORCEINLINE auto try_emplace(const_iterator /*hint*/, K&& key, Args&&... args) -> iterator {
         return do_try_emplace(std::forward<K>(key), std::forward<Args>(args)...).first;
     }
 
@@ -3881,12 +3941,12 @@ public:
     }
 
     template <typename Q = T, std::enable_if_t<is_map_v<Q>, bool> = true>
-    auto operator[](Key const& key) -> Q& {
+    ANKERL_UNORDERED_DENSE_FORCEINLINE auto operator[](Key const& key) -> Q& {
         return try_emplace(key).first->second;
     }
 
     template <typename Q = T, std::enable_if_t<is_map_v<Q>, bool> = true>
-    auto operator[](Key&& key) -> Q& {
+    ANKERL_UNORDERED_DENSE_FORCEINLINE auto operator[](Key&& key) -> Q& {
         return try_emplace(std::move(key)).first->second;
     }
 
@@ -3895,7 +3955,7 @@ public:
               typename H = Hash,
               typename KE = KeyEqual,
               std::enable_if_t<is_map_v<Q> && is_transparent_v<H, KE>, bool> = true>
-    auto operator[](K&& key) -> Q& {
+    ANKERL_UNORDERED_DENSE_FORCEINLINE auto operator[](K&& key) -> Q& {
         return try_emplace(std::forward<K>(key)).first->second;
     }
 

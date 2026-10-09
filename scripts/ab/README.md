@@ -547,6 +547,46 @@ octave where this map swings 1.07-1.28x. At 3251 entries and load 0.79 it costs 
 map's 3.78. The eleven points where it does come out ahead are all above 440000 entries, where every
 map is waiting on memory and the probe hardly matters.
 
+## The order a segmented_map tears itself down in
+
+`scripts/ab/teardown_order.sh` builds a `segmented_map` from empty, destroys it and builds it again,
+for main's header, the working tree's, and the working tree's with
+`scripts/ab/teardown_blocks_forward.patch`; what it prints is described at the top of
+`scripts/ab/teardown_order.cpp`. The results are in `notes/index-design.md`, "Tearing a segmented_map
+down in reverse".
+
+```sh
+AB_BUILD=/home/martinus/gra/x scripts/ab/teardown_order.sh -c clang++           # 3 passes, 7 rounds, 50000 200000 1000000
+AB_BUILD=/home/martinus/gra/x scripts/ab/teardown_order.sh -c g++ -r HEAD~1 1 3 50000
+```
+
+## The default maximum load factor, swept
+
+`scripts/ab/load_factor.sh` makes each value the working tree header's `default_max_load_factor` in
+turn and runs `run.sh -r REV -p 50 all 12` against it, pinned to `AB_CORE`; the first value is the
+same-header control. It edits the header between runs and restores it on exit, and refuses to start
+on a header with local changes. Written for #306; the results are in `notes/index-design.md`, "The
+default maximum load factor swept".
+
+```sh
+AB_BUILD=/home/martinus/gra/x scripts/ab/load_factor.sh clang++ | tee clang.txt   # 0.8 0.75 0.85 0.875 0.9, 28 minutes
+AB_BUILD=/home/martinus/gra/x scripts/ab/load_factor.sh g++ 0.8 0.875
+```
+
+## Instructions per `try_emplace` hit and insert, counted around the loop
+
+`scripts/ab/try_emplace_hit.sh` builds `scripts/ab/try_emplace_hit.cpp` against main's header and
+the working tree's, both compilers, one map and one mode per binary (`HIT`: `try_emplace` on a
+present key; `MISS`: fresh keys into reserved tables; integer or string key), and prints
+instructions and cycles per operation read with `perf_event_open` around the timed loop only. Main
+against itself reads identical instruction counts, so the counts need no rounds; the cycles do.
+Written for #305; the results are in `notes/index-design.md`, "`try_emplace` on a present key".
+
+```sh
+AB_BUILD=/home/martinus/gra/x AB_CORE=2 scripts/ab/try_emplace_hit.sh 3            # working tree against origin/main
+AB_BUILD=/home/martinus/gra/x AB_CORE=2 scripts/ab/try_emplace_hit.sh -r HEAD~1 1
+```
+
 ## What the rehash pipeline is worth, against table size
 
 `scripts/ab/rehash_size.sh` puts `fill_buckets_from_values` against the same loop with its ring and
