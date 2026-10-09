@@ -164,6 +164,7 @@ Every experiment run on `unordered_dense`'s index, hash, insert path and benchma
   - [Tearing a segmented_map down in reverse: glibc keeps the memory for the next build instead of handing it to the kernel, warm builds 1.8-3.2x when values own heap memory](#tearing-a-segmented_map-down-in-reverse-glibc-keeps-the-memory-for-the-next-build-instead-of-handing-it-to-the-kernel-warm-builds-18-32x-when-values-own-heap-memory) · 2026-09-26 · kept
   - [`segmented_map` lookups against `map`, one cell per binary: a hit costs 2-15 instructions more and a miss 0.4-2.4, and of that only about 5 instructions of clang's `find` hit are avoidable -- clang splits the value index a second time for `it->second`, where gcc reuses the probe's split -- so nothing was changed](#segmented_map-lookups-against-map-one-cell-per-binary-a-hit-costs-2-15-instructions-more-and-a-miss-04-24-and-of-that-only-about-5-instructions-of-clangs-find-hit-are-avoidable----clang-splits-the-value-index-a-second-time-for-it-second-where-gcc-reuses-the-probes-split----so-nothing-was-changed) · 2026-09-28 · rejected
   - [A `segmented_map`'s segment size, apart from the page: a map of strings iterates 3.3x slower than `map` with 4 KB segments and 1.24x with 256 KB because the segments sit between the strings' own buffers; for values without heap memory the size changes nothing, and exact-page segments lose everywhere](#a-segmented_maps-segment-size-apart-from-the-page-a-map-of-strings-iterates-33x-slower-than-map-with-4-kb-segments-and-124x-with-256-kb-because-the-segments-sit-between-the-strings-own-buffers-for-values-without-heap-memory-the-size-changes-nothing-and-exact-page-segments-lose-everywhere) · 2026-10-02 · kept
+  - [A map_view over a mapped file: on hugetlbfs its random hits are 1.02-1.16x faster than on the file's 4 KB pages from 4M to 64M entries and 2.2-2.4x at 1M, it starts in 4 ms and is shared, so hugetlbfs is worth having and not required; a lazy 4 KB mapping of a file not in the page cache needs 8.7 s for its first 100000 lookups at 64M](#a-map_view-over-a-mapped-file-on-hugetlbfs-its-random-hits-are-102-116x-faster-than-on-the-files-4-kb-pages-from-4m-to-64m-entries-and-22-24x-at-1m-it-starts-in-4-ms-and-is-shared-so-hugetlbfs-is-worth-having-and-not-required-a-lazy-4-kb-mapping-of-a-file-not-in-the-page-cache-needs-87-s-for-its-first-100000-lookups-at-64m) · 2026-10-02 · kept
 - [Small tables](#small-tables)
   - [#331, counting into a small table under clang 11-12% behind 4.1.2: about one cycle per row of latency in the 16-slot group's compare, on a table whose first slot almost always hits; #329's sentinel takes 0.1-0.3 cycles of it under clang and all of it under gcc, and nothing tried closes the rest](#331-counting-into-a-small-table-under-clang-11-12-behind-412-about-one-cycle-per-row-of-latency-in-the-16-slot-groups-compare-on-a-table-whose-first-slot-almost-always-hits-329s-sentinel-takes-01-03-cycles-of-it-under-clang-and-all-of-it-under-gcc-and-nothing-tried-closes-the-rest) · 2026-09-27 · open
   - [Small maps, two variants from #304 prototyped and measured against `main` over 20000 maps of 1 to 32 entries: no index below eight entries makes a map of up to four entries 1.06-2.3x faster to build, 1.2-2.2x faster to destroy and its lookups 1.5-3.7x faster, but puts back the empty-table test #329 took out of every lookup; a two-group minimum index helps a one- or two-entry integer map 2-28% and builds 32 entries 1.17-1.61x slower; neither was kept](#small-maps-two-variants-from-304-prototyped-and-measured-against-main-over-20000-maps-of-1-to-32-entries-no-index-below-eight-entries-makes-a-map-of-up-to-four-entries-106-23x-faster-to-build-12-22x-faster-to-destroy-and-its-lookups-15-37x-faster-but-puts-back-the-empty-table-test-329-took-out-of-every-lookup-a-two-group-minimum-index-helps-a-one--or-two-entry-integer-map-2-28-and-builds-32-entries-117-161x-slower-neither-was-kept) · 2026-09-28 · rejected
@@ -3343,6 +3344,8 @@ What this says and does not say: one machine, one compiler, one key distribution
 
 **Why the owning check needs the bitmap, found by `fuzz_index_view`.** The first check was the one the issue specified: every full slot in range, as many full slots as values. Under `_GLIBCXX_ASSERTIONS` the fuzzer found bytes that pass it and still read out of bounds: two slots pointing at value n-1, one value pointed at by none. An erase moves value n-1 into the hole and repoints the one slot `repoint_value` finds, and the other slot is left pointing at n-1, one past the end after the pop. ASan did not see it: the read is inside the vector's capacity. Requiring every value to be pointed at exactly once makes every later operation keep it so, and costs the owning load one bit per value. A view never erases and does not need it.
 
+**Later (2026-10-02):** the file and the page size are measured in [A map_view over a mapped file](#a-map_view-over-a-mapped-file-on-hugetlbfs-its-random-hits-are-102-116x-faster-than-on-the-files-4-kb-pages-from-4m-to-64m-entries-and-22-24x-at-1m-it-starts-in-4-ms-and-is-shared-so-hugetlbfs-is-worth-having-and-not-required-a-lazy-4-kb-mapping-of-a-file-not-in-the-page-cache-needs-87-s-for-its-first-100000-lookups-at-64m): a view on the file's 4 KB pages looks up at the owning map's speed from 4M entries up, and 2 MB pages are worth 1.03-1.13x there.
+
 What this says and does not say: a load from memory, not from a file; the 4M `uint64_t` row reads the unchecked load slower than the checked one on both compilers (6.85 against 6.36, 6.79 against 5.31), which nothing in the code explains, and is most likely where the allocator puts a fresh 27 MB index next to a 512 KB bitmap or without one -- unexplained, and the other three sizes agree with each other. The 1M and 4M rows of the build are in cache and out of it; the loads are bandwidth: 7 ns per entry at 64M is 27.5 bytes of values and index per entry (the RSS column), plus the page faults of the fresh index.
 
 ## The hash function
@@ -3573,6 +3576,7 @@ What the page size, the `segmented_map` container and the order of frees at tear
 - The score runs on 4 KB pages; the same binary on 2 MB pages scores 1.0256 (gcc) and 1.0364 (clang). Not the map's to set. See [The score runs on 4 KB pages and ...](#the-score-runs-on-4-kb-pages-and-pays-16-billion-l1-dtlb-misses-for-it).
 - `segmented_vector` destroys and frees last to first: warm builds 1.8-2.3x for strings, 2.6-3.2x for owning values, at the price of RSS staying until reuse or `malloc_trim(0)`. See [Tearing a segmented_map down in reverse](#tearing-a-segmented_map-down-in-reverse-glibc-keeps-the-memory-for-the-next-build-instead-of-handing-it-to-the-kernel-warm-builds-18-32x-when-values-own-heap-memory).
 - `default_segment_size_bytes` stays 4096. A map of strings iterates 3.3x slower than `map` with it and 1.24x with 256 KB segments (the 2560 byte segments sit between the strings' buffers); for other values the segment size changes nothing; exact-page segments lose everywhere. See [A `segmented_map`'s segment size, apart from the page](#a-segmented_maps-segment-size-apart-from-the-page-a-map-of-strings-iterates-33x-slower-than-map-with-4-kb-segments-and-124x-with-256-kb-because-the-segments-sit-between-the-strings-own-buffers-for-values-without-heap-memory-the-size-changes-nothing-and-exact-page-segments-lose-everywhere).
+- A `map_view` over a mapped file does not need hugetlbfs, and is better on it: 1.02-1.16x faster lookups than on the file's 4 KB pages from 4M to 64M entries (2.2-2.4x at 1M), a 4 ms start whether the file was evicted or not, one copy for every process. `mapped_view.h` (#301) defaults to the lazy shared mapping, which is hugetlbfs when the file is there; a 4 KB file not in the page cache wants `mapping::file_populated` (8.7 s against 0.3 s to the first 100000 lookups at 64M). See [A map_view over a mapped file](#a-map_view-over-a-mapped-file-on-hugetlbfs-its-random-hits-are-102-116x-faster-than-on-the-files-4-kb-pages-from-4m-to-64m-entries-and-22-24x-at-1m-it-starts-in-4-ms-and-is-shared-so-hugetlbfs-is-worth-having-and-not-required-a-lazy-4-kb-mapping-of-a-file-not-in-the-page-cache-needs-87-s-for-its-first-100000-lookups-at-64m).
 - A `segmented_map` hit costs 2-15 instructions more than `map` (a `find` hit 7-15, a clang `contains` hit 2); only about 5 of clang's `find` hit are avoidable, and fixing them needs a 24-byte iterator. Declined. See [`segmented_map` lookups against `map`, one cell per binary](#segmented_map-lookups-against-map-one-cell-per-binary-a-hit-costs-2-15-instructions-more-and-a-miss-04-24-and-of-that-only-about-5-instructions-of-clangs-find-hit-are-avoidable----clang-splits-the-value-index-a-second-time-for-it-second-where-gcc-reuses-the-probes-split----so-nothing-was-changed).
 
 ### What `segmented_map` gives up in 5.0.0, found in review.
@@ -3874,6 +3878,96 @@ Everything else, at 1M and 4M:
 **Exact-page segments are the worst segmented variant, or tied with the worst, on every workload and every element size**, and the idea that motivated them, one segment per page, buys nothing measurable: string iteration reads the same as 4 KB power-of-two segments, `uint64_t` iteration 3.1x because the index is now a division, and the page-aligned allocations cost glibc up to a page of padding each (RSS 0.90-1.09 of `map` for `uint64_t`, against 0.58-0.71). At 50000 entries a `uint64_t` map's RSS rises from 0.64 of `map` with 4 KB segments to 0.83 with 2 MB and 16 MB: a non-empty map holds whole segments.
 
 What this says and does not say: one round per cell and one compiler; the drift between neighbouring segment sizes is 1-3%, smaller than every effect quoted. The string grid ran against the header before #299 and the other two after it; `segmented_vector` is the same in both and every ratio is within one grid. Decision (owner, 2026-10-02): `default_segment_size_bytes` stays 4096, because a larger default costs every small segmented map a whole segment (a 1-entry map holds 4 KB today), and `doc/usage.md` and the header comment tell a map of strings to pass 256 KB. Exact-page segments closed with these numbers.
+
+### A map_view over a mapped file: on hugetlbfs its random hits are 1.02-1.16x faster than on the file's 4 KB pages from 4M to 64M entries and 2.2-2.4x at 1M, it starts in 4 ms and is shared, so hugetlbfs is worth having and not required; a lazy 4 KB mapping of a file not in the page cache needs 8.7 s for its first 100000 lookups at 64M
+
+*2026-10-02 · #301 · kept · Ryzen 9 7950X, clang 22 and gcc 16, THP `madvise`, `nr_hugepages` 0, btrfs on NVMe, `AB_CORE=2`; `scripts/ab/mapped_view.sh` (one binary per mode, median of 7 rounds of 1M hits, `perf_event_open` around the loop)*
+
+`map<uint64_t, uint64_t>` written to a file with both arrays at 2 MB boundaries (30 MB at 1M entries, 1684 MB at 64M), then read back five ways. **No hugetlbfs row was measured directly**: the machine has no huge pages reserved and the user is not root, so the 2 MB row is the file's bytes copied into an anonymous, 2 MB-aligned `MADV_HUGEPAGE` mapping, the proxy the issue named. `AnonHugePages` read mid-run equals the whole region at every size (30, 108, 424, 1684 MB) and page walks per lookup are 0.000-0.002, so the mechanism was engaged. `MADV_COLLAPSE` on the file mapping returns `EINVAL` (no `CONFIG_READ_ONLY_THP_FOR_FS`, btrfs): file pages here are 4 KB, and `FilePmdMapped` is 0 everywhere. `MAP_HUGETLB` fails for want of reserved pages.
+
+**Warm lookups**, ns per random hit (throughput: the key comes from an rng, several are in flight), clang / gcc:
+
+| | 1M | 4M | 16M | 64M |
+|---|---|---|---|---|
+| owning `map`, `std::allocator` | 11.97 / 9.51 | 33.33 / 28.79 | 38.43 / 32.75 | 39.89 / 34.18 |
+| owning `huge_page::map` | 6.03 / 4.83 | 30.43 / 26.58 | 34.64 / 29.60 | 35.26 / 30.42 |
+| view, file mapping (4 KB) | 8.22 / 8.30 | 32.55 / 28.34 | 38.42 / 32.68 | 39.99 / 34.32 |
+| view, file mapping, `MAP_POPULATE` | 7.97 / 8.54 | 32.64 / 28.72 | 38.34 / 32.73 | 40.03 / 34.11 |
+| view, 2 MB copy (hugetlbfs proxy) | 5.95 / 4.87 | 30.34 / 27.53 | 34.86 / 30.26 | 35.56 / 30.91 |
+| file / 2 MB | 1.38 / 1.70 | 1.07 / 1.03 | 1.10 / 1.08 | 1.12 / 1.11 |
+
+Per lookup, clang, cycles / L1 dTLB misses / page walks (`ls_l1_d_tlb_miss.all_l2_miss`): owning 64.6 / 2.01 / 1.09 at 1M and 216.5 / 2.04 / 2.02 at 64M; file view 43.7 / 1.94 / 0.004 at 1M and 217.1 / 2.02 / 1.98 at 64M; 2 MB copy 31.4 / 0.00 / 0.00 at 1M and 192.6 / 1.85 / 0.00 at 64M. Two misses per hit is the block and the value, each on its own page.
+
+In this first sweep the 2 MB row was the `MADV_HUGEPAGE` proxy: a view on it looked up 1.03-1.13x faster than one on the file's 4 KB pages from 4M to 64M entries and 1.38x (clang) to 1.70x (gcc) at 1M, within 3.6% of the owning map on `huge_page::map`, and the 4 KB view matched the owning map on `std::allocator` within 2.4% from 4M up. The owner then reserved huge pages and mounted hugetlbfs, and the real thing is measured further down this entry, under "On hugetlbfs itself".
+
+The 1M column has an oddity: the owning map on `std::allocator` is 1.46x (clang) and 1.15x (gcc) *slower* than the 4 KB file view, with a page walk per lookup where the file view has almost none (1.09 against 0.004), at the same 30 MB and the same number of L1 misses. The L2 TLB holds 3072 4 KB entries, 12 MB, so the file mapping is covered by something the heap is not. A plausible cause is the page cache's large folios, which give physically contiguous runs that Zen 4 coalesces into one TLB entry; it was not measured (`tlb_reload_coalesced_page_hit` was not read). Unexplained, and from 4M up the two agree. **Later (2026-10-02, the same day):** measured, and it is the page cache's history, below in this entry.
+
+**Cold**, ms from the start of the load until the first 100000 random hits are done, clang, one run per cell (gcc's run of the same cells differs by up to 27% on cells under 60 ms and by at most 5.2% on the rest; that spread is the noise of a single cold run). "Evicted" is after `POSIX_FADV_DONTNEED` on the file:
+
+| | 1M | 4M | 16M | 64M |
+|---|---|---|---|---|
+| owning `map`, file cached: load + lookups | 13.8 + 2.7 | 60.3 + 3.7 | 249 + 4.2 | 1007 + 5.7 |
+| owning `map`, evicted | 29.7 + 2.7 | 84.1 + 3.7 | 308 + 4.3 | 1222 + 5.9 |
+| owning `huge_page::map`, file cached | 6.9 + 1.8 | 29.9 + 3.5 | 120 + 3.6 | 493 + 3.9 |
+| view, file mapping, cached | 0.01 + 1.9 | 0.01 + 4.3 | 0.01 + 7.0 | 0.01 + 16.7 |
+| view, file mapping, evicted | 0.01 + 17.3 | 0.01 + 87.3 | 0.02 + 233 | 0.02 + **8616** |
+| view, `MAP_POPULATE`, cached | 1.3 + 1.8 | 4.6 + 3.5 | 20.0 + 3.9 | 97.7 + 5.2 |
+| view, `MAP_POPULATE`, evicted | 7.6 + 1.9 | 31.8 + 3.5 | 88.1 + 4.1 | 307 + 5.0 |
+| view, 2 MB copy, cached | 3.1 + 1.2 | 9.6 + 3.1 | 33.2 + 3.7 | 129.8 + 3.7 |
+| view, 2 MB copy, evicted | 7.6 + 1.7 | 36.5 + 3.3 | 95.6 + 3.6 | 335 + 3.7 |
+
+The evicted lazy mapping at 64M took 26577 major and 16981 minor faults for its 100000 lookups: one synchronous read per touched page, at random, about 0.3 ms each. At 16M the same mapping took 155 major faults, because readahead around each fault brings in most of a 424 MB file. With the file cached, a fresh lazy mapping is the fastest way to start serving at every size (1.9-16.7 ms against 16.5-1013 ms for the owning load).
+
+**Shared**, two processes, each maps the file `MAP_SHARED` (or reads it, for the owning rows) and looks up every key, MB (identical for both processes and both compilers to 1 MB):
+
+| | 1M: RSS / file / PSS | 64M: RSS / file / PSS | page cache, 64M |
+|---|---|---|---|
+| owning `map` | 28 / 1 / 26 | 1682 / 1 / 1680 | 1682 |
+| view, file mapping | 27 / 27 / 13 | 1682 / 1682 / 840 | 1684 |
+| view, `MAP_POPULATE` | 31 / 31 / 15 | 1685 / 1685 / 842 | 1684 |
+| view, 2 MB copy | 31 / 1 / 30 | 1685 / 1 / 1684 | 1684 |
+
+"One copy" holds for the file mapping: each process's PSS is half its RSS, and the page cache holds the file once. The owning map and the 2 MB copy are two private copies plus the page cache's (the page cache is reclaimable; the copies are not).
+
+**What shipped.** `include/ankerl/mapped_view.h`: `mapped_file` (open, map, own), `mapped_layout` (offsets and counts; the caller frames the file) and `mapped_view<View>`, which owns a `mapped_file` and the view over it. `mapping::file` (lazy, `MAP_SHARED`) is the default, from the shared and the cached-cold tables; `mapping::file_populated` (`MAP_POPULATE`) is there for the evicted row; `mapping::huge_copy` (`MAP_HUGETLB`, else `MADV_HUGEPAGE`) for a process that looks up a lot and does not share. A file on hugetlbfs gets 2 MB pages through `mapping::file` with nothing more to ask.
+
+**Re-measured through `mapped_view.h` itself**, the same day after the review asked whether the harness's own `mmap` stands for the header: four modes that construct `ud::mapped_view` (`header_file`, `header_populated`, `header_huge`, and `header_file_checked` = `mapping::file` with `trust::checked`), in one sweep with four of the modes above, both compilers, the machine idle. ns per random hit, clang / gcc:
+
+| | 1M | 4M | 16M | 64M |
+|---|---|---|---|---|
+| owning `map` | 11.67 / 10.05 | 32.77 / 28.34 | 38.08 / 32.68 | 39.71 / 33.96 |
+| harness file mapping | 9.25 / 9.96 | 32.27 / 28.75 | 38.12 / 33.20 | 39.79 / 34.56 |
+| `mapping::file` | 9.22 / 9.46 | 31.98 / 27.82 | 38.10 / 32.63 | 39.74 / 34.12 |
+| `mapping::file_populated` | 9.21 / 9.42 | 32.51 / 27.88 | 38.01 / 32.64 | 39.70 / 34.19 |
+| harness 2 MB copy | 5.43 / 4.77 | 29.82 / 26.42 | 34.51 / 29.89 | 35.33 / 30.65 |
+| `mapping::huge_copy` | 5.44 / 4.58 | 29.80 / 25.85 | 34.51 / 29.68 | 35.34 / 30.37 |
+| `mapping::file` / `huge_copy` | 1.69 / 2.07 | 1.07 / 1.08 | 1.10 / 1.10 | 1.12 / 1.12 |
+
+The header reads as the harness's own mappings do: within 1% under clang, within 5.0% under gcc (the 1M cells; 3.3% at 4M, under 2% above), in both directions, and the same cold and shared. So the first table stands for the shipped code.
+
+**What `trust::checked` costs a lazy `file` mapping**, ms until 100000 lookups are done, clang: with the file cached 2.6 / 7.7 / 21.3 / 72.8 at 1M / 4M / 16M / 64M against 1.7 / 4.2 / 7.2 / 16.8 unchecked; with it evicted 15.3 / 65.7 / 191 / 684 against 17.4 / 84.7 / 247 / **8601** unchecked and 9.9 / 37.1 / 101 / 312 for `mapping::file_populated` (one run per cell; gcc's run agrees within 5% except the evicted checked cell at 4M, 49.0). The check reads the index front to back, which readahead serves in large reads, so it pages in the index far faster than random lookups would; the values are still faulted in one page at a time. Checked costs a cached file 4.3x at 64M and saves an evicted one 12.6x.
+
+**The 1M anomaly is the page cache's history.** The file view's page walks per lookup at 1M read 0.000 in clang's half of this sweep and 0.505 in gcc's, the same file, the same code. `perf stat` on the clang `header_file` binary, 1M, 3 rounds: with the page cache as the sweep left it (filled by the random faults of the evicted runs) 0.69 walks per lookup, 0.99M coalesced reloads against 3.16M 4 KB ones; after evicting it and reading the file once with `cat`, 0.000 walks, 6.59M coalesced reloads against 16K 4 KB ones. A sequential read fills the cache with large folios, physically contiguous runs the L2 TLB holds as one coalesced entry; random faults fill it with small ones. At 1M that is the difference between the whole file fitting the L2 TLB and not: 10.6 against 11.4 ns in those two `perf stat` runs. The owning map's heap gets no such runs (1.09 walks either way). From 4M up the file is past what coalescing can cover and the walks are the same either way. (The `perf stat` events sharing the process with the harness's own three counters may have multiplexed; the ratios, not the counts, are the evidence.)
+
+**On hugetlbfs itself.** The owner reserved 2048 huge pages (`vm.nr_hugepages`) and mounted a hugetlbfs owned by the user (`mount -t hugetlbfs -o uid=...,pagesize=2M none /mnt/huge`), and a third sweep ran with the file copied there (`header_hugetlbfs`: `mapping::file` over it; hugetlbfs has no `write()`, so the copy goes through a mapping, before the clock) and with `huge_copy` now getting `MAP_HUGETLB` (`hugetlb_MB` in `smaps_rollup`, 0 page walks). ns per random hit, clang / gcc, one sweep:
+
+| | 1M | 4M | 16M | 64M |
+|---|---|---|---|---|
+| owning `map` | 12.97 / 10.06 | 34.76 / 28.72 | 38.11 / 33.13 | 40.07 / 34.36 |
+| owning `huge_page::map` | 6.29 / 4.63 | 31.86 / 26.28 | 34.78 / 30.20 | 35.21 / 31.22 |
+| `mapping::file`, 4 KB file | 13.84 / 10.93 | 33.38 / 30.05 | 38.59 / 34.14 | 40.00 / 35.35 |
+| `mapping::file`, file on hugetlbfs | 6.20 / 4.55 | 32.69 / 26.24 | 34.88 / 30.04 | 35.68 / 30.53 |
+| `mapping::huge_copy` (`MAP_HUGETLB`) | 6.11 / 4.77 | 32.00 / 27.10 | 35.17 / 33.14 | 35.45 / 31.02 |
+| `MADV_HUGEPAGE` copy (the proxy) | 5.67 / 4.95 | 32.24 / 26.88 | 34.63 / 30.72 | 35.68 / 30.94 |
+| 4 KB file / hugetlbfs | 2.23 / 2.40 | 1.02 / 1.15 | 1.11 / 1.14 | 1.12 / 1.16 |
+
+**Hugetlbfs against 4 KB: a `map_view` over a file on hugetlbfs looks up 1.02-1.16x faster than over the same file on 4 KB pages from 4M to 64M entries, and 2.2-2.4x at 1M; it matches the owning map on `huge_page::map` within 3% from 4M up, and the proxy stood for it within 2.4% there (9% at 1M).** gcc's `huge_copy` at 16M (33.14) is the one cell off its neighbours; it was not re-run. The 1M 4 KB cells are the page cache's history again (13.84 here against 9.22 in the second sweep, with 0.002 walks per lookup; the L1 misses were not compared).
+
+Cold, ms until 100000 lookups are done, clang / gcc: the file on hugetlbfs 0.67 / 1.58, 3.13 / 2.72, 3.76 / 3.29, 4.28 / 3.82 at 1M / 4M / 16M / 64M, the same after `POSIX_FADV_DONTNEED` (hugetlbfs pages are never evicted), against 16.95 / 16.74 cached and 8715 / 8679 evicted for the 4 KB file at 64M. Shared: two processes on the hugetlbfs file took 0 reserved pages between them beyond the file's own (`HugePages_Free` before and while both held it); two on `huge_copy` took 60, 216, 848 and 3368 MB, two copies.
+
+So hugetlbfs is the best of every column here: the speed of the 2 MB copy, a start as fast as a mapping of a cached file, one copy for all processes. It needs root once (reserve the pages, mount), the pages are pinned whether used or not, and the file must be written through a mapping. `mapping::file` gets all of it without asking when the file is there, which is why it stays the default.
+
+What this says and does not say: hits only, throughput; misses and dependent chains were not run. One machine, one filesystem: btrfs with whatever folio sizes its page cache uses here; another filesystem may coalesce differently, and the 1M file view depends on how the file entered the page cache (above). The first sweep's modes do their own `mmap` (`MAP_PRIVATE` outside the shared phase, at a 2 MB-aligned address); the `header_*` modes of the later sweeps go through `mapped_view.h` and read the same, as shown above. The first two sweeps' 2 MB rows are a proxy; the third measures hugetlbfs itself, with 2048 pages reserved on a 62 GB machine. The evicted numbers are NVMe; a spinning disk would make the lazy row far worse. The sweep ended at 16:47:17; the owner started a game on the machine shortly after, and the gcc half agrees with the clang half in the direction of every ratio, so it is taken as undisturbed.
 
 ## Small tables
 
