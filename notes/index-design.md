@@ -210,6 +210,12 @@ place rather than being deleted, because the retraction is usually the more usef
 - The default maximum load factor swept from 0.75 to 0.9: every step above 0.8 costs both compilers the same, and the one step below buys 0.8% for 6.7% more index
 - Tearing a segmented_map down in reverse: glibc keeps the memory for the next build instead of handing it to the kernel, warm builds 1.8-3.2x when values own heap memory
 - `try_emplace` split at the home group: the hit and the common placement inlined into the caller, the walk past home behind a call for clang only, and every scored workload at or under main's instruction count on both compilers
+- `insert()` and `emplace()` look the key up first when the arguments already are the value: a set's string hit 2.2x, a map's `insert({k, v})` hit 4.5x under clang, and `emplace(k, new int)` must still build its value
+- MySQL's int join never reaches the map, which makes it the control for how much relinking mysqld moves a query: 2.4%, the size of every MySQL difference measured for #321 and #323
+- MySQL's `EXCEPT` read 7-11% slower on 5.2.0 than on 4.4.0, and it is where the linker put the map's code: an inactive block added next to the call took it to +1% and removing it brought the +7-11% back, with `do_find` and `hash_bytes` byte-identical in both binaries
+- udb3's `++h[key]` ran 70% slower under clang on 5.2.0 than on 5.1.0, and it was a loop variable stored and reloaded across a store with a late address: on Zen 4 that, with a division on the way to the next key, stops the loop overlapping its misses, 5x in a loop with no map at all; the part of the insert after a miss is called again under clang
+- The caller corpus: nine loops the way programs write them, one binary each, both compilers, in cache and past it, judged by each header's worst loop and not by a geomean; 5.2.0's worst was 3.3x under clang and 3.6x under gcc, the clang miss call of #310 brings clang's to 1.10, and under gcc nothing that removes the cliff is worth its price
+- The shape search: sixteen combinations of what the insert inlines, each judged by its worst ratio to the best combination anywhere measured, with the rule fixed before the results; it picks one shape for every compiler -- the home-group lookup inlined, the miss path and the walk past home called -- worst 1.11 under clang and 1.58 under gcc, where 5.2.0's everything-inlined reads 3.32 and 3.54
 
 **The robin hood index this replaced, and its dead ends**
 
@@ -5558,11 +5564,403 @@ site. In the score binary, which holds more insert sites than any caller will, g
 `.text` is 5531 -> 7244 / 10946 -> 11618 / 14597 -> 15480 bytes under clang (u64 hit, u64 miss,
 string miss) and 7731 -> 7573 / 9411 -> 8789 / 13953 -> 14465 under gcc.
 
-What this says and does not say: one machine, in cache (50000 entries one-map, the score's sizes);
-the counts are the decisive numbers. MSVC takes the gcc branch of the macro and gets no `flatten`,
+**Past the cache, the README's own harness** (2026-09-27, clang, `bench_readme.cpp` one map per
+binary, a million entries = the geomean of five sizes over the octave, `udm` built once from main
+and once from this branch, five rounds alternating the order, pinned to one core; median ns per
+operation, range over the rounds):
+
+| panel | key | 5.1.0 | this | speedup |
+|---|---|---|---|---|
+| build | u64 | 25.99 [25.88-26.27] | 25.08 [24.95-25.35] | 1.036 |
+| buildfree | u64 | 27.82 [27.63-28.20] | 26.96 [26.69-27.11] | 1.032 |
+| churn | u64 | 97.10 [96.63-98.57] | 97.95 [96.14-98.94] | 0.991 |
+| find | u64 | 32.14 [31.91-32.25] | 31.88 [31.78-31.95] | 1.008 |
+| build | str | 90.58 [89.90-90.84] | 90.14 [89.32-90.36] | 1.005 |
+| buildfree | str | 107.59 [106.90-108.31] | 106.65 [106.41-107.13] | 1.009 |
+| churn | str | 447.32 [447.21-447.87] | 446.46 [445.27-447.95] | 1.002 |
+| find | str | 132.97 [132.72-133.31] | 132.75 [132.57-133.21] | 1.002 |
+
+At a million entries the insert waits on memory, and what this saves is instructions: only the
+integer build moves, 3-4%, the rest is inside 1%. The README's graphs were not redrawn for it. The
+same comparison in `maps.sh -r main` (both headers in one binary) read the integer `find` at 0.81
+at all five sizes, which is that harness's inlining band and not the change: one map per binary,
+`count()` at a million entries retires 50.24 instructions under clang and 49.22 under gcc with
+either header, cycles within 1%. What is real is smaller and belongs to the caller: with the fill
+loop in the same function as the lookup loop, clang's lookup went 51.74 -> 54.74 instructions,
+because the inlined insert changes the register allocation of the function around it; with the
+fill moved into its own function the difference is zero. A first run of the alternating comparison
+shared its core with a stray process and read every cell twice as slow; the table is the re-run.
+
+What this says and does not say: one machine, in cache (50000 entries one-map, the score's sizes)
+except the table just above; the counts are the decisive numbers. MSVC takes the gcc branch of the macro and gets no `flatten`,
 and has not been measured. The compiler split is a measured choice per compiler, not a principle:
 a third compiler, or a future clang or gcc, may want the other shape, and the one-map harness and
 `solo.sh` are what would tell.
+
+**`insert()` and `emplace()` look the key up first when the arguments already are the value: a set's
+string hit 2.2x, a map's `insert({k, v})` hit 4.5x under clang, and `emplace(k, new int)` must still
+build its value** (2026-09-27, follow-up to #321, Ryzen 9 7950X, clang 22 and gcc 16, one map per
+binary: `scripts/ab/try_emplace_hit.cpp` with the operation swapped for `insert`, `solo.sh`,
+`perwl.sh`). #321 put `try_emplace`'s hit and common placement in front of any call; every other
+single-element insert still built the value first (`emplace_back`), probed, and popped it on a hit,
+and a set has no `try_emplace` at all. The comment on `do_insert_hashed` had named this as "left for
+its own change".
+
+The shape: `do_try_emplace`'s body is `do_find_or_place<Piecewise>(key, args...)`, and `emplace()`
+routes to it when its arguments are one `value_type`, or for a map a `Key` and a `mapped_type` (each
+by value or reference); the set's transparent `emplace(K&&)` routes to it too. Every `insert()`
+overload goes through `emplace()`, and all six are now `always_inline`. What is built is built from
+the same arguments as before; only a present key skips it.
+
+**Instructions and cycles per operation, #321's merged header against this, 50000 entries** (map =
+`map.insert({k, v})`, set = `set.insert(k)` with `k` a non-const lvalue for a miss and a const one
+for a hit, so both `insert` overloads are covered):
+
+| | clang instr | clang cycles | gcc instr | gcc cycles |
+|---|---|---|---|---|
+| map hit u64 | 88.0 -> 50.3 | 121.4 -> 26.8 | 58.2 -> 43.2 | 27.3 -> 23.6 |
+| map hit string | 300.6 -> 227.2 | 191.1 -> 175.9 | 282.2 -> 227.9 | 192.9 -> 177.2 |
+| map miss u64 | 98.0 -> 81.2 | 99.7 -> 40.9 | 76.0 -> 67.9 | 31.5 -> 29.1 |
+| map miss string | 331.6 -> 311.9 | 160.0 -> 148.6 | 310.9 -> 305.1 | 153.4 -> 150.6 |
+| set hit u64 | 80.0 -> 49.3 | 33.0 -> 21.1 | 55.1 -> 42.2 | 22.4 -> 20.3 |
+| set hit string | 270.0 -> 104.6 | 185.1 -> 83.4 | 251.7 -> 107.0 | 181.1 -> 82.2 |
+| set miss u64 | 92.0 -> 76.2 | 40.3 -> 33.1 | 65.0 -> 63.9 | 25.3 -> 25.3 |
+| set miss string | 304.8 -> 279.8 | 147.8 -> 120.3 | 277.7 -> 278.8 | 148.4 -> 110.4 |
+
+The string hits are the copy of the key that is no longer made. clang's integer map hit took 121
+cycles for 88 instructions in the old shape; why was not looked into, since the shape is gone.
+`try_emplace`'s own counts are identical to the merged header's in all eight cells of its harness.
+The score (`solo.sh` against the merged header): clang 0.9962, gcc 0.9979, inside the band; every
+workload's instructions identical except clang's `find` at 1.017 (u64) and 1.026 (big value), whose
+code this does not touch -- the inliner, the same caller-side effect as the entry above.
+
+**Three shapes lost on the way.** Routing only `insert(value_type const&/&&)` (V19) missed the
+common case: `set.insert(k)` with a non-const `k` binds to the template `insert(P&&)`, which went to
+`emplace()`, so the set miss did not move at all. Putting the dispatch in `emplace()` with the
+`insert()` overloads left un-annotated (V20) put gcc's integer map miss at 94.9 instructions against
+76.0 and the set miss at 89.9 against 65.0: `insert` stayed a call and the caller's map was spilled
+around it, #321's mechanism again; `always_inline` on the six overloads (V21) took it back. Building
+`try_emplace`'s `piecewise_construct` tuples in `do_try_emplace` and handing them down (V19-V21)
+cost clang 6 instructions on an integer `try_emplace` miss, because they were held across the
+lookup; the `Piecewise` flag forms them at the placement (V22).
+
+**The rule has to stop at conversions**, which ASan found: `unique_ptr_fill` calls
+`emplace(k, new int(i))` twice per key and its comment says the element "is still constructed, so
+there's no memory leak here". Looked up first, the second call built nothing and the pointer leaked,
+1000 per map type. So a key-first `emplace()` takes only arguments that already are what they would
+become, where skipping construction skips a copy and nothing else; `emplace(k, 20)` into a map whose
+mapped type is built from an `int` still builds and destroys it, and a test counts that. MySQL's
+hash join (`emplace(key, LinkedImmutableString{nullptr})`) passes a `mapped_type` and takes the new
+path.
+
+What this says and does not say: in cache only, one machine; MySQL, ClickHouse and the million-entry
+harness were not re-run. `emplace(Args...)` with anything else, the hinted `emplace_hint`, and
+`insert_or_assign` keep their shapes. A present key now leaves an rvalue `insert` argument unmoved,
+where before it was moved from into an element that was then popped.
+
+**MySQL's int join never reaches the map, which makes it the control for how much relinking mysqld
+moves a query: 2.4%, the size of every MySQL difference measured for #321 and #323** (2026-09-27,
+MySQL 9.7.2 built with gcc 16 `-O2`, no LTO, Ryzen 9 7950X, `perf stat` and `perf record -c 1000003`
+on the pinned mysqld during the query; `mysqlish.cpp` beside it, one map per binary). The
+`bench.py` rounds for 5.1.0 against main after #323 read the int join 7.828 -> 8.016 s and `EXCEPT`
+0.270 -> 0.276 s, both with non-overlapping ranges, where #321's run had `EXCEPT` at 0.260. Counted:
+
+| query | instructions 5.1.0 -> main | cycles |
+|---|---|---|
+| hash join, int key, duplicates | 429,278,525,275 -> 429,278,668,041 | +2.4% |
+| `EXCEPT`, int | 13.616 G -> 13.413 G (-1.5%) | +2.9% |
+
+The int join's profile holds no `unordered_dense`, no hash join iterator and no `StoreRow`: the only
+hash in it is InnoDB's adaptive hash index, and the time is `row_search_mvcc` and the record
+compares. Its instructions agree to seven digits because none of the changed code runs; its 2.4%
+is where the linker put InnoDB. `EXCEPT` does use the map -- `MaterializeIterator` calls
+`segmented_map::emplace(key, LinkedImmutableString{nullptr})`, which #323 routes key-first -- and
+retires fewer instructions, and its cycles move by the control's amount. Its profile is ~1170
+samples a build and the symbols move with inlining (5.1.0's out-of-line `emplace` holds 37 samples,
+main's `MaterializeIterator` gains 58), so it cannot split the two. That call alone, replayed in one
+map per binary (`segmented_map<std::string_view, pointer>`, 8-byte keys, 1M `emplace`s of which 49%
+are new, from empty, gcc `-O2`), is 123.6 -> 99.6 cycles (gcc) and 121.5 -> 100.1 (clang) against
+5.1.0, and #321 alone does not move it (123.5, 121.7).
+
+So the MySQL rounds in "split at the home group" and its 0.260 for `EXCEPT` are inside this band as
+well, and the int join there was never a measurement of the map. A MySQL number needs the
+instruction count beside it, and a query that does not run the map as its control. (2026-09-27, later: `EXCEPT`'s
+part was split after all, and it was not the map's work; see the entry below, "instruction cache".)
+
+**MySQL's `EXCEPT` read 7-11% slower on 5.2.0 than on 4.4.0, and it is where the linker put the
+map's code: an inactive block added next to the call took it to +1% and removing it brought the
++7-11% back, with `do_find` and `hash_bytes` byte-identical in both binaries** (2026-09-27, MySQL
+9.7.2 built with gcc 16 `-O2`, no LTO, Ryzen 9 7950X; `perf stat`, `perf record -c 200003` over ten
+queries on the pinned mysqld; `scripts/ab/mysql_except_replay.cpp`, `scripts/ab/mysql_except_dump.patch`,
+`/home/martinus/gra/mysqlbench/bench2.py`). With 2 GB buffers, ten `EXCEPT`s per server, two
+alternating rounds, 5.2.0 as a drop-in read 1.1887 / 1.1882 G cycles a query against 4.4.0's 1.1085
+/ 1.1105, on 1.3% fewer instructions, while the int join (which never calls the map, entry below)
+went 1.5% the other way. The profile put it in the map: `do_find` 1693 -> 3190 samples, the hash
+1120 -> 1347, `memcmp` 3832 -> 4952.
+
+**Three explanations that the replay rules out.** The replay runs MySQL's call pattern on the map
+alone: `segmented_map<ImmutableStringWithLength, LinkedImmutableString>` with MySQL's hasher, keys as
+pointers to a one-byte length and eight bytes in an arena, the first table `emplace`d and the second
+`find`-ed. Per operation, 4.4.0 -> 5.2.0:
+
+| keys | `emplace` cycles | `find` cycles | compares per `find` |
+|---|---|---|---|
+| `splitmix` of sysbench's `k`, 632k distinct | 147.2 -> 71.9 | 80.3 -> 64.8 | 0.6337 -> 0.6583 |
+| MySQL's own, dumped from the query, 174k distinct | 54.2 -> 27.2 | 27.5 -> 23.1 | 0.8892 -> 0.9122 |
+| MySQL's own, 16 random lines of 64 MB read per operation | 638.0 -> 588.8 | 600.1 -> 575.8 | same |
+
+- False fingerprint matches: 5.x has 16x more of them, and they are 0.023-0.025 compares per lookup.
+  A one-byte fingerprint over sixteen slots gives that rate with any hash.
+- The hash on MySQL's keys: those are the output of MySQL's own row hash, and structured -- about
+  24 of 64 bits vary, the low byte is always zero, and a million rows of 632k distinct `k` give only
+  174k distinct keys, so MySQL's hash already collides. `hash_bytes` spreads them as well as random
+  keys: the compare count moves by the same 0.023.
+- The group's second cache line and the fingerprint table, evicted between lookups by the scan:
+  with 16 random cache misses of other work per operation, 5.2.0 stays ahead.
+
+**The A/B/A.** The dump patch (a `getenv` test, never true in a timed run) went into
+`composite_iterators.cc`; with it, `EXCEPT` read 1.1019 / 1.1263 G cycles against 4.4.0's 1.1048 /
+1.1004, on 19 M more instructions for the test. Taken out again and rebuilt, it read 1.2054 / 1.2394
+against 1.1223 / 1.1155. `do_find` sits 384 bytes further on in the one binary, 64-byte aligned in
+both, and its instructions are identical except the RIP offset of the fingerprint table, which
+resolves to the same address. Its samples: 3479 in the slow binary, 1961 in the fast one; the hash
+1523 against 581. Counted per query:
+
+| binary | cycles | L1 icache misses | op cache misses | branch misses |
+|---|---|---|---|---|
+| 5.2.0, slow layout | 1209.6 M | 4.54 M | 59.0 M | 0.55 M |
+| 5.2.0, fast layout | 1126.5 M | 0.56 M | 34.1 M | 0.72 M |
+| 4.4.0 | 1119.2 M | 0.44 M | 1.3 M | 1.13 M |
+
+So the slow layout pays ten times the instruction cache misses of the fast one, and it is the
+front end, not the branch predictor, which does better on 5.2.0 in both. Which lines collide is not
+known: counting the sampled hot lines per L1i set does not separate the two binaries (the fast one
+has more sets over eight ways), because samples show where time went and not every line fetched.
+
+**What is 5.2.0's in every layout: 26-45x the op cache misses of 4.4.0.** #321 and #323 inline the
+whole insert into the caller, `flatten` pulls the vector's growth path in with it, and MySQL's
+`check_unique_fields_hash` is such a caller. In the fast layout it costs 0.7% of the cycles; it is
+also more hot code for an unlucky placement to collide with. Filed as its own issue.
+
+**Spilling at MySQL's defaults**, the other half of recommending 5.2.0 to MySQL: its hash join and
+set operations add `bucket_count() * sizeof(bucket_type)` to their memory and spill to disk past
+`join_buffer_size` / `set_operations_buffer_size`, which reads 24 bytes per slot on 5.x against 5.5
+real ("You sized the index" in `doc/upgrading-to-5.md`). Median of three, two alternating rounds,
+seconds:
+
+| query | buffer | 4.4.0 | 5.2.0 drop-in | 5.2.0 with `index_bytes()` |
+|---|---|---|---|---|
+| hash join, string key | 256 KB (default) | 1.812 | 1.962 (+8.3%) | 1.833 (+1.1%) |
+| hash join, string key | 16 MB | 1.140 | 1.137 | 1.128 |
+| hash join, string key | 64 MB | 1.111 | 1.094 | 1.075 |
+| `INTERSECT` | 256 KB | 5.853 | 5.875 | 5.852 |
+| `INTERSECT` | 16 MB | 3.079 | 2.999 | 3.045 |
+| `INTERSECT` | 64 MB | 3.082 | 3.103 | 3.077 |
+| `EXCEPT` | 256 KB | 0.490 | 0.433 | 0.486 |
+| `EXCEPT` | 16 MB | 0.255 | 0.274 | 0.262 |
+| `EXCEPT` | 64 MB | 0.253 | 0.273 | 0.261 |
+
+The drop-in pays for the over-counted index where it spills, 8.3% on the string join at the default,
+and `index_bytes()` takes that back. The drop-in's `EXCEPT` at 256 KB reading 12% faster is not
+explained. The `EXCEPT` rows at 16 and 64 MB are the layout above (the `index_bytes()` build is a
+third link of mysqld).
+
+What this says and does not say: one machine, one compiler, no LTO, which is not how MySQL ships;
+a layout effect of this size is specific to the binary, and another build of the same source may
+land either way. It does not say which functions collide. For MySQL, 5.2.0 with `index_bytes()` is
+level with or ahead of 4.4.0 on every query here but `EXCEPT`, which reads between +1% and +11%
+depending on the link, and whose map operations are 1.2-2x faster alone.
+
+**udb3's `++h[key]` ran 70% slower under clang on 5.2.0 than on 5.1.0, and it was a loop variable
+stored and reloaded across a store with a late address: on Zen 4 that, with a division on the way to
+the next key, stops the loop overlapping its misses, 5x in a loop with no map at all; the part of
+the insert after a miss is called again under clang** (2026-09-27, issue #310, Ryzen 9 7950X, clang
+22 and gcc 16; udb3 with its own `test.cpp` and flags, `scripts/ab/insert_sweep.cpp`,
+`scripts/ab/spill_trap.cpp`, `scripts/ab/try_emplace_hit.cpp`, `solo.sh`, `perwl.sh`).
+
+**udb3** (80M `uint32_t` inputs, 16.6M distinct keys, its `Hash32`), ns per input, median of three,
+pinned:
+
+| | 4.4.0 | 5.1.0 | 5.2.0 | 5.2.0, insert behind a `noinline` call | this |
+|---|---|---|---|---|---|
+| insert-only (`++h[key]`), gcc | 88.4 | 80.7 | 80.1 | 81.9 | = 5.2.0 |
+| insert-only, clang | 89.4 | 47.8 | **81.2** | 47.9 | **41.9** |
+| insert+delete (`try_emplace`, `erase`), gcc | 59.9 | **83.5** | **60.3** | 84.5 | = 5.2.0 |
+| insert+delete, clang | 79.7 | 47.2 | **60.6** | 45.9 | **41.6** |
+
+#310's own complaint, gcc's insert+delete at 83.5 against 4.4.0's 59.4, was already fixed by 5.2.0
+(#321, #323). The clang rows are what 5.2.0 did: clang, 5.1.0 against 5.2.0 on insert-only, the
+same L1D misses (0.369 G, 0.371 G), the same dTLB misses (0.152 G), the same branch misses, 16%
+fewer instructions and 72% more cycles. The same misses stopped overlapping.
+
+**Not the map, found in a loop without one** (`spill_trap.cpp`: two arrays of 16M entries, a key, a
+load of `idx[key]`, a load of `val[idx[key]]`), cycles per iteration:
+
+| | clang | gcc |
+|---|---|---|
+| none of: generator state through memory, a 64 bit `%`, `++` on the found element | 48.1 | 52.2 |
+| any one or two of them | 56.8-75.6 | 54.1-75.9 |
+| all three | **380.7** | **380.4** |
+| all three, the store to a fixed address instead | 64.6 | 68.1 |
+| all three, only the divisor reloaded (never stored) | 80.6 | 80.6 |
+
+What it needs is a variable stored to and reloaded from the stack every iteration, a store in
+between whose address comes from a cache miss, and the division between the reload and the next
+iteration's misses. The reload waits for that store's address. udb3 has all three: `y % (n >> 2)`,
+the splitmix state behind `&x`, and `++h[key]`. The map's part is register pressure: 5.2.0 inlines
+the whole insert, and the caller's loop variables no longer fit.
+
+**The sweep, and how chaotic it is** (`insert_sweep.cpp`, `map<uint64_t, uint64_t>`, cycles per
+operation). Build from empty is 4-12% faster on 5.2.0 than 5.1.0 at every size from 50k to 16M on
+both compilers; churn under clang 744 -> 505 at 16M, under gcc unchanged. The hit (`++m[k]`, key
+`r() % n`) is two speeds 2.2x apart at every size, 31.8 against 82.5 at 50k, 222 against 490 at
+16M, and which binary is fast follows no shape: clang 5.1.0 fast, clang 5.2.0 slow inlined and slow
+called, gcc slow in every version. Without the store (`m[k]`) or without the division (a mask) the
+gap goes, and 5.2.0 is ahead: 58.9 against 68.0, 59.3 against 67.5 cycles at 1M. It is the trap
+above, set off by the harness's own `r() % n`. And one cold branch decides it: the first version of
+this change left `allocate_buckets_if_none()` in the inlined part, in an `else` that only an empty
+table takes, and the hit read 145 cycles at 1M; moved into the called part, 56.
+
+(2026-09-27, later: superseded by "shape search" below -- the call is now the shape for every
+compiler, gcc included, picked by a fixed rule over sixteen shapes. The clang numbers here stand.)
+
+**What shipped: the part after a home-group miss (`find_or_place_miss`, the placement and the walk)
+is `noinline` under clang, as in #321's V12, and inlined under gcc, byte-identical to 5.2.0**
+(checked on five binaries). Under clang, against 5.2.0:
+
+| | 5.2.0 | this |
+|---|---|---|
+| udb3 insert-only / insert+delete, ns | 81.2 / 60.6 | 41.9 / 41.6 |
+| sweep hit at 1M / 16M, cycles | 143 / 492 | 56 / 181 |
+| sweep build at 1M / 16M | 62 / 191 | 68 / 211 |
+| sweep churn at 1M / 16M | 157 / 505 | 159 / 509 |
+| one map, instructions (cycles): hit u64 | 51.3 (25.4) | 45.8 (24.2) |
+| hit string | 109.6 (87.1) | 105.2 (86.6) |
+| miss u64 | 81.2 (33.8) | 101.1 (39.3) |
+| miss string | 294.0 (123.8) | 319.9 (129.3) |
+| score, `solo.sh` against 5.2.0 | | 0.9698 |
+
+The score's per-workload instructions under clang, against 5.2.0: build 1.149 / 1.045 / 1.129
+(u64 / string / big value), churn 1.075 / 1.031 / 1.079, insert-erase 1.057 / 1.033 / 1.053, find
+and iterate within 2%. ClickHouse's aggregation benchmark, cycles per row against 5.1.0 (the same
+baseline as in "split at the home group"): CounterID -16.7%, AdvEngineID -21.9%, RegionID -15.2%,
+TraficSourceID -20.8%, UserID -8.2%, WatchID -2.9%, where 5.2.0 read -15.6, -19.4, -13.5, -18.4,
+-9.0 and -11.1%.
+
+This is #321's V14-against-V12 trade taken the other way, now that one side of it has a measured
+cliff. The price under clang: the score 3%, ClickHouse's WatchID (100M rows, almost all distinct)
+8 points of the 11 that 5.2.0 had won, an insert of a fresh key 16% more cycles in cache (4% for a
+string key). What it buys: 1.9x in udb3 and 2.6x in the sweep's hit, in the loops that spill. A
+cliff that depends on the caller's code was taken as the worse failure; the numbers to reverse
+that are here. Under gcc no
+shape avoided it in udb3's insert loop (about 80 ns in every version and shape), and gcc keeps
+5.2.0's shape because called it lost udb3's insert+delete (60.3 -> 84.5). (2026-09-27, later: the same
+shape for gcc was measured once more against the caller corpus, entry below, and rejected again:
+the score 0.940, ClickHouse's WatchID +22.0% against 5.1.0 where 5.2.0 read -3.9%.)
+
+What this says and does not say: one CPU; the trap needs the three ingredients and I measured it on
+Zen 4 only. No shape of the map can promise that a caller's loop does not spill, which is why
+`doc/benchmarks.md` now says what the ingredients are. A benchmark that picks keys with `%` and
+stores into what it found measures this, and mine did.
+
+**The caller corpus: nine loops the way programs write them, one binary each, both compilers, in
+cache and past it, judged by each header's worst loop and not by a geomean; 5.2.0's worst was 3.3x
+under clang and 3.6x under gcc, the clang miss call of #310 brings clang's to 1.10, and under gcc
+nothing that removes the cliff is worth its price** (2026-09-27, #310, Ryzen 9 7950X, clang 22 and
+gcc 16, `scripts/ab/caller_corpus.{cpp,sh}`). The loops, each for a slowdown that happened: udb3's
+insert and insert+delete (#310), `++m[f(r() % n)]` and churn with keys from a modulo (the spill
+trap in its plainest form), `++m[k]` with a mask (#321's counting loop), a build from empty, a
+`std::string` hit, `segmented_map` with a 12 byte key built field by field and hashed through
+memory (#311, #312), and MySQL's `EXCEPT` call pattern. Each at 65536 and 4194304 entries, three
+rounds, every header once per cell and round, median; instruction counts deterministic.
+
+Worst ratio of a header's cycles to the fastest header in the same cell, over all 18 cells:
+
+| | 5.1.0 | 5.2.0 | #310 (clang: miss called) | V24 (miss called, both compilers) | V28 (the whole insert behind two calls) |
+|---|---|---|---|---|---|
+| clang | 1.29 | 3.33 | **1.10** | = #310 | 1.21 |
+| gcc | 1.58 | 2.76 / 3.59 | = 5.2.0 | 1.57 | 1.59 |
+
+(Two runs for gcc, the second with 5.2.0, V24 and V28 only; 5.2.0's worst read 2.76 and 3.59, the
+same loop, `bump_mod`.) The cells behind them, cycles per operation, 65536 / 4194304 entries:
+
+| | clang 5.2.0 | clang #310 | gcc 5.2.0 | gcc V24 | gcc V28 |
+|---|---|---|---|---|---|
+| `bump_mod` | 90.2 / 365.3 | 27.1 / 156.9 | 91.4 / 370.4 | 25.5 / 140.3 | 33.3 / 192.2 |
+| `churn_mod` | 134.8 / 568.4 | 80.7 / 271.3 | 108.5 / 359.9 | 134.3 / 566.0 | 140.1 / 573.7 |
+| `udb3_del` | 102.7 / 222.4 | 75.6 / 161.2 | 112.3 / 313.7 | 129.1 / 329.3 | 121.8 / 321.0 |
+| `build` | 48.1 / 118.1 | 52.2 / 129.4 | 44.9 / 108.7 | 51.9 / 133.1 | 53.1 / 145.2 |
+| `mysql_except` | 70.8 / 245.0 | 74.4 / 262.7 | 74.7 / 217.7 | 85.2 / 261.6 | 88.3 / 290.7 |
+| `bump_mask` | 25.0 / 156.5 | 24.7 / 154.9 | 25.4 / 141.0 | 23.4 / 137.9 | 30.7 / 186.8 |
+
+Three things it shows. The inlined shapes are fastest wherever the caller does not spill and fall
+off a 2.3-3.6x cliff where it does, and which loop that is changes with the compiler and with
+unrelated lines (a `reserve(1)` in the sweep harness moved 5.2.0's hit from 143 to 62 cycles). A
+call boundary bounds it, because the caller's loop variables then live in callee-saved registers
+whatever the map does; with only the home-group hit inlined, the lean hit path has not tripped it
+in any loop of this corpus under clang -- but it did in one loop of the earlier five-loop version,
+where the map was passed by reference (`++m[f(r() % n)]` at 1M: 141 against 5.1.0's 72 cycles), so
+it lowers the odds and does not remove them. V28, the whole insert behind a call with the hit in a function of
+its own and the rest tail-called, loses to that in nearly every cell and costs in cache (one map,
+hit u64 27.4 against 25.1 cycles under clang, a miss up to 45% under gcc), so it was dropped. The
+earlier five-loop corpus had recommended V28; the nine-loop one with two sizes overturned it.
+
+Under gcc the call that fixes clang costs more than it saves. V24 takes gcc's worst from 3.59 to
+1.57, and the one loop it rescues is `bump_mod`; against that, gcc's score reads 0.9404 (build
+1.338 / 1.095 / 1.294 instructions, u64 / string / big value; churn 1.186 / 1.088 / 1.180;
+insert-erase 1.177 / 1.077 / 1.212), ClickHouse's WatchID (100M rows, almost all new keys) +22.0%
+against 5.1.0 where 5.2.0 read -3.9%, UserID +0.3% where 5.2.0 read -2.8%, and udb3's
+insert+delete 83.9 against 59.9 ns. The likely mechanism is #321's V10 one: a call that receives
+the map's `this` keeps a map declared in the caller in memory instead of in registers, and every
+insert of a new key pays for it. So gcc keeps 5.2.0's shape and its cliff, and `doc/benchmarks.md`
+says what a caller can do about it. (2026-09-27, later: reversed by "shape search"
+below. This paragraph weighed ClickHouse and udb3 above the corpus loop by judgment; a rule fixed
+before the results, the smallest worst ratio over all of them, picks the call for gcc too.)
+
+What this says and does not say: nine loops are a sample, chosen from slowdowns that happened, and
+a tenth may disagree; one CPU. The corpus is the check for any change to what an insert inlines
+(`CLAUDE.md`, the measurement table): its worst-ratio line, not the score, is what such a change
+has to hold.
+
+**The shape search: sixteen combinations of what the insert inlines, each judged by its worst ratio
+to the best combination anywhere measured, with the rule fixed before the results; it picks one
+shape for every compiler -- the home-group lookup inlined, the miss path and the walk past home
+called -- worst 1.11 under clang and 1.58 under gcc, where 5.2.0's everything-inlined reads 3.32
+and 3.54** (2026-09-27, #310, Ryzen 9 7950X, clang 22 and gcc 16, `scripts/ab/shape_search/`). This
+replaced a week of one-variant-at-a-time argument, in which the gcc choice flipped twice. The four
+switches: `do_find_or_place` (the home-group lookup) inlined or called, `find_or_place_miss`
+inlined or called, `find_or_place_far` inlined or called, `flatten` on `append_value` or not;
+`gen.py` writes all sixteen from the tree's header. Every shape is measured on the caller corpus
+(18 cells, cycles), udb3 (2 modes, ns), ClickHouse (WatchID and CounterID, cycles), and the score
+(15 workloads, instructions, reported beside the grade since instructions are not time). The grade
+is the worst ratio over the timed metrics, each against the best shape on that metric.
+
+| | clang worst | where | clang score instr | gcc worst | where | gcc score instr |
+|---|---|---|---|---|---|---|
+| hit inlined, miss and walk called, flatten (**shipped**) | 1.11 | corpus build | 1.050 | 1.58 | corpus churn 4M | 1.105 |
+| hit inlined, miss called, walk inlined, flatten | 1.13 | corpus build | 1.047 | 1.57 | corpus churn 4M | 1.107 |
+| hit called, miss called | 1.17-1.18 | udb3_del, mysql 4M | 1.06 | 1.59-1.60 | corpus churn 4M | 1.14-1.16 |
+| hit called, miss inlined | 1.27-1.28 | bump_mask 4M | 1.04 | 1.61-1.67 | bump_mask / bump_mod 4M | 1.12-1.15 |
+| everything inlined (5.2.0) | 3.32-3.36 | bump_mod 64k | 1.004-1.011 | 3.54-3.58 | bump_mod 64k | 1.000-1.070 |
+
+What the shipped shape gives up against the best shape on each metric, gcc: the corpus churn at 4M
+1.58, udb3 insert+delete 1.39 (83.7 against 59.9 ns), ClickHouse WatchID 1.24 (373.6 against 301.6
+cycles per row), CounterID 1.07; clang: ClickHouse WatchID 1.10 (352.3 against 321.3), the corpus
+build 1.11. What it removes: the 3.3-3.6x cliff in `bump_mod` on both compilers, udb3's 1.9x under
+clang. The `flatten` and walk switches move nothing by more than 0.02 in the grade under either
+compiler; they are kept as they were measured best, flatten on and the walk called.
+
+Per metric, where the switches go (cycles or ns, best to worst group): udb3 under clang wants the
+miss called (41.8 against 60-81 inlined); udb3 under gcc wants everything inlined, walk included
+(59.9; with only the walk called 82.7); ClickHouse WatchID wants the miss inlined on both compilers
+(clang 321 against 352, gcc 302-327 against 350-390); calling the hit loses on every ClickHouse
+cell. No shape wins all of them, which is why the rule and not a judgment has to pick.
+
+What this says and does not say: the grade weights a synthetic corpus loop the same as a real
+program's benchmark, on purpose -- the rule is the smallest worst case, which is what "not
+brittle" means -- and a different rule (e.g. weighting real programs) would pick 5.2.0's shape for
+gcc again. One CPU. The search is the tool for the next such question: `run.sh gen`, the stages,
+`run.sh rank`, about three hours unattended.
 
 ## The robin hood index this replaced, and its dead ends
 
