@@ -205,7 +205,10 @@ re-tested across the cache boundary".
 Two smaller tools answer questions the harnesses cannot. `scripts/ab/probe_length.sh` patches a
 counter into a copy of the probe and reports **groups visited per lookup**, fresh and after churn,
 with an argument for how many writing lookups each churn round does -- which is the only path
-`move_home()` runs on, so 0 measures the drift and 4 measures what taking it back is worth. And
+`move_home()` runs on, so 0 measures the drift and 4 measures what taking it back is worth. Until
+2026-10-02 it, and `scripts/ab/move_home.cpp`, churned in sequential keys (`next++`), which the hash
+spreads almost evenly: they read a quarter of the real drift and `move_home` at a tenth of what it
+is worth. Both draw random keys now. And
 `scripts/ab/placement.cpp` simulates bucketized placement against sliding-window placement with no
 map involved, which is how the ungrouped-window idea was priced without building it.
 
@@ -571,6 +574,40 @@ default maximum load factor swept".
 ```sh
 AB_BUILD=/home/martinus/gra/x scripts/ab/load_factor.sh clang++ | tee clang.txt   # 0.8 0.75 0.85 0.875 0.9, 28 minutes
 AB_BUILD=/home/martinus/gra/x scripts/ab/load_factor.sh g++ 0.8 0.875
+```
+
+## Which lines `prefetch_index` names, and what `place_element_at`'s `always_inline` is worth
+
+Two one-header-per-binary harnesses from the 2026-10-02 cross-read of the notes, both patching
+copies of the working tree's header so the tree is untouched, both compilers, rounds rotated,
+medians. `scripts/ab/prefetch_index.sh` times the scored benchmark's `find_all` with both of
+`prefetch_index`'s lines, with only `p + 87` and with only `p + 64`, from 50000 to 16M entries.
+`scripts/ab/place_inline.sh` builds a map from empty in a translation unit holding nothing else,
+with `place_element_at`'s `always_inline` and without, and reads `perf stat` instructions too. The
+results are in `notes/index-design.md`, "`prefetch_index`'s two lines re-measured" and
+"`always_inline` on `place_element_at` re-measured".
+
+```sh
+AB_BUILD=/home/martinus/gra/x AB_CORE=2 scripts/ab/prefetch_index.sh 5    # about an hour
+AB_BUILD=/home/martinus/gra/x AB_CORE=2 scripts/ab/place_inline.sh 5      # about ten minutes
+```
+
+## Probe sequences other than the triangular one (#355)
+
+`scripts/ab/probe_sequence.py` writes a copy of the working tree's header that walks another
+probe sequence; every walk then goes through one `advance()`, and `--check` proves that each
+variant visits every group within its bound. `--list` names the variants, and the docstring says
+what each one asks. `scripts/ab/probe_sequence.sh` runs them: `probes` (groups per lookup through
+`probe_length.sh`, which takes `AB_HEADER` and a group count for this), `score` (`solo.sh -h`,
+which takes the candidate header from a file, then `perwl.sh`), and `time` (a churned table, fresh
+lookups and builds, one binary per variant, `AB_CXX` for one compiler, `AB_SMOKE=1` for the
+smallest size of each). The result is in `notes/index-design.md`, "Seven probe sequences".
+
+```sh
+scripts/ab/probe_sequence.py --check
+scripts/ab/probe_sequence.sh probes tri dh dhcls                                   # minutes
+AB_BUILD=/home/martinus/gra/x AB_CORE=2 scripts/ab/probe_sequence.sh score 5 dh    # ~20 min per variant
+AB_BUILD=/home/martinus/gra/x AB_CORE=2 AB_CXX=g++ scripts/ab/probe_sequence.sh time 5 dh
 ```
 
 ## Instructions per `try_emplace` hit and insert, counted around the loop
@@ -1006,3 +1043,33 @@ Sweep both axes. The size axis and the duplicate rate disagree about which varia
 single cell is not an answer -- the numbers and what they decided are in `notes/index-design.md`
 under "the duplicate rate that turns it over". `scripts/ab/replace_forward.patch` is the dedup walk
 rewritten as a forward compaction, measured there and not applied.
+
+## A segmented_map's segment size, apart from the page it lands on (#350)
+
+    AB_CORE=2 AB_BUILD=/home/martinus/gra/x scripts/ab/segment_size.sh -k str [-c g++] [-b 50000,200000,1000000,4000000] [-v regex]
+    python3 scripts/ab/segment_size_table.py out.txt
+
+One binary per variant: the plain map, power-of-two segments from 4 KB to 16 MB on `std::allocator`
+and on `huge_page_allocator`, and `exact4096` -- `segment_exact_page.patch` applied to a copy of
+the header, `4096 / sizeof(T)` elements per segment, each one page-aligned page, indexed by a
+division. `-k` picks the element: `u64` (16 bytes), `str` (40), `big` (72). The workloads are
+`bench_readme.cpp`'s through `maps.h`: build and destroy inside the clock, find at half hits, churn,
+iterate, and peak RSS of a build in a forked child, each an octave geomean. The table script prints
+every variant as a ratio to the plain map. The full grid of one kind is 15 variants and ~50 minutes
+for strings; `-v` cuts it (13 variants of `u64`: ~35 minutes). Smoke with
+`-k u64 -b 1000 -o 10000 -v 'map|seg4096$'`. The numbers are in `notes/index-design.md`, "segment
+size".
+
+## Loading a map from its values and its index (#299)
+
+    AB_CORE=2 AB_BUILD=/home/martinus/gra/x scripts/ab/index_load.sh [-c g++] [-k u64|str] [-n 1000000,4000000,16000000,64000000] [-r 7]
+
+One binary per mode (`index_load.cpp` lists them): building by inserting, the owning constructor
+with `trust::checked` and `trust::unchecked`, `map_view` with both, and `verify(spot)` and
+`verify(full)`. The values and the index sit in 64-aligned memory before the clock starts; a mode
+that builds a map hands it out of the clock to be destroyed, because freeing a million strings is
+not a load. Prints the median ns per entry over the rounds and the peak RSS of one load in a forked
+child, measured before the timed rounds (after them the arena is warm and the child reads near
+zero). `u64` at the four default sizes and `str` at 1M and 4M take about 12 minutes per compiler.
+Smoke with `-n 10000 -r 1`. The numbers are in `notes/index-design.md`, "Loading a map from its
+values and its index".

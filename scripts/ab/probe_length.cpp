@@ -46,8 +46,9 @@ auto measure(map_t const& m, std::vector<std::uint64_t> const& keys, std::size_t
 int main(int argc, char** argv) {
     auto const load = argc > 1 ? std::strtod(argv[1], nullptr) : 0.76;
     auto const turnovers = argc > 2 ? std::strtoull(argv[2], nullptr, 10) : 200;
-    // 4096 groups = 65536 slots; fill to the requested load
-    auto const slots = std::size_t{65536};
+    // 4096 groups = 65536 slots by default; fill to the requested load
+    auto const groups = argc > 4 ? std::strtoull(argv[4], nullptr, 10) : 4096;
+    auto const slots = static_cast<std::size_t>(groups) * 16U;
     auto const n = static_cast<std::size_t>(static_cast<double>(slots) * load);
 
     auto r = rng();
@@ -71,7 +72,6 @@ int main(int argc, char** argv) {
     // churn at a fixed size, with a key the map has never held. `hits` writing lookups per round:
     // operator[] on a key that is present is the path move_home() runs on, so this is what says
     // what move_home takes back.
-    auto next = std::uint64_t{1} << 40U;
     auto const hits = argc > 3 ? std::strtoull(argv[3], nullptr, 10) : 0;
     for (std::size_t t = 0; t < turnovers; ++t) {
         for (std::size_t i = 0; i < n; ++i) {
@@ -80,7 +80,11 @@ int main(int argc, char** argv) {
             }
             auto const at = static_cast<std::size_t>(r() % present.size());
             m.erase(present[at]);
-            present[at] = next++;
+            // A random key, like the ones the table was filled with. A counter here (it was
+            // `next++` until 2026-10-02) leaves a churned table holding sequential keys,
+            // which the hash spreads almost evenly: drift read 1.036/1.061 groups per
+            // hit/miss instead of 1.136/1.265, and FIFO churn read exactly 1.000.
+            present[at] = r() >> 1U;
             m.try_emplace(present[at], 1);
         }
     }

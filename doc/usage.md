@@ -27,6 +27,10 @@ shapes `ankerl::unordered_dense::map` and `set` can be asked to take. The index 
   - [`auto hash_for(K const& key) const -> precomputed_hash`](#auto-hash_fork-const-key-const---precomputed_hash)
   - [`auto visit(FwdIt first, FwdIt last, F f) -> size_t`](#auto-visitfwdit-first-fwdit-last-f-f---size_t)
   - [`void merge(map& source)`](#void-mergemap-source)
+- [Loading a map from its values and its index](#loading-a-map-from-its-values-and-its-index)
+  - [What the check covers and what only `verify()` covers](#what-the-check-covers-and-what-only-verify-covers)
+  - [What is portable](#what-is-portable)
+  - [A custom index container](#a-custom-index-container)
 - [Taking the duplicates out of a vector](#taking-the-duplicates-out-of-a-vector)
 - [`std::erase_if`, and the version macros](#stderase_if-and-the-version-macros)
 - [Custom Container Types](#custom-container-types)
@@ -452,6 +456,164 @@ Two things differ from `std::unordered_map::merge`, and both follow from the ele
 
 `merge` is worth using over the loop it replaces: about **2x** when the two maps mostly do not overlap, which is what a merge is usually for.
 
+## Loading a map from its values and its index
+
+A map is two arrays: the values, in insertion order, and the index, plain bytes with no addresses
+in them. Both can be written out and read back, and a map built from them again without hashing a
+single key. A `map_view` or `set_view` reads both in place, from memory the caller owns -- a file
+mapping, a shared memory segment -- and copies nothing.
+
+```cpp
+using map_t = ankerl::unordered_dense::map<std::uint64_t, std::uint64_t>;
+
+// writing: the values your way, the index as bytes, and the id next to them
+map.rehash(map.size());        // a loaded index never repairs drift; take it out first
+auto values = map.values();    // std::vector<std::pair<...>>, in insertion order
+auto index = map.index();      // index.data(), index.size() blocks of sizeof(map_t::index_block) bytes
+write(map_t::index_format_id, values, index);
+
+// reading: compare the id, then construct from both
+if (stored_id != map_t::index_format_id) { /* rebuild by inserting */ }
+
+// an owning map: moves the values in, copies the index, checks it with trust::checked, then works as
+// any map
+auto loaded = map_t(std::move(values_read), map_t::index_view(blocks_read, num_blocks),
+                    ankerl::unordered_dense::trust::checked);
+
+// a read only view over the bytes where they are; trust::checked scans the index once,
+// trust::unchecked is O(1) and trusts the bytes
+auto view = ankerl::unordered_dense::map_view<std::uint64_t, std::uint64_t>(
+    {values_ptr, num_values}, {blocks_ptr, num_blocks}, ankerl::unordered_dense::trust::checked);
+```
+
+The members:
+
+- `index()` is the index as it is: `size()` 0 for a table that has not allocated one,
+  otherwise a pointer to `index().size()` blocks. It is invalidated by anything that rehashes, as
+  `values()` is by anything that grows.
+- `index_format_id` is a compile-time `std::uint64_t` naming what the index bytes mean. Write it
+  next to the bytes and compare before constructing. It covers the block layout, the width of a
+  value index, the byte order, and the hash as far as the header can see it: the version of this
+  library's hash functions, and `Hash::format_id` where the hash declares one. This library's
+  hashes for integers, enums, strings, string views, and pairs and tuples of those declare one. A
+  hash built on `std::hash` does not, and nothing covers a seed or any other state of a hasher:
+  `verify()` is how to check those. A changed id means rebuild; nothing converts an index.
+- `map(values_container&&, index_view, trust)` and the same for `set` and the segmented versions: an
+  owning table. It moves the values in and copies the index. With `trust::checked` it checks every
+  slot in the same loop as the copy. That is most of what the load costs: for `map<uint64_t,
+  uint64_t>` 1.9-3.0 ns per entry checked against 0.45-0.49 unchecked at 1M entries, 5.8-7.1
+  against 4.1-4.3 at 16M and 64M, where building the same map by inserting costs 8-45. So
+  `trust::unchecked` skips it for bytes the caller vouches for. A rejected index throws
+  `std::invalid_argument` (aborts without exceptions) and leaves the values with the caller.
+- `map_view<Key, T, Hash, KeyEqual, Bucket>` and `set_view<...>` over `{values pointer, count}` and
+  an `index_view`, with a `trust` argument and no default: `trust::checked` reads every byte of the
+  index once, which on a lazily paged mapping means paging all of it in, and `trust::unchecked`
+  does not. Both reject an index of the wrong shape or alignment. A view is read only: an insert,
+  an erase, `clear()`, `rehash()`, `reserve()`, `max_load_factor(float)`, `swap()` and assignment
+  do not compile. It is copyable, two pointers each.
+- `view()` is a `map_view` of a map's own arrays, sharing its bytes, for a map whose values are one
+  array (not a segmented one). `map(map_view const&)` goes back, copying both arrays and checking
+  the index whatever trust the view was built with.
+- `verify(verify_level::spot)` and `verify(verify_level::full)` check the index against the hasher
+  (below). Both work on views.
+
+The caller provides: values aligned for `value_type`, the index aligned for `index_block` (4 bytes
+for `bucket_type::group`, 8 for `group_big`), native byte order, the same hasher state as when the
+index was written, and bytes that do not change while a view reads them. A `MAP_SHARED` file that
+another process writes to, or truncates, under a view is outside that: write a new file and rename
+it into place.
+
+### What the check covers and what only `verify()` covers
+
+The check that `trust::checked` runs reads every slot and
+hashes nothing: every full slot must point at a value, and the number of full slots must equal the
+number of values. The first makes every lookup memory safe. The second leaves a free slot for every
+insert, which the insert's walk relies on to end. An owning table also requires that no two slots
+point at one value, so that every value has exactly one slot: an erase moves the last value into
+the hole and repoints the one slot it finds for it, and a second slot would be left pointing past
+the end. That costs the owning constructor one bit per value while it copies. A view only reads and
+does not need it. A view's check costs 0.85-0.88 ns per entry at every size from 1M to 64M;
+`verify(verify_level::full)` costs 3.2 ns per entry at 1M and 17 at 64M for integer keys, 11-34 for
+strings at 1M-4M, and `verify(verify_level::spot)` is 16 lookups.
+
+Bytes that pass the check can still be wrong: a value in the wrong slot, a wrong overflow counter,
+and for a view, two slots pointing at one value. Lookups then give wrong answers, but never read out
+of bounds and never fail to end, because every key search is bounded by the size of the table. In
+an owning table, an erase on such bytes can fail to find the slot of the value it has to move and
+throws `std::logic_error`, after which the table is unusable.
+
+`verify()` is what makes them correct, through the map's own lookup: value `i` is consistent when
+`find()` of its key returns `begin() + i`. That covers the fingerprint, the probe path, every
+counter on it and duplicate keys. `verify_level::full` checks every value, which also proves the
+index points at each value exactly once; `verify_level::spot` checks 16 values spread over the
+table, which is enough to catch a different hasher or seed, and touches 16 groups. Neither finds a
+counter that is too high, which makes a miss walk further and changes no answer.
+
+`trust::unchecked` skips the check, so bytes that fail it can make a view read out of bounds.
+
+### What is portable
+
+The id rejects every "no" in this table:
+
+| | 32 and 64 bit, little endian | big and little endian |
+|---|---|---|
+| `bucket_type::group` index, this library's hashes | yes: the same bytes and the same id | no: value indices are native endian, and string hashes read native words |
+| `bucket_type::group_big` index | no: its value index is 4 bytes on 32 bit | no |
+| a hash built on `std::hash` | no: its result differs between standard libraries | no |
+| the values | the caller's bytes: `std::pair<uint32_t, uint64_t>` is 12 bytes on i386 and 16 on x86-64 | the caller's bytes |
+
+The values are never written or read by the library, `std::string` included. Write them in
+whatever format the rest of the file uses, and hand the table a container of them.
+
+### A custom index container
+
+A table object that lives inside a blob, next to its two arrays, cannot hold plain pointers: the
+blob is copied or mapped at another address. The table holds the values in its value container,
+which can be your own type already (see [Custom Container Types](#custom-container-types)); give
+that type a member alias template, and the table takes the index container from it as well:
+
+```cpp
+template <typename T>
+class offset_values {
+    // ... the value container, read only: `using is_view = void;` and the interface below
+public:
+    template <typename Bucket>
+    using index_container = offset_index<Bucket>;
+};
+
+using blob_map = ankerl::unordered_dense::map<Key, T, Hash, KeyEqual, offset_values<std::pair<Key, T>>>;
+```
+
+The alias is looked up on the type in the allocator-or-container slot, before anything else: a
+container that names one gets it, a `map_view`'s values get the index view, everything else the
+library's own index. `test/unit/index_container.cpp` has a self-relative pair of containers for a
+table placed in a blob, and an owning one that forwards to `std::vector`.
+
+What the index container has to provide. Both kinds:
+
+- `using block = ankerl::unordered_dense::detail::group_block<Bucket>;` and `data()` returning a
+  pointer to `size()` blocks, aligned to `alignof(block)`. When it holds no blocks, `data()` returns
+  `ankerl::unordered_dense::detail::sentinel_blocks<Bucket>()`, never null: an empty table looks up
+  in it without a test. Both are `static_assert`ed.
+- `size()` (in blocks, 0 or a power of two of at least 4), `empty()`, `using allocator_type`, and
+  `static constexpr bool nothrow_move_assignable`.
+- a constructor from the table's allocator (`explicit`, any allocator type), and one from another
+  of its kind and the allocator.
+
+Read only, when the value container has `is_view`, the table only reads through it: a default
+constructor (the view constructor leaves it to that and then assigns), `assign(other)` to copy
+one, `assign(block const* data, std::size_t size)` for what the view
+constructor is given, and `clear()` for a table that was moved from. A write to such a table does
+not compile.
+
+Owning, everything the library's own index container has, with its meaning: `get_allocator()`,
+`set_allocator(a)` (give the blocks back and take `a`), `clear()` (give the blocks back),
+`resize(n)` (n value-initialized blocks, replacing what is there), `assign(other)` (a copy),
+`take(other)` (other's blocks, leaving it empty), `swap(other)`, `data()` in both constness and
+`clear_metadata()` (zero every block's fingerprints and counters). The constructor that loads an
+index into an owning table copies it with `resize()` and checks the copy, where the library's own
+container does both in one loop.
+
 ## Taking the duplicates out of a vector
 
 A `std::vector<std::string>` with repeats in it, and you want each string once. A dense set keeps
@@ -569,6 +731,20 @@ How much the remaining index spike matters depends on the size of your value. Th
 
 The size of a segment is a template parameter, and it defaults to 4096 bytes, which is small. A map
 that is going on huge pages wants it set: see [Sizing a segment for a huge page](#sizing-a-segment-for-a-huge-page).
+
+A map whose values own heap memory wants it set too. A `segmented_map<std::string, size_t>` with
+4096 byte segments iterates 3.3x slower than `map` at 4M entries, because its 2560 byte segments
+are allocated between the strings' own buffers and every one of them starts the walk cold; with
+256 KB segments it is 1.24x, with 16 MB 1.06x, and lookups, churn and memory do not change. For
+values without heap memory the segment size makes no difference to iteration. The default stays
+small because a non-empty segmented map holds at least one whole segment:
+
+```cpp
+// 256 KB segments for a map of strings
+using map_t = ankerl::unordered_dense::segmented_map<std::string, std::size_t, ankerl::unordered_dense::hash<std::string>,
+                                                     std::equal_to<std::string>, std::allocator<std::pair<std::string, std::size_t>>,
+                                                     ankerl::unordered_dense::bucket_type::group, 256 * 1024>;
+```
 
 ## Custom Bucket Types
 
