@@ -36,8 +36,8 @@ git ls-files -z '*.h' '*.hpp' '*.cpp' '*.cc' '*.cxx' | xargs -0 sed -i \
 
 ## 2. You passed a seventh template argument to `map` or `set`
 
-The `BucketContainer` parameter is gone. The index is one contiguous array in every configuration
-now, so there was nothing left for it to choose.
+The `BucketContainer` parameter is gone. A container type in the allocator-or-container slot can
+name the index container instead, see [A custom index container](usage.md#a-custom-index-container).
 
 ```cpp
 // 4.x - seven parameters
@@ -154,7 +154,7 @@ that 4.x did not have. `reserve()` up front removes it.
 #endif
 ```
 
-The inline namespace follows the version, so `ankerl::unordered_dense::v5_2_0` is also the exact
+The inline namespace follows the version, so `ankerl::unordered_dense::v5_3_0` is also the exact
 version, and linking two translation units built against different versions is a link error rather
 than a silent mismatch.
 

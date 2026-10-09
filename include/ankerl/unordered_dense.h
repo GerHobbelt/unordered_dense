@@ -1,7 +1,7 @@
 ///////////////////////// ankerl::unordered_dense::{map, set} /////////////////////////
 
 // A fast & densely stored hashmap and hashset.
-// Version 5.2.0
+// Version 5.3.0
 // https://github.com/martinus/unordered_dense
 //
 // Licensed under the MIT License <http://opensource.org/licenses/MIT>.
@@ -31,7 +31,7 @@
 
 // see https://semver.org/spec/v2.0.0.html
 #define ANKERL_UNORDERED_DENSE_VERSION_MAJOR 5 // NOLINT(cppcoreguidelines-macro-usage) incompatible API changes
-#define ANKERL_UNORDERED_DENSE_VERSION_MINOR 2 // NOLINT(cppcoreguidelines-macro-usage) backwards compatible functionality
+#define ANKERL_UNORDERED_DENSE_VERSION_MINOR 3 // NOLINT(cppcoreguidelines-macro-usage) backwards compatible functionality
 #define ANKERL_UNORDERED_DENSE_VERSION_PATCH 0 // NOLINT(cppcoreguidelines-macro-usage) backwards compatible bug fixes
 
 // API versioning with inline namespace, see https://www.foonathan.net/2018/11/inline-namespaces/
@@ -3773,7 +3773,7 @@ private:
                 auto const& group = *block[i];
                 // The element, once it is known: converging on a pointer rather than a found-flag
                 // keeps the call to f in one place instead of one per way of arriving at it.
-                value_type* element = nullptr;
+                std::conditional_t<is_view_v, value_type const, value_type>* element = nullptr;
                 auto remaining = lanes[i];
                 while (remaining != 0) {
                     auto const lane = first_lane(remaining);
@@ -4119,7 +4119,7 @@ public:
     }
 
     auto cbegin() const noexcept -> const_iterator {
-        return m_values.cbegin();
+        return begin(); // the const one: a value container need not have cbegin()
     }
 
     auto end() noexcept -> iterator {
@@ -4127,7 +4127,7 @@ public:
     }
 
     auto cend() const noexcept -> const_iterator {
-        return m_values.cend();
+        return end();
     }
 
     auto end() const noexcept -> const_iterator {
@@ -4824,8 +4824,8 @@ public:
     // getting that backwards is a wrong answer rather than a crash.
     //
     // f is taken by value, as the standard algorithms take a callable, and is called with
-    // value_type& -- or value_type const& on a const map. Keys that are absent are not reported; the
-    // return value counts the ones that were found.
+    // value_type& -- or value_type const& on a const map and on any map_view or set_view. Keys that
+    // are absent are not reported; the return value counts the ones that were found.
     template <typename FwdIt, typename F>
     auto visit(FwdIt first, FwdIt last, F f) -> std::size_t {
         return do_visit(first, last, std::move(f));
